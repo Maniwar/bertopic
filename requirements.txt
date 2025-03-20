@@ -10,3 +10,4 @@ plotly
 sentence-transformers
 transformers
 torch
+tf-keras
