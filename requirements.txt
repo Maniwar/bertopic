@@ -9,3 +9,4 @@ hdbscan
 plotly
 sentence-transformers
 transformers
+torch
