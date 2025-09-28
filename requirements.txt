@@ -1,13 +1,64 @@
-streamlit
-pandas
-numpy
-tensorflow
-bertopic
-scikit-learn
-umap-learn
-hdbscan
-plotly
-sentence-transformers
-transformers
-torch
-tf-keras
+# BERTopic Streamlit Application - 2025 Optimized Dependencies
+# Compatible with Python 3.9+ including latest Python 3.13+
+
+# === CORE WEB FRAMEWORK ===
+streamlit>=1.28.0
+
+# === DATA PROCESSING & ANALYSIS ===
+pandas>=2.0.0
+numpy>=1.21.0
+
+# === LIGHTWEIGHT ML EMBEDDINGS (replaces TensorFlow/PyTorch stack) ===
+model2vec>=0.2.0
+# Note: Model2Vec provides 50x smaller models, 500x faster inference
+# Replaces: tensorflow, torch, sentence-transformers, transformers
+
+# === TOPIC MODELING CORE ===
+bertopic>=0.16.0
+scikit-learn>=1.3.0
+
+# === CLUSTERING & DIMENSIONALITY REDUCTION ===
+umap-learn>=0.5.3
+hdbscan>=0.8.30
+
+# === VISUALIZATION ===
+plotly>=5.15.0
+
+# === MODERN PERFORMANCE & MONITORING TOOLS ===
+# Advanced logging with rich formatting
+loguru>=0.6.0
+rich>=12.0.0
+
+# Progress bars and better CLI output
+tqdm>=4.64.0
+
+# Memory profiling and optimization
+psutil>=5.8.0
+
+# === ADDITIONAL UTILITIES ===
+# YAML configuration support
+pyyaml>=6.0.0
+
+# Date/time handling
+python-dateutil>=2.8.0
+
+# === OPTIONAL PERFORMANCE TOOLS ===
+# Safe tensor serialization (install if available)
+# safetensors>=0.3.0
+
+# Async file operations for better performance
+# aiofiles>=22.0.0
+
+# Fast data validation
+# pydantic>=2.0.0
+
+# HTTP client for async operations
+# httpx>=0.24.0
+
+# Fast JSON parsing
+# orjson>=3.8.0
+
+# Development and debugging tools (optional for production)
+# Uncomment for development:
+# streamlit-profiler>=0.2.0
+# memory-profiler>=0.61.0

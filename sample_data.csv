@@ -1,0 +1,51 @@
+id,review_text,category,rating
+1,"The customer service team was exceptional, they resolved my issue within minutes and were very professional throughout the process",service,5
+2,"Terrible customer service experience, waited on hold for hours and the representative was rude and unhelpful when I finally got through",service,1
+3,"Outstanding customer support! They went above and beyond to help me with my complex billing question and followed up to ensure satisfaction",service,5
+4,"Customer service is mediocre at best, representatives seem undertrained and couldn't answer basic questions about the product features",service,3
+5,"Absolutely wonderful customer service experience, the team was knowledgeable, patient, and helped me find exactly what I needed",service,5
+6,"Poor customer service response time, took days to get a simple answer and when they finally responded it wasn't helpful",service,2
+7,"Excellent customer service via live chat, quick responses and very helpful guidance throughout my entire shopping experience",service,5
+8,"Customer support was friendly but didn't seem to understand my technical issue, had to explain multiple times",service,3
+9,"Amazing customer service! They helped me process a return and exchange seamlessly, very impressed with their professionalism",service,5
+10,"Customer service needs major improvement, long wait times and inconsistent information from different representatives",service,2
+11,"This product exceeded my expectations in every way, excellent build quality and attention to detail in the design and materials",product,5
+12,"Very disappointed with the product quality, it feels cheap and broke within the first week of normal use",product,2
+13,"Outstanding product quality for the price point, durable materials and solid construction that feels like it will last years",product,5
+14,"The product quality is inconsistent, some features work great while others seem poorly designed and implemented",product,3
+15,"Exceptional product quality and craftsmanship, you can tell a lot of thought went into the design and manufacturing process",product,5
+16,"Poor product quality control, received a defective item and the replacement also had issues with the same components",product,2
+17,"Really impressed with the product quality, sturdy build and premium materials that justify the higher price point",product,5
+18,"Product quality is below average for this price range, feels flimsy and several features don't work as advertised",product,2
+19,"Great product quality overall, minor issues with some details but the core functionality is solid and reliable",product,4
+20,"Terrible product quality, multiple components failed within months and customer service wasn't helpful with warranty claims",product,1
+21,"The product quality is exactly what I expected based on reviews, good value for money and meets all my requirements",product,4
+22,"Excellent product quality and attention to detail, clearly made with high-quality materials and expert craftsmanship",product,5
+23,"Lightning fast shipping and delivery, ordered yesterday and received today with perfect packaging and no damage",shipping,5
+24,"Shipping was extremely slow, took over two weeks to arrive and there was no tracking information provided",shipping,1
+25,"Great shipping experience, arrived exactly when promised and the packaging was secure and environmentally friendly",shipping,5
+26,"Shipping was delayed multiple times without explanation, very frustrating experience and poor communication",shipping,2
+27,"Excellent shipping service, fast delivery and careful packaging ensured my fragile items arrived in perfect condition",shipping,5
+28,"Terrible shipping experience, package was damaged and items were missing, had to contact customer service multiple times",shipping,1
+29,"Quick and reliable shipping, arrived ahead of schedule and the packaging was professional and well-protected",shipping,5
+30,"Shipping costs are too high for the speed of delivery, took a week to arrive despite paying for expedited shipping",shipping,3
+31,"Outstanding shipping experience, real-time tracking and delivery updates kept me informed throughout the entire process",shipping,5
+32,"Shipping was a nightmare, wrong address delivery and took weeks to resolve with multiple calls to customer service",shipping,1
+33,"The website is incredibly user-friendly with intuitive navigation and a clean, modern design that makes shopping enjoyable",website,5
+34,"Website is confusing and outdated, difficult to find products and the checkout process is unnecessarily complicated",website,2
+35,"Excellent website functionality, fast loading times and responsive design that works perfectly on both desktop and mobile",website,5
+36,"The website has too many bugs and glitches, pages crash frequently and the search function doesn't work properly",website,2
+37,"Great website design and user experience, easy to browse products and the filtering options help find exactly what you need",website,5
+38,"Website is slow and unresponsive, takes forever to load pages and the mobile version is practically unusable",website,2
+39,"Outstanding website performance, smooth navigation and excellent product photos with detailed descriptions and specifications",website,5
+40,"The website needs a complete overhaul, outdated design and poor user interface make it frustrating to use",website,2
+41,"Really impressed with the website functionality, smart recommendations and personalized experience based on browsing history",website,5
+42,"Website security concerns, checkout process seems unsafe and I'm worried about providing payment information",website,2
+43,"Excellent value for money, competitive pricing and the quality justifies every penny spent on this purchase",pricing,5
+44,"Way too expensive for what you get, similar products available elsewhere for half the price with better features",pricing,1
+45,"Great pricing strategy with frequent sales and discounts, managed to get a high-quality product at an affordable price",pricing,4
+46,"Pricing is reasonable but not the cheapest option available, good balance between cost and quality for most customers",pricing,4
+47,"Overpriced compared to competitors, the premium doesn't seem justified given the limited additional features offered",pricing,2
+48,"Outstanding value proposition, the price is fair considering the excellent quality and comprehensive warranty coverage",pricing,5
+49,"Pricing is transparent with no hidden fees, appreciate the honest approach and competitive rates in the market",pricing,4
+50,"Too expensive for the average consumer, pricing strategy seems to target only premium market segment exclusively",pricing,2
