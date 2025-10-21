@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Claude
+.claude/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data and Models
+*.pkl
+*.pickle
+*.h5
+*.safetensors
+models/
+data/
+*.parquet
+
+# Generated files
+topic_report.html
+*.html
+*.pdf
+
+# Logs
+*.log
+
+# Old/backup files
+*_broken.py
+*_old.py
+*_backup.py
+test_*.py
+
+# Streamlit
+.streamlit/cache/
+.streamlit/secrets.toml

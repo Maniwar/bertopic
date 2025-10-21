@@ -1380,7 +1380,15 @@ class SentimentAwareTopicModeler:
 
                     # Add sample documents (max 20)
                     for doc_idx, (_, doc_row) in enumerate(topic_data.head(20).iterrows()):
-                        doc_text = doc_row[text_column] if text_column else str(doc_row.iloc[0])
+                        # Get document text - prioritize 'Document' column, then text_column, then first string column
+                        if 'Document' in doc_row.index:
+                            doc_text = doc_row['Document']
+                        elif text_column and text_column in doc_row.index:
+                            doc_text = doc_row[text_column]
+                        else:
+                            # Find first string column
+                            str_cols = [col for col in doc_row.index if isinstance(doc_row[col], str) and col not in ['Topic', 'sentiment', 'Sentiment']]
+                            doc_text = doc_row[str_cols[0]] if str_cols else str(doc_row.iloc[0])
 
                         # Add sentiment coloring if available
                         sentiment_class = ""
@@ -1608,6 +1616,8 @@ def main():
             df.columns,
             help="Choose the column containing text data"
         )
+        # Store in session state for use in other parts of the app
+        st.session_state.text_column = text_column
 
         # Analysis button
         if st.button("🚀 Analyze Topics & Sentiment", type="primary"):
@@ -1789,7 +1799,17 @@ def main():
                     else:
                         sentiment_icon = "⚪"
 
-                st.markdown(f"{sentiment_icon} **{idx}.** {row[text_column]}")
+                # Get the text column dynamically from session state or first non-numeric column
+                if 'text_column' in st.session_state and st.session_state.text_column in row.index:
+                    text_col = st.session_state.text_column
+                elif 'Document' in row.index:
+                    text_col = 'Document'
+                else:
+                    # Find the first text column
+                    text_cols = [col for col in row.index if col not in ['Topic', 'sentiment', 'Sentiment', 'Probability'] and isinstance(row[col], str)]
+                    text_col = text_cols[0] if text_cols else row.index[0]
+
+                st.markdown(f"{sentiment_icon} **{idx}.** {row[text_col]}")
                 if idx < min(10, len(topic_docs)):
                     st.divider()
 
