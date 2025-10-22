@@ -926,6 +926,17 @@ def main():
         balance_analysis = st.session_state.balance_analysis
         outlier_ratio = st.session_state.outlier_ratio
         
+        # Recreate topic_labels from topic_info (needed for display)
+        topic_labels = {}
+        for _, row in topic_info.iterrows():
+            topic_id = row['Topic']
+            if topic_id == -1:
+                topic_labels[topic_id] = "Outliers"
+            else:
+                # Get top 3 words
+                words = row['Representation'][:3] if isinstance(row['Representation'], list) else []
+                topic_labels[topic_id] = f"Topic {topic_id}: {', '.join(words)}"
+        
         # Summary metrics
         st.header("📊 Results Summary")
         
