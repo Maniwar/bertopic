@@ -5,6 +5,27 @@ import numpy as np
 import warnings
 warnings.filterwarnings("ignore")
 
+# Set Streamlit to wide mode for better layout
+st.set_page_config(layout="wide", page_title="Windows CUDA-Optimized BERTopic", page_icon="🚀")
+
+# Check for accelerate package (required for some device operations)
+try:
+    import accelerate
+    accelerate_available = True
+except ImportError:
+    accelerate_available = False
+    st.error("""
+    ❌ **Missing 'accelerate' package**
+    
+    The error you're seeing requires the accelerate package. Please install it:
+    ```bash
+    pip install accelerate
+    ```
+    
+    After installation, restart the app.
+    """)
+    st.stop()
+
 from bertopic import BERTopic
 from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance
 from sentence_transformers import SentenceTransformer
@@ -40,15 +61,12 @@ except ImportError:
     faiss_available = False
     faiss_gpu_available = False
 
-# Set Streamlit to wide mode for better layout
-st.set_page_config(layout="wide", page_title="Windows CUDA-Optimized BERTopic", page_icon="🚀")
-
 # Force CUDA initialization if available
 if torch.cuda.is_available():
     torch.cuda.init()
     torch.cuda.empty_cache()
-    # Set default tensor type to CUDA
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # DO NOT set default tensor type globally - it conflicts with SentenceTransformer
+    # Instead, we'll handle device placement explicitly where needed
     # Enable TF32 for better performance on newer GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -127,7 +145,12 @@ class WindowsOptimizedHDBSCAN:
         if torch.cuda.is_available() and len(X) < 50000:  # Use GPU for reasonable sizes
             # Compute distance matrix on GPU
             X_tensor = torch.from_numpy(X).float().cuda()
-            with torch.cuda.amp.autocast():  # Use mixed precision for speed
+            # Try to use mixed precision if available
+            try:
+                with torch.cuda.amp.autocast():  # Use mixed precision for speed
+                    dist_matrix = torch.cdist(X_tensor, X_tensor).cpu().numpy()
+            except:
+                # Fallback to regular precision if amp fails
                 dist_matrix = torch.cdist(X_tensor, X_tensor).cpu().numpy()
             
             # Run HDBSCAN on CPU with precomputed distances
@@ -171,7 +194,8 @@ def create_optimized_bertopic_model(
     use_kmeans=False,
     use_gpu_kmeans=True,
     calculate_probabilities=False,
-    embedding_batch_size=32
+    embedding_batch_size=32,
+    use_fp16=False
 ):
     """
     Creates a Windows-optimized BERTopic model with maximum GPU utilization.
@@ -181,7 +205,8 @@ def create_optimized_bertopic_model(
     # Log GPU status
     if device == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        device_props = torch.cuda.get_device_properties(0)
+        gpu_memory = device_props.total_memory / 1024**3
         print(f"Using GPU: {gpu_name} ({gpu_memory:.1f} GB)")
         print(f"CUDA version: {torch.version.cuda}")
         print(f"cuDNN enabled: {torch.backends.cudnn.enabled}")
@@ -286,10 +311,14 @@ def create_optimized_bertopic_model(
     # Windows CUDA optimizations for embeddings
     if device == 'cuda':
         embedding_model = embedding_model.to('cuda')
-        embedding_model = embedding_model.half()  # Use FP16 for faster inference
+        # Get device properties for capability check
+        device_props = torch.cuda.get_device_properties(0)
+        # Only use half precision if GPU supports it (compute capability >= 7.0)
+        if device_props.major >= 7 and use_fp16:
+            embedding_model = embedding_model.half()  # Use FP16 for faster inference
         
         # Set optimal batch size based on GPU memory
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_memory_gb = device_props.total_memory / 1024**3
         if gpu_memory_gb >= 8:
             embedding_model.max_seq_length = 256  # Can handle longer sequences
         else:
@@ -367,7 +396,7 @@ def get_cuda_memory_info():
         }
     return None
 
-def generate_embeddings_gpu_optimized(docs, embedding_model, batch_size=32, show_progress=True):
+def generate_embeddings_gpu_optimized(docs, embedding_model, batch_size=32, show_progress=True, use_amp=True):
     """Generate embeddings with GPU optimization and progress tracking"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -396,7 +425,15 @@ def generate_embeddings_gpu_optimized(docs, embedding_model, batch_size=32, show
             status_text.text(f"Generating embeddings: {i+len(batch)}/{len(docs)} documents")
         
         # Generate batch embeddings
-        with torch.cuda.amp.autocast():  # Use mixed precision
+        if torch.cuda.is_available() and use_amp:
+            with torch.cuda.amp.autocast():  # Use mixed precision
+                batch_embeddings = embedding_model.encode(
+                    batch,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    batch_size=batch_size
+                )
+        else:
             batch_embeddings = embedding_model.encode(
                 batch,
                 convert_to_numpy=True,
@@ -591,6 +628,7 @@ def main():
                 use_amp = st.checkbox(
                     "Use Automatic Mixed Precision",
                     value=True,
+                    disabled=not torch.cuda.is_available(),
                     help="Faster computation with automatic precision management"
                 )
             
@@ -620,6 +658,14 @@ def main():
         # Determine clustering settings
         use_kmeans = "K-means" in clustering_method
         use_gpu_kmeans = "GPU" in clustering_method
+        
+        # Set default values if not defined (for safety)
+        if 'use_fp16' not in locals():
+            use_fp16 = False
+        if 'use_amp' not in locals():
+            use_amp = True
+        if 'cache_embeddings' not in locals():
+            cache_embeddings = True
         
         with st.spinner(f"Processing {st.session_state.uploaded_file_name}..."):
             # Initialize progress tracking
@@ -663,7 +709,8 @@ def main():
                 use_kmeans=use_kmeans,
                 use_gpu_kmeans=use_gpu_kmeans,
                 calculate_probabilities=calculate_probabilities,
-                embedding_batch_size=embedding_batch_size
+                embedding_batch_size=embedding_batch_size,
+                use_fp16=use_fp16
             )
             
             # Step 3: Generate or load embeddings
@@ -679,7 +726,8 @@ def main():
                     docs,
                     model.embedding_model,
                     batch_size=embedding_batch_size,
-                    show_progress=True
+                    show_progress=True,
+                    use_amp=use_amp
                 )
                 if cache_embeddings:
                     st.session_state.embeddings = embeddings
