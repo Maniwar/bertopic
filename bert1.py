@@ -216,7 +216,7 @@ class OutlierReducer:
         Args:
             model: BERTopic model
             docs: List of documents
-            embeddings: Document embeddings
+            embeddings: Document embeddings (numpy array)
             labels: Current topic labels
             top_k: Number of nearest topics to consider
         
@@ -227,14 +227,29 @@ class OutlierReducer:
         
         outlier_indices = [i for i, label in enumerate(labels) if label == -1]
         
-        if len(outlier_indices) == 0 or not hasattr(model, 'topic_embeddings_'):
+        if len(outlier_indices) == 0:
             return labels
         
-        # Get topic embeddings (excluding outlier topic)
-        topic_embeddings = model.topic_embeddings_[1:]  # Skip outlier topic at index 0
+        # Try to get topic embeddings
+        try:
+            if hasattr(model, 'topic_embeddings_') and model.topic_embeddings_ is not None:
+                topic_embeddings = model.topic_embeddings_
+                # Skip outlier topic if it's at index 0
+                if -1 in model.get_topic_info()['Topic'].values:
+                    topic_embeddings = topic_embeddings[1:]
+            else:
+                # No topic embeddings available
+                return labels
+        except Exception as e:
+            # If anything goes wrong, just return original labels
+            return labels
         
         if len(topic_embeddings) == 0:
             return labels
+        
+        # Ensure embeddings is a numpy array
+        if not isinstance(embeddings, np.ndarray):
+            embeddings = np.array(embeddings)
         
         # Calculate similarity between outlier docs and topics
         new_labels = labels.copy()
@@ -251,6 +266,68 @@ class OutlierReducer:
                 new_labels[idx] = max_sim_idx  # Topic indices start at 0 for non-outliers
         
         return new_labels
+
+# -----------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------
+def safe_extract_embeddings(model, docs, verbose=False):
+    """
+    Safely extract embeddings from documents, trying multiple methods.
+    
+    Args:
+        model: BERTopic model
+        docs: List of documents
+        verbose: Print debug information
+    
+    Returns:
+        numpy array of embeddings
+    """
+    try:
+        # Method 1: Use BERTopic's internal method (newest versions)
+        if verbose:
+            st.info("Trying method 1: BERTopic internal extraction...")
+        embeddings = model._extract_embeddings(docs, method="document")
+        if verbose:
+            st.success("✅ Method 1 succeeded")
+        return embeddings
+    except Exception as e1:
+        if verbose:
+            st.warning(f"Method 1 failed: {e1}")
+        
+        try:
+            # Method 2: Access the underlying embedding model
+            if verbose:
+                st.info("Trying method 2: Direct model access...")
+            
+            if hasattr(model, 'embedding_model'):
+                emb_model = model.embedding_model
+                
+                # If it's a backend wrapper, get the underlying model
+                if hasattr(emb_model, 'embedding_model'):
+                    emb_model = emb_model.embedding_model
+                
+                embeddings = emb_model.encode(docs, show_progress_bar=False)
+                if verbose:
+                    st.success("✅ Method 2 succeeded")
+                return embeddings
+        except Exception as e2:
+            if verbose:
+                st.warning(f"Method 2 failed: {e2}")
+        
+        # Method 3: Create fresh embedding model (most reliable fallback)
+        if verbose:
+            st.info("Trying method 3: Fresh embedding model...")
+        
+        from sentence_transformers import SentenceTransformer
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        temp_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        embeddings = temp_model.encode(docs, show_progress_bar=False)
+        del temp_model
+        
+        if verbose:
+            st.success("✅ Method 3 succeeded (fallback)")
+        
+        return embeddings
 
 # -----------------------------------------------------
 # GPU-ACCELERATED CLUSTERING FOR WINDOWS
@@ -746,7 +823,8 @@ def main():
                     status_text.text("Analyzing document embeddings...")
                     progress_bar.progress(60)
                     
-                    embeddings = model.embedding_model.encode(docs, show_progress_bar=False)
+                    # Use safe extraction method
+                    embeddings = safe_extract_embeddings(model, docs, verbose=False)
                     
                     # Step 4: Analyze category balance
                     status_text.text("Analyzing category balance...")
@@ -766,14 +844,23 @@ def main():
                         status_text.text("Attempting to reassign outliers...")
                         progress_bar.progress(80)
                         
-                        reducer = OutlierReducer()
-                        topics = reducer.reassign_outliers_to_nearest(
-                            model, docs, embeddings, topics
-                        )
-                        
-                        # Recalculate outlier count
-                        outlier_count = sum(1 for t in topics if t == -1)
-                        outlier_ratio = outlier_count / len(topics)
+                        try:
+                            reducer = OutlierReducer()
+                            new_topics = reducer.reassign_outliers_to_nearest(
+                                model, docs, embeddings, topics
+                            )
+                            
+                            # Only update if we successfully reduced outliers
+                            new_outlier_count = sum(1 for t in new_topics if t == -1)
+                            if new_outlier_count < outlier_count:
+                                topics = new_topics
+                                outlier_count = new_outlier_count
+                                outlier_ratio = outlier_count / len(topics)
+                                status_text.text(f"✅ Reduced outliers by {outlier_count - new_outlier_count}")
+                        except Exception as e:
+                            # If reassignment fails, continue with original topics
+                            st.warning(f"Could not reassign outliers: {e}. Continuing with original results.")
+                            pass
                     
                     # Step 6: Prepare results
                     status_text.text("Preparing results...")
