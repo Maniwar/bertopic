@@ -463,10 +463,14 @@ def create_optimized_bertopic_model(
     use_gpu_kmeans=True,
     calculate_probabilities=False,
     embedding_batch_size=32,
-    use_fp16=False
+    use_fp16=False,
+    seed_topic_list=None
 ):
     """
     Creates a Windows-optimized BERTopic model with better outlier handling.
+    
+    Args:
+        seed_topic_list: List of lists of seed words for guided topic modeling
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -536,19 +540,25 @@ def create_optimized_bertopic_model(
         MaximalMarginalRelevance(diversity=0.3)
     ]
     
-    # Create BERTopic model
-    topic_model = BERTopic(
-        embedding_model=embedding_model,
-        umap_model=umap_model,
-        hdbscan_model=hdbscan_model,
-        vectorizer_model=vectorizer_model,
-        representation_model=representation_models,
-        top_n_words=10,
-        min_topic_size=min_topic_size,
-        nr_topics=nr_topics,
-        calculate_probabilities=calculate_probabilities,
-        verbose=False
-    )
+    # Create BERTopic model with optional seed topics
+    bertopic_params = {
+        'embedding_model': embedding_model,
+        'umap_model': umap_model,
+        'hdbscan_model': hdbscan_model,
+        'vectorizer_model': vectorizer_model,
+        'representation_model': representation_models,
+        'top_n_words': 10,
+        'min_topic_size': min_topic_size,
+        'nr_topics': nr_topics,
+        'calculate_probabilities': calculate_probabilities,
+        'verbose': False
+    }
+    
+    # Add seed topics for guided topic modeling if provided
+    if seed_topic_list and len(seed_topic_list) > 0:
+        bertopic_params['seed_topic_list'] = seed_topic_list
+    
+    topic_model = BERTopic(**bertopic_params)
     
     return topic_model
 
@@ -761,6 +771,48 @@ def main():
                     help="Higher = faster but uses more memory"
                 )
             
+            # Seed words for guided topic modeling
+            with st.sidebar.expander("🎯 Seed Words (Optional)"):
+                st.markdown("""
+                **Guided Topic Modeling**: Steer topics toward specific keywords.
+                
+                Enter seed words for topics you want to create:
+                """)
+                
+                use_seed_words = st.checkbox(
+                    "Enable Seed Words",
+                    value=False,
+                    help="Guide topics with predefined keywords"
+                )
+                
+                seed_topics = []
+                if use_seed_words:
+                    num_seed_topics = st.number_input(
+                        "Number of Seed Topics",
+                        min_value=1,
+                        max_value=10,
+                        value=3,
+                        help="How many topics to guide"
+                    )
+                    
+                    st.write("**Enter keywords for each topic (comma-separated):**")
+                    for i in range(num_seed_topics):
+                        seed_words = st.text_input(
+                            f"Topic {i+1} Keywords",
+                            placeholder="e.g., email, inbox, message, reply",
+                            key=f"seed_topic_{i}",
+                            help="Comma-separated keywords"
+                        )
+                        if seed_words.strip():
+                            keywords = [w.strip() for w in seed_words.split(",") if w.strip()]
+                            if keywords:
+                                seed_topics.append(keywords)
+                    
+                    if seed_topics:
+                        st.success(f"✅ {len(seed_topics)} seed topics defined")
+                    else:
+                        st.info("Add keywords above to enable guided topics")
+            
             # Category balance monitoring
             with st.sidebar.expander("📊 Category Balance Settings"):
                 max_category_ratio = st.slider(
@@ -798,6 +850,10 @@ def main():
                     status_text.text("Creating optimized model...")
                     progress_bar.progress(20)
                     
+                    # Add seed topics notification if used
+                    if seed_topics:
+                        status_text.text(f"Creating model with {len(seed_topics)} seed topics...")
+                    
                     model = create_optimized_bertopic_model(
                         min_topic_size=min_topic_size,
                         nr_topics=nr_topics,
@@ -810,7 +866,8 @@ def main():
                         use_gpu_kmeans=use_gpu_kmeans,
                         calculate_probabilities=False,
                         embedding_batch_size=embedding_batch_size,
-                        use_fp16=use_fp16
+                        use_fp16=use_fp16,
+                        seed_topic_list=seed_topics if seed_topics else None
                     )
                     
                     # Step 2: Fit model
@@ -902,7 +959,8 @@ def main():
                         'Clustering': 'GPU K-means' if use_kmeans and use_gpu_kmeans else 'K-means' if use_kmeans else 'HDBSCAN',
                         'FP16': use_fp16,
                         'Documents': len(docs),
-                        'Outlier Strategy': outlier_strategy
+                        'Outlier Strategy': outlier_strategy,
+                        'Seed Topics': len(seed_topics) if seed_topics else 0
                     }
                     
                     progress_bar.progress(100)
@@ -999,6 +1057,16 @@ def main():
             for col, (key, value) in zip(cols, ran_params.items()):
                 with col:
                     st.metric(key, value)
+        
+        # Show seed topics if used
+        if ran_params.get('Seed Topics', 0) > 0:
+            with st.expander("🎯 Seed Topics Used"):
+                st.info(f"""
+                This analysis used **{ran_params['Seed Topics']} guided seed topics**.
+                
+                Seed topics help steer the model toward specific themes or concepts you care about.
+                The topics found may be influenced by the seed words you provided.
+                """)
         
         # Tabs for different views
         tab1, tab2, tab3, tab4 = st.tabs([
@@ -1256,6 +1324,11 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
             3. **Conservative (Standard HDBSCAN)** - Natural clustering
                - Highest quality topics
                - May have more outliers
+            
+            **🎯 NEW: Seed Words**
+            - Guide topics with predefined keywords
+            - Steer model toward topics you care about
+            - Great for domain-specific analysis
             """)
         
         with col2:
