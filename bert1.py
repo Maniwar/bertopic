@@ -305,8 +305,8 @@ def create_optimized_bertopic_model(
     else:
         embedding_model_name = 'all-MiniLM-L12-v2'  # Good balance
     
-    # Initialize embedding model with optimizations
-    embedding_model = SentenceTransformer(embedding_model_name, device=device)
+    # Initialize embedding model WITHOUT device parameter to avoid accelerate requirement
+    embedding_model = SentenceTransformer(embedding_model_name)
     
     # Windows CUDA optimizations for embeddings
     if device == 'cuda':
