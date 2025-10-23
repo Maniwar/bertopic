@@ -1384,7 +1384,7 @@ def main():
 
         with col1:
             denom = max(2, st.session_state.min_topic_size)
-            max_topics = max(2, min(100, len(st.session_state.documents) // denom))
+            max_topics = max(2, min(2000, len(st.session_state.documents) // denom))
 
             n_topics_slider = st.slider(
                 "🎯 **Number of Topics** (Adjust in real-time!)",
