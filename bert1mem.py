@@ -1394,39 +1394,142 @@ Topic label:"""
         return make_human_label(topic_docs, keywords_str)
 
 
+def clear_gpu_memory():
+    """Clear GPU memory cache to free up space"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        import gc
+        gc.collect()
+
+
 @st.cache_resource
-def load_local_llm(model_name):
+def load_local_llm(model_name, force_cpu=False):
     """
-    Load a local LLM for topic labeling.
-    Cached to avoid reloading on every rerun.
+    Load a local LLM for topic labeling with intelligent GPU/CPU handling.
+    
+    Smart fallback strategy:
+    1. Try GPU if available and not forced to CPU
+    2. If GPU OOM, clear cache and try CPU with system RAM
+    3. Use appropriate precision for each device
     
     Recommended models:
-    - "microsoft/Phi-3-mini-4k-instruct" (3.8GB, fast)
-    - "mistralai/Mistral-7B-Instruct-v0.2" (14GB, better quality)
-    - "HuggingFaceH4/zephyr-7b-beta" (14GB, good quality)
+    - "microsoft/Phi-3-mini-4k-instruct" (3.8GB, fast, good for 16GB GPU)
+    - "mistralai/Mistral-7B-Instruct-v0.2" (14GB, better quality, needs 24GB+ GPU)
+    - "HuggingFaceH4/zephyr-7b-beta" (14GB, good quality, needs 20GB+ GPU)
     """
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        import psutil
         
-        st.info(f"Loading {model_name}... This may take a few minutes the first time.")
+        # Check available system RAM
+        system_ram_gb = psutil.virtual_memory().total / (1024**3)
         
+        st.info(f"🔄 Loading {model_name}... This may take a few minutes the first time.")
+        
+        # Load tokenizer (small, always works)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True
-        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
-        if not torch.cuda.is_available():
-            # CPU mode - load in 8-bit for efficiency
-            st.warning("Running on CPU - labels will be slower to generate")
+        model = None
+        device_used = None
+        
+        # Strategy 1: Try GPU first (if available and not forced to CPU)
+        if torch.cuda.is_available() and not force_cpu:
+            try:
+                # Check available GPU memory
+                gpu_free_gb = torch.cuda.mem_get_info()[0] / (1024**3)
+                st.info(f"📊 Available GPU memory: {gpu_free_gb:.1f} GB")
+                
+                # Only try GPU if we have at least 4GB free (minimum for small models)
+                if gpu_free_gb >= 4.0:
+                    st.info("🎮 Attempting to load LLM on GPU...")
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.float16,  # Half precision for GPU
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                        max_memory={0: f"{int(gpu_free_gb * 0.85)}GB"}  # Use 85% of available
+                    )
+                    device_used = "GPU"
+                    st.success(f"✅ LLM loaded on GPU ({gpu_free_gb:.1f}GB available)")
+                else:
+                    st.warning(f"⚠️ Only {gpu_free_gb:.1f}GB GPU memory available - switching to CPU")
+                    raise RuntimeError("Insufficient GPU memory, falling back to CPU")
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    st.warning("⚠️ GPU out of memory - clearing cache and trying CPU...")
+                    torch.cuda.empty_cache()
+                    model = None  # Will fall through to CPU loading
+                else:
+                    raise e
+        
+        # Strategy 2: Load on CPU with system RAM
+        if model is None:
+            st.info("💻 Loading LLM on CPU using system RAM...")
+            
+            # Check if we have enough system RAM (need ~8GB minimum for 7B model)
+            if system_ram_gb < 12:
+                st.error(f"❌ Insufficient system RAM ({system_ram_gb:.1f}GB). Need at least 12GB for CPU inference.")
+                st.info("💡 Consider using a smaller model like 'microsoft/Phi-3-mini-4k-instruct' (needs ~6GB)")
+                return None
+            
+            try:
+                # Load in 8-bit on CPU for efficiency (if bitsandbytes available)
+                try:
+                    import bitsandbytes
+                    st.info("Using 8-bit quantization for CPU efficiency...")
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        load_in_8bit=True,
+                        device_map="cpu",
+                        low_cpu_mem_usage=True
+                    )
+                except ImportError:
+                    # Fall back to float32 on CPU
+                    st.info("Loading in float32 (install bitsandbytes for faster CPU inference)")
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=torch.float32,
+                        low_cpu_mem_usage=True
+                    )
+                    model = model.to('cpu')
+                
+                device_used = "CPU"
+                st.success(f"✅ LLM loaded on CPU (using system RAM: {system_ram_gb:.1f}GB available)")
+                st.info("⚡ Note: CPU inference is slower than GPU but will work reliably")
+                
+            except Exception as cpu_error:
+                st.error(f"❌ Failed to load on CPU: {str(cpu_error)}")
+                st.info("💡 Try a smaller model or ensure you have enough system RAM")
+                return None
+        
+        # Verify model loaded successfully
+        if model is None:
+            st.error("❌ Failed to load LLM on both GPU and CPU")
+            return None
+        
+        # Display final configuration
+        st.success(f"🎯 LLM ready on {device_used}")
+        if device_used == "CPU":
+            st.info("💡 Pro tip: Close other applications to free up system RAM for faster inference")
         
         return (model, tokenizer)
         
     except Exception as e:
-        st.error(f"Failed to load LLM: {str(e)}")
-        st.info("Install transformers: pip install transformers accelerate")
+        st.error(f"❌ Failed to load LLM: {str(e)}")
+        st.info("📦 Make sure you have transformers installed: pip install transformers accelerate")
+        if "out of memory" in str(e).lower():
+            st.error("💥 Out of memory error. Try one of these solutions:")
+            st.markdown("""
+            1. **Use a smaller model**: Try 'microsoft/Phi-3-mini-4k-instruct' (only 3.8GB)
+            2. **Force CPU mode**: Check 'Force CPU for LLM' in advanced settings
+            3. **Free up memory**: Close other applications
+            4. **Use Conservative profile**: Reduces memory usage
+            5. **Skip LLM**: Uncheck 'Use LLM for labels' (uses TF-IDF fallback)
+            """)
         return None
 
 
@@ -2015,19 +2118,36 @@ def main():
                 )
                 
                 llm_model_name = None
+                force_llm_cpu = False
                 if use_llm_labeling:
                     llm_model_name = st.selectbox(
                         "LLM Model",
                         [
                             "microsoft/Phi-3-mini-4k-instruct",  # 3.8GB - Fast, good quality
-                            "microsoft/Phi-3-mini-128k-instruct",  # 3.8GB - Fast, good quality
                             "mistralai/Mistral-7B-Instruct-v0.2",  # 14GB - Better quality
                             "HuggingFaceH4/zephyr-7b-beta",  # 14GB - Good quality
                         ],
                         help="Smaller models are faster. First load takes time to download."
                     )
+                    
+                    # ✅ NEW: Force CPU option
+                    force_llm_cpu = st.checkbox(
+                        "Force CPU for LLM (use system RAM)",
+                        value=False,
+                        help="Load LLM on CPU using system RAM instead of GPU. Use this if GPU is full or you get OOM errors."
+                    )
+                    
+                    if force_llm_cpu:
+                        st.info("💻 LLM will use CPU + system RAM (slower but reliable)")
+                    elif torch.cuda.is_available():
+                        gpu_free = torch.cuda.mem_get_info()[0] / (1024**3)
+                        if gpu_free < 4.0:
+                            st.warning(f"⚠️ Only {gpu_free:.1f}GB GPU memory free. Consider forcing CPU mode.")
+                    
                     st.caption("⚠️ First-time download may be large (3-14GB). Model is cached after first use.")
                     st.caption("💡 Phi-3 recommended for speed, Mistral for quality.")
+                    if force_llm_cpu:
+                        st.caption("🔧 CPU mode: Needs ~12GB system RAM. Slower but doesn't use GPU memory.")
 
                 # Seed words
                 st.subheader("🎯 Seed Words (Optional)")
@@ -2092,12 +2212,19 @@ def main():
                 with st.spinner("Computing UMAP reduction for fast reclustering..."):
                     umap_embeddings = compute_umap_embeddings(embeddings, n_neighbors, n_components)
                     st.session_state.umap_embeddings = umap_embeddings
+                
+                # ✅ Clear GPU memory before loading LLM
+                if torch.cuda.is_available() and use_llm_labeling:
+                    st.info("🧹 Clearing GPU cache before loading LLM...")
+                    clear_gpu_memory()
+                    gpu_free_after = torch.cuda.mem_get_info()[0] / (1024**3)
+                    st.info(f"📊 GPU memory available for LLM: {gpu_free_after:.1f} GB")
 
                 # Step 3.5: Load LLM if enabled
                 llm_model = None
                 if use_llm_labeling and llm_model_name:
                     with st.spinner(f"Loading {llm_model_name} for enhanced labeling..."):
-                        llm_model = load_local_llm(llm_model_name)
+                        llm_model = load_local_llm(llm_model_name, force_cpu=force_llm_cpu)
                         if llm_model:
                             st.success("✅ LLM loaded successfully!")
                         else:
