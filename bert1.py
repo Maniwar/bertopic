@@ -9,6 +9,12 @@ from collections import Counter
 from scipy.spatial.distance import cosine
 import plotly.express as px
 import plotly.graph_objects as go
+# ✅ NEW IMPORTS FOR LLM OPTIMIZATION
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import psutil
+import os
+
 
 # Set Streamlit to wide mode for better layout
 st.set_page_config(layout="wide", page_title="Complete BERTopic with All Features", page_icon="🚀")
@@ -67,6 +73,365 @@ if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.8)
     except Exception as e:
         st.warning(f"CUDA initialization warning: {e}")
+
+# =====================================================
+# ⚡ OPTIMIZED LLM LABELING - AUTO-ADAPTIVE & PARALLEL
+# =====================================================
+class SystemPerformanceDetector:
+    """Auto-detect system capabilities and recommend optimal parameters"""
+    
+    @staticmethod
+    def detect_optimal_parameters():
+        """Detect system capabilities and return optimal parameters for LLM labeling"""
+        params = {
+            'has_gpu': False,
+            'gpu_memory_gb': 0,
+            'cpu_cores': os.cpu_count() or 4,
+            'ram_gb': psutil.virtual_memory().total / (1024**3),
+            'batch_size': 10,
+            'max_workers': 1,
+            'recommended_docs_per_topic': 5
+        }
+        
+        if torch.cuda.is_available():
+            params['has_gpu'] = True
+            try:
+                gpu_props = torch.cuda.get_device_properties(0)
+                params['gpu_memory_gb'] = gpu_props.total_memory / (1024**3)
+                params['gpu_name'] = gpu_props.name
+                
+                if params['gpu_memory_gb'] >= 20:
+                    params['batch_size'] = 40
+                    params['max_workers'] = 4
+                    params['tier'] = 'High-end GPU'
+                elif params['gpu_memory_gb'] >= 14:
+                    params['batch_size'] = 25
+                    params['max_workers'] = 3
+                    params['tier'] = 'Mid-range GPU'
+                elif params['gpu_memory_gb'] >= 10:
+                    params['batch_size'] = 20
+                    params['max_workers'] = 3
+                    params['tier'] = 'Standard GPU'
+                elif params['gpu_memory_gb'] >= 6:
+                    params['batch_size'] = 12
+                    params['max_workers'] = 2
+                    params['tier'] = 'Entry-level GPU'
+                else:
+                    params['batch_size'] = 8
+                    params['max_workers'] = 1
+                    params['tier'] = 'Low-memory GPU'
+            except Exception:
+                params['batch_size'] = 15
+                params['max_workers'] = 2
+                params['tier'] = 'Unknown GPU'
+        else:
+            params['tier'] = 'CPU'
+            params['batch_size'] = 10
+            params['max_workers'] = 1
+            if params['cpu_cores'] >= 16:
+                params['max_workers'] = 2
+        
+        return params
+
+
+class AdaptiveProgressTracker:
+    """Track and display detailed progress with adaptive updates"""
+    
+    def __init__(self, total_items, operation_name="Processing"):
+        self.total_items = total_items
+        self.operation_name = operation_name
+        self.start_time = time.time()
+        self.completed = 0
+        self.progress_bar = st.progress(0.0)
+        self.status_container = st.empty()
+        self.metrics_container = st.empty()
+        
+    def update(self, completed_count, extra_info=None):
+        """Update progress with detailed stats"""
+        self.completed = completed_count
+        progress = min(1.0, completed_count / self.total_items)
+        self.progress_bar.progress(progress)
+        
+        elapsed = time.time() - self.start_time
+        rate = completed_count / elapsed if elapsed > 0 else 0
+        remaining = self.total_items - completed_count
+        eta = remaining / rate if rate > 0 else 0
+        
+        elapsed_str = f"{int(elapsed)}s" if elapsed < 60 else f"{int(elapsed/60)}m {int(elapsed%60)}s"
+        eta_str = f"{int(eta)}s" if eta < 60 else f"{int(eta/60)}m {int(eta%60)}s"
+        
+        status_msg = f"🚀 {self.operation_name}: {completed_count}/{self.total_items}"
+        if extra_info:
+            status_msg += f" | {extra_info}"
+        self.status_container.info(status_msg)
+        
+        col1, col2, col3, col4 = self.metrics_container.columns(4)
+        with col1:
+            st.metric("Progress", f"{progress*100:.1f}%")
+        with col2:
+            st.metric("Rate", f"{rate:.1f}/sec")
+        with col3:
+            st.metric("Elapsed", elapsed_str)
+        with col4:
+            st.metric("ETA", eta_str if eta > 0 else "Finishing...")
+    
+    def complete(self, final_message=None):
+        """Mark as complete and clean up"""
+        elapsed = time.time() - self.start_time
+        self.progress_bar.empty()
+        self.metrics_container.empty()
+        
+        if final_message:
+            self.status_container.success(f"✅ {final_message} (took {elapsed:.1f}s)")
+        else:
+            self.status_container.success(f"✅ {self.operation_name} complete! (took {elapsed:.1f}s, {self.total_items/elapsed:.1f} items/sec)")
+
+
+def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=5, max_topics_per_batch=20):
+    """Generate labels for multiple topics in a single LLM call"""
+    if not batch_data or llm_model is None:
+        return {}
+    
+    try:
+        model, tokenizer = llm_model
+        
+        topics_text = []
+        for i, item in enumerate(batch_data[:max_topics_per_batch], 1):
+            topic_id = item['topic_id']
+            keywords = item['keywords']
+            sample_docs = item['docs'][:max_docs_per_topic]
+            docs_preview = "\n".join([f"  • {doc[:150]}" for doc in sample_docs[:3]])
+            
+            topics_text.append(
+                f"Topic {i} (ID: {topic_id}):\n"
+                f"Keywords: {keywords}\n"
+                f"Sample docs:\n{docs_preview}"
+            )
+        
+        batch_prompt = f"""Generate short, descriptive topic labels (2-5 words each) for these topics.
+Return ONLY the labels in this exact format:
+Topic 1: [label]
+Topic 2: [label]
+Topic 3: [label]
+etc.
+
+{chr(10).join(topics_text)}
+
+Labels:
+"""
+        
+        inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=2048)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.5,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if "Labels:" in response:
+            response = response.split("Labels:")[-1]
+        
+        labels_dict = {}
+        lines = response.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or not line.startswith('Topic '):
+                continue
+            
+            try:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    topic_num = int(parts[0].replace('Topic', '').strip())
+                    label = parts[1].strip().strip('"\'.,;')
+                    
+                    if 1 <= topic_num <= len(batch_data):
+                        if 3 <= len(label) <= 70 and len(label.split()) <= 8:
+                            actual_topic_id = batch_data[topic_num - 1]['topic_id']
+                            labels_dict[actual_topic_id] = label
+            except (ValueError, IndexError):
+                continue
+        
+        return labels_dict
+    except Exception:
+        return {}
+
+
+class AdaptiveParallelLLMLabeler:
+    """Production-ready parallel LLM labeler with adaptive batch sizing and detailed progress"""
+    
+    def __init__(self, llm_model, system_params=None, max_docs_per_topic=5):
+        self.llm_model = llm_model
+        self.max_docs_per_topic = max_docs_per_topic
+        
+        if system_params is None:
+            system_params = SystemPerformanceDetector.detect_optimal_parameters()
+        
+        self.system_params = system_params
+        self.batch_size = system_params['batch_size']
+        self.max_workers = system_params['max_workers'] if llm_model else 0
+        self.original_batch_size = self.batch_size
+        self.oom_count = 0
+        self.successful_batches = 0
+        
+    def _adaptive_reduce_batch_size(self):
+        """Reduce batch size if OOM errors occur"""
+        if self.batch_size > 5:
+            self.batch_size = max(5, self.batch_size // 2)
+            self.oom_count += 1
+            st.warning(f"⚠️ Reducing batch size to {self.batch_size} due to memory constraints (attempt {self.oom_count})")
+            
+            if self.oom_count >= 2 and self.max_workers > 1:
+                self.max_workers = max(1, self.max_workers - 1)
+                st.warning(f"⚠️ Reducing parallel workers to {self.max_workers}")
+            
+            return True
+        return False
+    
+    def label_all_topics(self, topics_dict, keywords_dict, fallback_func, show_progress=True):
+        """Label all topics using adaptive parallel batching with detailed progress"""
+        topic_items = []
+        for topic_id, docs in topics_dict.items():
+            if topic_id == -1:
+                continue
+            topic_items.append({
+                'topic_id': topic_id,
+                'docs': docs,
+                'keywords': keywords_dict.get(topic_id, '')
+            })
+        
+        total_topics = len(topic_items)
+        if total_topics == 0:
+            return {}
+        
+        if show_progress:
+            sys_info = self.system_params
+            st.info(
+                f"🖥️ **System**: {sys_info['tier']} | "
+                f"**Batch Size**: {self.batch_size} topics | "
+                f"**Parallel Workers**: {self.max_workers} | "
+                f"**Total Topics**: {total_topics}"
+            )
+            
+            if sys_info['has_gpu']:
+                st.info(f"🎮 **GPU**: {sys_info.get('gpu_name', 'Unknown')} ({sys_info['gpu_memory_gb']:.1f}GB)")
+        
+        if self.llm_model is None or self.max_workers == 0:
+            return self._sequential_fallback(topic_items, fallback_func, show_progress)
+        
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                return self._process_batches_parallel(topic_items, fallback_func, show_progress)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "OOM" in str(e):
+                    torch.cuda.empty_cache()
+                    if self._adaptive_reduce_batch_size():
+                        st.warning(f"🔄 Retrying with smaller batch size... (attempt {retry + 1}/{max_retries})")
+                        time.sleep(2)
+                        continue
+                    else:
+                        st.error("❌ Cannot reduce batch size further. Falling back to sequential processing.")
+                        return self._sequential_fallback(topic_items, fallback_func, show_progress)
+                else:
+                    raise e
+        
+        st.warning("⚠️ All parallel attempts failed. Using sequential fallback.")
+        return self._sequential_fallback(topic_items, fallback_func, show_progress)
+    
+    def _process_batches_parallel(self, topic_items, fallback_func, show_progress):
+        """Process batches in parallel with detailed progress tracking"""
+        batches = [topic_items[i:i + self.batch_size] for i in range(0, len(topic_items), self.batch_size)]
+        total_topics = len(topic_items)
+        num_batches = len(batches)
+        
+        if show_progress:
+            tracker = AdaptiveProgressTracker(total_topics, f"Labeling with LLM ({num_batches} batches)")
+        
+        all_labels = {}
+        completed_topics = 0
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_batch = {
+                executor.submit(generate_batch_labels_with_llm, batch, self.llm_model, self.max_docs_per_topic, self.batch_size): (batch_idx, batch)
+                for batch_idx, batch in enumerate(batches)
+            }
+            
+            for future in as_completed(future_to_batch):
+                batch_idx, batch = future_to_batch[future]
+                
+                try:
+                    batch_labels = future.result(timeout=120)
+                    self.successful_batches += 1
+                    all_labels.update(batch_labels)
+                    
+                    fallback_count = 0
+                    for item in batch:
+                        topic_id = item['topic_id']
+                        if topic_id not in batch_labels:
+                            fallback_label = fallback_func(item['docs'], item['keywords'])
+                            all_labels[topic_id] = fallback_label
+                            fallback_count += 1
+                    
+                    completed_topics += len(batch)
+                    if show_progress:
+                        extra_info = f"Batch {batch_idx+1}/{num_batches}"
+                        if fallback_count > 0:
+                            extra_info += f" ({fallback_count} fallbacks)"
+                        tracker.update(completed_topics, extra_info)
+                    
+                except Exception:
+                    for item in batch:
+                        topic_id = item['topic_id']
+                        fallback_label = fallback_func(item['docs'], item['keywords'])
+                        all_labels[topic_id] = fallback_label
+                    
+                    completed_topics += len(batch)
+                    if show_progress:
+                        tracker.update(completed_topics, f"Batch {batch_idx+1}/{num_batches} (failed, used fallback)")
+        
+        elapsed = time.time() - start_time
+        
+        if show_progress:
+            success_rate = (self.successful_batches / num_batches * 100) if num_batches > 0 else 0
+            tracker.complete(
+                f"Labeled {total_topics} topics | Success rate: {success_rate:.0f}% | "
+                f"Rate: {total_topics/elapsed:.1f} topics/sec"
+            )
+        
+        return all_labels
+    
+    def _sequential_fallback(self, topic_items, fallback_func, show_progress):
+        """Sequential processing without LLM"""
+        total = len(topic_items)
+        
+        if show_progress:
+            st.warning("⚠️ Using TF-IDF fallback method (no LLM)")
+            tracker = AdaptiveProgressTracker(total, "Generating labels with TF-IDF")
+        
+        all_labels = {}
+        
+        for i, item in enumerate(topic_items):
+            topic_id = item['topic_id']
+            label = fallback_func(item['docs'], item['keywords'])
+            all_labels[topic_id] = label
+            
+            if show_progress and (i % 10 == 0 or i == total - 1):
+                tracker.update(i + 1)
+        
+        if show_progress:
+            tracker.complete()
+        
+        return all_labels
+
 
 # -----------------------------------------------------
 # ROBUST TEXT PREPROCESSOR
@@ -860,62 +1225,110 @@ class FastReclusterer:
         return topics, topic_info
 
     def _extract_topic_keywords(self, topics, top_n_words=10):
-        """Extract keywords and generate human-readable labels for each topic."""
+        """⚡ OPTIMIZED: Extract keywords and generate human-readable labels with adaptive parallel batching"""
+        # Group documents by topic
         topics_dict = {}
         for idx, topic in enumerate(topics):
             topics_dict.setdefault(topic, [])
             if idx < len(self.documents):
                 topics_dict[topic].append(self.documents[idx])
-
+        
+        # Handle outliers
         topic_info_list = []
+        if -1 in topics_dict:
+            topic_info_list.append({
+                'Topic': -1,
+                'Count': len(topics_dict[-1]),
+                'Keywords': 'Outliers',
+                'Human_Label': 'Outliers',
+                'Name': 'Outliers'
+            })
+        
+        # PHASE 1: Extract keywords for all topics (fast, no LLM)
+        keywords_dict = {}
         for topic_id in sorted(topics_dict.keys()):
             if topic_id == -1:
-                topic_info_list.append({
-                    'Topic': -1,
-                    'Count': len(topics_dict[-1]),
-                    'Keywords': 'Outliers',
-                    'Human_Label': 'Outliers',
-                    'Name': 'Outliers'
-                })
                 continue
-
+            
             topic_docs = topics_dict[topic_id]
-
-            # --- keywords (simple, fast) ---
+            
             try:
-                sample_size = min(200, len(topic_docs))  # Increased sample size for better labels
+                sample_size = min(200, len(topic_docs))
                 topic_text = ' '.join(topic_docs[:sample_size])
-
                 words = topic_text.lower().split()
                 word_counts = Counter(words)
-                common_words = {'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','as',
-                                'is','was','are','were','be','have','has','had','do','does','did','will','would','could',
-                                'should','may','might','must','shall','can','need','it','this','that','these','those',
-                                'i','you','he','she','we','they'}
+                
+                common_words = {
+                    'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','as',
+                    'is','was','are','were','be','have','has','had','do','does','did','will','would','could',
+                    'should','may','might','must','shall','can','need','it','this','that','these','those',
+                    'i','you','he','she','we','they'
+                }
+                
                 filtered = {w: c for w, c in word_counts.items() if w not in common_words and len(w) > 2}
                 top_words = sorted(filtered.items(), key=lambda x: x[1], reverse=True)[:top_n_words]
                 keywords = [w for w, _ in top_words] or ['topic', str(topic_id)]
+                keywords_str = ', '.join(keywords[:5])
             except Exception:
-                keywords = [f'topic_{topic_id}']
-
-            keywords_str = ', '.join(keywords[:5])
-
-            # --- human label (actual category name) ---
-            # Use LLM if available, otherwise fall back to TF-IDF method
-            if self.llm_model is not None:
-                human_label = generate_topic_label_with_llm(topic_docs, keywords_str, self.llm_model)
-            else:
-                human_label = make_human_label(topic_docs, keywords_str)
-
+                keywords_str = f'topic_{topic_id}'
+            
+            keywords_dict[topic_id] = keywords_str
+        
+        # PHASE 2: Generate human-readable labels
+        # ⚡ NEW: Use optimized adaptive parallel batched LLM labeling
+        if self.llm_model is not None:
+            num_topics = len(topics_dict) - (1 if -1 in topics_dict else 0)
+            st.info(f"🤖 Using LLM for {num_topics} topic labels (optimized batching enabled)")
+            
+            # Create adaptive parallel labeler (auto-detects system capabilities)
+            labeler = AdaptiveParallelLLMLabeler(
+                llm_model=self.llm_model,
+                system_params=None,  # Auto-detect
+                max_docs_per_topic=5
+            )
+            
+            # Generate all labels in parallel batches with adaptive sizing
+            labels_dict = labeler.label_all_topics(
+                topics_dict=topics_dict,
+                keywords_dict=keywords_dict,
+                fallback_func=make_human_label,
+                show_progress=True
+            )
+        else:
+            # No LLM - use TF-IDF based fallback for all topics
+            labels_dict = {}
+            
+            if len(topics_dict) > 100:
+                progress_bar = st.progress(0.0)
+                st.info("Generating labels using TF-IDF method...")
+            
+            for i, (topic_id, docs) in enumerate(topics_dict.items()):
+                if topic_id != -1:
+                    labels_dict[topic_id] = make_human_label(docs, keywords_dict[topic_id])
+                    
+                    if len(topics_dict) > 100:
+                        progress_bar.progress((i + 1) / len(topics_dict))
+            
+            if len(topics_dict) > 100:
+                progress_bar.empty()
+        
+        # PHASE 3: Build final topic info dataframe
+        for topic_id in sorted(topics_dict.keys()):
+            if topic_id == -1:
+                continue
+            
+            human_label = labels_dict.get(topic_id, f"Topic {topic_id}")
+            
             topic_info_list.append({
                 'Topic': topic_id,
-                'Count': len(topic_docs),
-                'Keywords': keywords_str,
+                'Count': len(topics_dict[topic_id]),
+                'Keywords': keywords_dict[topic_id],
                 'Human_Label': human_label,
-                'Name': human_label  # keep compatibility with UI
+                'Name': human_label
             })
-
+        
         return pd.DataFrame(topic_info_list)
+
 
 # -----------------------------------------------------
 # GUARANTEE COLUMNS EXIST ON topic_info
@@ -2089,4 +2502,3 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                             st.write(f"{icon} {key.replace('_available', '').title()}")
 
 if __name__ == "__main__":
-    main()
