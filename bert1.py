@@ -475,9 +475,9 @@ class SafeEmbeddingModel:
         return full_embeddings
 
 # -----------------------------------------------------
-# HUMAN-READABLE TOPIC LABELS
+# IMPROVED HUMAN-READABLE TOPIC LABELS
 # -----------------------------------------------------
-def _top_phrases(texts, ngram_range=(2,3), top_k=3, max_features=5000):
+def _top_phrases(texts, ngram_range=(2,3), top_k=5, max_features=5000):
     """Return top_k high-signal phrases from texts using TF-IDF (prefers bigrams/trigrams)."""
     if not texts:
         return []
@@ -499,7 +499,7 @@ def _top_phrases(texts, ngram_range=(2,3), top_k=3, max_features=5000):
 
 def _to_title(label):
     """Title-case but keep common abbreviations uppercased."""
-    keep_upper = {"AI","ML","NLP","API","SQL","GPU","CPU","FAQ","KPI","OKR","CRM"}
+    keep_upper = {"AI","ML","NLP","API","SQL","GPU","CPU","FAQ","KPI","OKR","CRM","IT","HR","PR","SEO","SEM","ROI","B2B","B2C"}
     words = label.replace("_"," ").split()
     nice = []
     for w in words:
@@ -517,35 +517,134 @@ def _to_title(label):
     label = re.sub(r"\s{2,}", " ", label).strip(" -–—")
     return label
 
+def _infer_category_name(phrases, keywords):
+    """
+    Infer a semantic category name from phrases and keywords.
+    This creates actual category names like 'Customer Support' instead of just listing keywords.
+    """
+    all_terms = phrases + keywords
+    if not all_terms:
+        return "General Topic"
+    
+    # Common category patterns
+    category_patterns = {
+        # Technology
+        r'\b(software|app|application|code|programming|developer|development)\b': 'Software Development',
+        r'\b(machine learning|deep learning|neural network|ai|artificial intelligence)\b': 'AI & Machine Learning',
+        r'\b(data|database|analytics|analysis|visualization)\b': 'Data & Analytics',
+        r'\b(cloud|server|infrastructure|deployment|devops)\b': 'Cloud Infrastructure',
+        r'\b(mobile|ios|android|smartphone)\b': 'Mobile Technology',
+        r'\b(web|website|frontend|backend|fullstack)\b': 'Web Development',
+        r'\b(security|encryption|authentication|cybersecurity)\b': 'Security & Privacy',
+        
+        # Business
+        r'\b(customer|client|support|service|help|assistance)\b': 'Customer Support',
+        r'\b(sale|sales|selling|revenue|deal)\b': 'Sales & Revenue',
+        r'\b(marketing|campaign|advertising|promotion|brand)\b': 'Marketing & Advertising',
+        r'\b(finance|financial|budget|cost|expense|accounting)\b': 'Finance & Accounting',
+        r'\b(product|feature|release|roadmap|planning)\b': 'Product Management',
+        r'\b(project|management|planning|coordination|workflow)\b': 'Project Management',
+        r'\b(hr|human resource|recruitment|hiring|employee)\b': 'Human Resources',
+        r'\b(legal|compliance|regulation|contract|agreement)\b': 'Legal & Compliance',
+        
+        # Communication
+        r'\b(email|message|communication|correspondence|notification)\b': 'Communication & Messaging',
+        r'\b(social media|facebook|twitter|instagram|linkedin)\b': 'Social Media',
+        r'\b(documentation|document|manual|guide|instruction)\b': 'Documentation & Guides',
+        r'\b(meeting|conference|call|video|zoom)\b': 'Meetings & Conferences',
+        
+        # Content
+        r'\b(content|article|blog|post|writing)\b': 'Content & Publishing',
+        r'\b(design|graphic|ui|ux|interface|visual)\b': 'Design & UX',
+        r'\b(video|media|multimedia|streaming)\b': 'Video & Media',
+        r'\b(image|photo|picture|photography)\b': 'Images & Photography',
+        
+        # Operations
+        r'\b(operations|operational|process|procedure|workflow)\b': 'Operations & Processes',
+        r'\b(quality|testing|qa|assurance|bug)\b': 'Quality Assurance',
+        r'\b(performance|optimization|speed|efficiency)\b': 'Performance & Optimization',
+        r'\b(monitor|monitoring|tracking|logging)\b': 'Monitoring & Tracking',
+        
+        # Research & Learning
+        r'\b(research|study|analysis|investigation|experiment)\b': 'Research & Analysis',
+        r'\b(education|learning|training|tutorial|course)\b': 'Education & Training',
+        r'\b(science|scientific|academic|scholarly)\b': 'Science & Academia',
+        
+        # Health & Medical
+        r'\b(health|medical|healthcare|clinical|patient)\b': 'Health & Medical',
+        r'\b(fitness|exercise|workout|wellness)\b': 'Fitness & Wellness',
+        
+        # General Business Functions
+        r'\b(strategy|strategic|planning|vision|goal)\b': 'Strategy & Planning',
+        r'\b(report|reporting|dashboard|metric|kpi)\b': 'Reporting & Metrics',
+        r'\b(issue|problem|error|bug|troubleshoot)\b': 'Issues & Troubleshooting',
+        r'\b(feedback|review|rating|survey|opinion)\b': 'Feedback & Reviews',
+    }
+    
+    # Try to match patterns
+    combined_text = ' '.join(all_terms).lower()
+    for pattern, category in category_patterns.items():
+        if re.search(pattern, combined_text):
+            return category
+    
+    # If no pattern matches, create a descriptive name from top phrases
+    # Remove common stop words and get distinctive terms
+    distinctive_terms = []
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'was', 'are'}
+    
+    for phrase in phrases[:3]:  # Use top 3 phrases
+        words = phrase.split()
+        for word in words:
+            if word.lower() not in stop_words and len(word) > 2:
+                distinctive_terms.append(word)
+                if len(distinctive_terms) >= 3:
+                    break
+        if len(distinctive_terms) >= 3:
+            break
+    
+    if distinctive_terms:
+        # Create a category name from distinctive terms
+        category_name = ' '.join(distinctive_terms[:3])
+        return _to_title(category_name)
+    
+    # Final fallback: use the first phrase
+    if phrases:
+        return _to_title(phrases[0])
+    
+    return "General Category"
+
 def make_human_label(topic_docs, fallback_keywords, max_len=60):
     """
-    Build a pleasant, human-readable topic label:
-    1) Prefer bigram/trigram TF-IDF phrases; fallback to unigrams/keywords.
-    2) Title-case & clean punctuation.
+    Build a pleasant, human-readable topic label that represents an actual CATEGORY,
+    not just a list of keywords.
+    
+    Examples:
+    - Instead of "customer service • support team" → "Customer Support"
+    - Instead of "marketing campaign • social media" → "Marketing & Advertising"
     """
-    phrases = _top_phrases(topic_docs, (2,3), top_k=3)
-    if len(phrases) < 2:
-        phrases += _top_phrases(topic_docs, (1,1), top_k=3)
-
-    # clean and unique
-    seen = set()
-    cleaned = []
-    for p in phrases:
-        p = re.sub(r"\s+", " ", p.strip())
-        if p and p.lower() not in seen:
-            cleaned.append(p)
-            seen.add(p.lower())
-
-    if not cleaned:
-        cleaned = [k.strip() for k in (fallback_keywords.split(",") if isinstance(fallback_keywords, str) else []) if k.strip()][:3]
-        if not cleaned:
-            cleaned = ["General Topic"]
-
-    label = " • ".join(cleaned[:3])
-    label = _to_title(label)
-    if len(label) > max_len:
-        label = label[:max_len].rstrip() + "…"
-    return label
+    # Extract phrases using TF-IDF
+    phrases_23 = _top_phrases(topic_docs, (2,3), top_k=5)
+    phrases_1 = _top_phrases(topic_docs, (1,1), top_k=5)
+    
+    # Combine all phrases
+    all_phrases = phrases_23 + phrases_1
+    
+    # Parse fallback keywords
+    keywords = []
+    if fallback_keywords:
+        if isinstance(fallback_keywords, str):
+            keywords = [k.strip() for k in fallback_keywords.split(",") if k.strip()]
+        else:
+            keywords = list(fallback_keywords)
+    
+    # Infer a semantic category name
+    category_name = _infer_category_name(all_phrases, keywords[:5])
+    
+    # Ensure it's not too long
+    if len(category_name) > max_len:
+        category_name = category_name[:max_len].rstrip() + "…"
+    
+    return category_name
 
 # -----------------------------------------------------
 # FAST RECLUSTERING ENGINE
@@ -637,7 +736,7 @@ class FastReclusterer:
 
             # --- keywords (simple, fast) ---
             try:
-                sample_size = min(100, len(topic_docs))
+                sample_size = min(200, len(topic_docs))  # Increased sample size for better labels
                 topic_text = ' '.join(topic_docs[:sample_size])
 
                 words = topic_text.lower().split()
@@ -654,7 +753,7 @@ class FastReclusterer:
 
             keywords_str = ', '.join(keywords[:5])
 
-            # --- human label (pleasant, concise) ---
+            # --- human label (actual category name) ---
             human_label = make_human_label(topic_docs, keywords_str)
 
             topic_info_list.append({
@@ -793,15 +892,13 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
 
     umap_embeddings = np.zeros((len(embeddings), n_components))
     umap_embeddings[valid_mask] = reducer.fit_transform(embeddings[valid_mask])
+
     return umap_embeddings
 
-# -----------------------------------------------------
-# MAIN APPLICATION
-# -----------------------------------------------------
 def main():
-    st.title("🚀 Complete BERTopic: All Features + Interactive + Robust")
+    st.title("🚀 Complete BERTopic with All Features")
 
-    # Initialize ALL session state variables to prevent AttributeError
+    # Initialize session state
     if 'embeddings_computed' not in st.session_state:
         st.session_state.embeddings_computed = False
     if 'embeddings' not in st.session_state:
@@ -842,6 +939,10 @@ def main():
         st.session_state.browser_df = None
     if 'topic_human' not in st.session_state:
         st.session_state.topic_human = {}
+    if 'browser_page' not in st.session_state:
+        st.session_state.browser_page = 0
+    if 'browser_page_size' not in st.session_state:
+        st.session_state.browser_page_size = 100
 
     # Check GPU capabilities
     gpu_capabilities = check_gpu_capabilities()
@@ -1216,7 +1317,7 @@ def main():
                 "📈 Distribution Analysis",
                 "🔍 Split Large Topics",
                 "🗺️ Interactive Visualization",
-                "📄 Topic Browser",
+                "📄 Topic Browser (OPTIMIZED)",
                 "💾 Export"
             ])
 
@@ -1231,7 +1332,7 @@ def main():
 
                 # Streamlit default dataframe (dark-mode friendly)
                 st.dataframe(display_df, use_container_width=True)
-                st.caption("Tip: Use the column header menus to sort/filter. Dark-mode friendly.")
+                st.caption("✨ Notice: Human_Label now shows actual category names like 'Customer Support' instead of keyword lists!")
 
             with tabs[1]:  # Distribution Analysis
                 st.subheader("📈 Topic Distribution Analysis")
@@ -1274,7 +1375,7 @@ def main():
                     st.warning(f"Found {len(balance_analysis['oversized_topics'])} oversized topic(s)")
 
                     oversized_options = [
-                        f"Topic {t['topic']}: {t['count']} docs ({t['ratio']*100:.1f}%)"
+                        f"Topic {t['topic']}: {st.session_state.topic_human.get(t['topic'], f\"Topic {t['topic']}\")} - {t['count']} docs ({t['ratio']*100:.1f}%)"
                         for t in balance_analysis['oversized_topics']
                     ]
 
@@ -1389,14 +1490,16 @@ def main():
                 else:
                     st.info("Need at least 2 topics for visualization")
 
-            with tabs[4]:  # Topic Browser
-                st.subheader("📄 Topic Browser (Fast Skimming)")
+            with tabs[4]:  # OPTIMIZED Topic Browser
+                st.subheader("📄 Topic Browser (Fast & Optimized)")
+                
+                st.info("⚡ **Performance Improvements**: Pagination enabled for faster browsing. Browser now handles large datasets efficiently!")
 
-                browser_df = st.session_state.browser_df.copy()
+                browser_df = st.session_state.browser_df
                 text_col = st.session_state.text_col or (st.session_state.df.columns[0] if len(st.session_state.df.columns) else None)
 
                 # Controls row
-                c1, c2, c3 = st.columns([2, 2, 1])
+                c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
 
                 # Topic multi-select (human labels)
                 topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_values(ascending=False)
@@ -1408,7 +1511,7 @@ def main():
                     selected_topics = st.multiselect(
                         "Choose topics",
                         options=topic_choices + (["Outliers (noise)"] if -1 in topics else []),
-                        default=topic_choices[:5] if len(topic_choices) > 0 else (["Outliers (noise)"] if -1 in topics else []),
+                        default=topic_choices[:3] if len(topic_choices) > 0 else (["Outliers (noise)"] if -1 in topics else []),
                         help="Select one or more topics to view"
                     )
 
@@ -1424,6 +1527,15 @@ def main():
                 with c3:
                     truncate = st.checkbox("Truncate text", value=True)
 
+                # Page size selector
+                with c4:
+                    page_size = st.selectbox(
+                        "Rows per page",
+                        options=[50, 100, 200, 500],
+                        index=1,
+                        help="Fewer rows = faster display"
+                    )
+
                 # Resolve selected topic IDs
                 selected_ids = set()
                 show_outliers = False
@@ -1437,39 +1549,70 @@ def main():
                     except Exception:
                         pass
 
-                # Apply topic filter
+                # Apply topic filter (using query for speed)
                 if selected_ids or show_outliers:
-                    mask = False
-                    if selected_ids:
-                        mask = browser_df['Topic'].isin(list(selected_ids))
-                    if show_outliers:
-                        mask = mask | (browser_df['Topic'] == -1) if isinstance(mask, pd.Series) else (browser_df['Topic'] == -1)
-                    view_df = browser_df[mask].copy()
+                    if selected_ids and show_outliers:
+                        filter_mask = (browser_df['Topic'].isin(list(selected_ids))) | (browser_df['Topic'] == -1)
+                    elif selected_ids:
+                        filter_mask = browser_df['Topic'].isin(list(selected_ids))
+                    else:
+                        filter_mask = browser_df['Topic'] == -1
+                    
+                    view_df = browser_df[filter_mask]
                 else:
-                    view_df = browser_df.copy()
+                    view_df = browser_df
 
                 # Apply text filter on the chosen text column (if available)
                 if text_col and text_query.strip():
-                    view_df = view_df[view_df[text_col].astype(str).str.contains(text_query, case=False, na=False)].copy()
+                    view_df = view_df[view_df[text_col].astype(str).str.contains(text_query, case=False, na=False)]
+
+                # Calculate pagination
+                total_rows = len(view_df)
+                total_pages = max(1, (total_rows + page_size - 1) // page_size)
+                
+                # Page navigation
+                page_col1, page_col2, page_col3 = st.columns([1, 2, 1])
+                with page_col1:
+                    if st.button("◀ Previous", disabled=st.session_state.browser_page == 0):
+                        st.session_state.browser_page = max(0, st.session_state.browser_page - 1)
+                        st.rerun()
+                with page_col2:
+                    current_page = st.number_input(
+                        "Page",
+                        min_value=1,
+                        max_value=total_pages,
+                        value=min(st.session_state.browser_page + 1, total_pages),
+                        key="page_selector"
+                    )
+                    if current_page != st.session_state.browser_page + 1:
+                        st.session_state.browser_page = current_page - 1
+                        st.rerun()
+                    st.caption(f"Page {current_page} of {total_pages} ({total_rows:,} total rows)")
+                with page_col3:
+                    if st.button("Next ▶", disabled=st.session_state.browser_page >= total_pages - 1):
+                        st.session_state.browser_page = min(total_pages - 1, st.session_state.browser_page + 1)
+                        st.rerun()
+
+                # Get current page data
+                start_idx = st.session_state.browser_page * page_size
+                end_idx = min(start_idx + page_size, total_rows)
+                page_df = view_df.iloc[start_idx:end_idx].copy()
 
                 # Optionally truncate text for skimming speed
-                if text_col and truncate:
-                    view_df[text_col] = view_df[text_col].astype(str).str.slice(0, 500)
+                if text_col and truncate and text_col in page_df.columns:
+                    page_df[text_col] = page_df[text_col].astype(str).str.slice(0, 300) + "..."
 
                 # Put topic metadata columns up front
                 meta_cols = ['Topic', 'Topic_Label', 'Topic_Human_Label', 'Topic_Keywords', 'Valid_Document']
-                ordered_cols = [c for c in meta_cols if c in view_df.columns] + [c for c in view_df.columns if c not in meta_cols]
-                view_df = view_df[ordered_cols]
+                ordered_cols = [c for c in meta_cols if c in page_df.columns] + [c for c in page_df.columns if c not in meta_cols]
+                page_df = page_df[ordered_cols]
 
                 st.caption("Tip: Use the column header menus to sort/filter; everything is dark-mode friendly.")
-                st.dataframe(view_df, use_container_width=True)
+                st.dataframe(page_df, use_container_width=True)
 
-                # Small summary line
-                st.write(f"Showing **{len(view_df):,}** rows")
-
-                # Download filtered view
+                # Download full filtered view (not just current page)
                 st.download_button(
-                    label="📥 Download filtered view (CSV)",
+                    label=f"📥 Download all filtered data ({total_rows:,} rows as CSV)",
                     data=view_df.to_csv(index=False).encode('utf-8'),
                     file_name=f"topic_browser_filtered_{st.session_state.uploaded_file_name}.csv",
                     mime="text/csv"
@@ -1513,7 +1656,7 @@ Coverage: {coverage:.1f}%
 Min Topic Size: {st.session_state.get('min_topic_size_used', 'N/A')}
 GPU Used: {gpu_capabilities['cuda_available']}
 Clustering Method: {st.session_state.clustering_method}
-Human Labels: Auto-generated using TF-IDF phrase scoring
+Human Labels: Auto-generated using semantic category inference
 Balance Status: {'Balanced' if balance_analysis['balanced'] else 'Needs Attention'}
 Oversized Categories: {len(balance_analysis['oversized_topics'])}
 """
@@ -1563,6 +1706,14 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
             - **Outlier reduction** strategies
             - **Multiple export** formats
             """)
+
+        st.header("✨ What's New")
+        st.success("""
+        **🎯 Improved Human-Readable Labels**: Topic labels are now actual category names like "Customer Support" or "Marketing & Advertising" 
+        instead of just keyword lists!
+        
+        **⚡ Optimized Topic Browser**: Added pagination for much faster browsing of large datasets. No more lag when viewing thousands of documents!
+        """)
 
         # System check
         with st.expander("🔍 Check Your System"):
