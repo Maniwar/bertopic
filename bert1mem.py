@@ -507,68 +507,84 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
                 
                 sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
             
-            # Show FULL documents (up to 800 chars each) - let LLM see the real content
-            docs_preview = "\n\n".join([
-                f"Document {j+1}:\n{doc[:800]}" 
+            # ✅ SMART SCALING: More docs = shorter excerpts to fit in context
+            if max_docs_per_topic >= 40:
+                doc_length = 400  # Phi-128k with 50 docs: 400 chars each
+            elif max_docs_per_topic >= 20:
+                doc_length = 500  # Mid-size: 500 chars each
+            elif max_docs_per_topic >= 10:
+                doc_length = 600  # Standard: 600 chars each
+            else:
+                doc_length = 800  # Few docs: show more per doc
+            
+            # Show documents with CRYSTAL CLEAR boundaries
+            docs_preview = "\n".join([
+                f"━━━ DOCUMENT {j+1} of {len(sample_docs)} ━━━\n{doc[:doc_length]}\n━━━ END DOC {j+1} ━━━" 
                 for j, doc in enumerate(sample_docs[:max_docs_per_topic])
             ])
             
             topics_text.append(
                 f"\n{'='*70}\n"
-                f"TOPIC {i}\n"
+                f"📋 TOPIC {i}\n"
                 f"Keywords: {keywords}\n"
-                f"Total documents in topic: {len(all_docs)}\n"
+                f"Analyzing {len(sample_docs)} representative documents (from {len(all_docs)} total)\n"
                 f"\n{docs_preview}\n"
             )
         
         # ✅ CHAIN-OF-THOUGHT PROMPT: Let the LLM think, then label
         batch_prompt = f"""You are an expert at analyzing customer support conversations and creating descriptive category names.
 
-I'll show you several topics with real customer messages. For each topic:
-1. Read the actual customer messages carefully
-2. Think about what common issue or request they share
-3. Create a clear, descriptive category name that captures the essence
+I'll show you several topics with real customer messages. Each topic contains multiple documents clearly marked with:
+━━━ DOCUMENT X of Y ━━━
+[customer message]
+━━━ END DOC X ━━━
+
+For each topic:
+1. Read through ALL the documents carefully (they're clearly separated)
+2. Identify the common thread - what do these customers need?
+3. Create a clear, descriptive category name
 
 **YOUR TASK:**
 For each topic, write:
-- A brief analysis (1-2 sentences) of what the customers need
-- A descriptive category name (as many words as needed to be clear and specific)
+- Analysis: Brief explanation (1-2 sentences) of the common customer need
+- Category: A descriptive name (use as many words as needed to be clear and specific)
 
 **WHAT MAKES A GOOD CATEGORY NAME:**
-- Uses specific products, services, or issues mentioned by customers
-- Clear enough that someone could route the conversation to the right team
-- Descriptive enough to understand without seeing the documents
-- Natural language (how a human would describe it)
+- Mentions specific products, services, or issues from the documents
+- Clear enough for support routing (which team should handle this?)
+- Self-explanatory without needing to read the documents
+- Natural language (how a human support manager would describe it)
 
-**EXAMPLES OF GOOD CATEGORY NAMES:**
-- "Samsung Galaxy Z Fold Trade-In Value Questions"
-- "Washer and Dryer Delivery Scheduling and Installation"
-- "Student Discount Verification and Approval Process"
-- "Adding Products to Existing Orders Before Shipment"
-- "Unlocked Phone Compatibility With Current Carrier"
-- "Order Status Tracking Number Issues and Updates"
+**EXAMPLES OF EXCELLENT CATEGORY NAMES:**
+✓ "Samsung Galaxy Z Fold Trade-In Value Questions"
+✓ "Washer and Dryer Delivery Scheduling and Installation Concerns"
+✓ "Student Discount Verification and Approval Process"
+✓ "Adding Additional Products to Existing Orders Before Shipment"
+✓ "Unlocked Phone Compatibility With Current Carrier Plans"
+✓ "Order Status Tracking Number Not Working or Not Updating"
+✓ "Canceling Individual Items From Recently Placed Orders"
 
 **AVOID:**
-- Generic phrases like "Help with Order" or "Product Question"
-- Single words or very short phrases
-- Abstract categories that don't tell you what the issue is
+✗ Generic phrases: "Help with Order", "Product Question", "Customer Support"
+✗ Single words or ultra-short phrases
+✗ Vague categories that don't tell you the actual issue
 
 {chr(10).join(topics_text)}
 
 {'='*70}
 
-Now analyze each topic and create category names:
+Now analyze each topic by reading ALL the documents, then create a descriptive category name.
 
-FORMAT (one per topic):
+FORMAT (exactly like this):
 Topic 1:
-Analysis: [What are customers trying to do/asking about?]
+Analysis: [What common need/issue do these customers share?]
 Category: [Descriptive category name]
 
 Topic 2:
-Analysis: [What are customers trying to do/asking about?]
+Analysis: [What common need/issue do these customers share?]
 Category: [Descriptive category name]
 
-Begin:"""
+Begin your analysis:"""
         
         # Generate with much more space for thoughtful responses
         inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length)
