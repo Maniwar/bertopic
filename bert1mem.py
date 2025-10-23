@@ -382,6 +382,40 @@ class AdaptiveProgressTracker:
             self.status_container.success(f"✅ {self.operation_name} complete! (took {elapsed:.1f}s, {self.total_items/elapsed:.1f} items/sec)")
 
 
+
+
+def clean_documents_for_llm(docs, max_docs=50):
+    """
+    Clean documents for LLM by removing sanitized tokens and noise
+    
+    This handles:
+    - <entity_type> and similar sanitization markers
+    - XML-style tags
+    - Excessive repetition
+    - Special characters that confuse LLMs
+    """
+    cleaned = []
+    for doc in docs[:max_docs]:
+        # Remove common sanitization patterns
+        text = str(doc)
+        
+        # Remove XML-style sanitization tags but keep the context
+        text = re.sub(r'<entity_type>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)  # Remove any other XML tags
+        
+        # Remove excessive repetition (same word 3+ times in a row)
+        text = re.sub(r'\b(\w+)(\s+\1){2,}\b', r'\1', text)
+        
+        # Clean up whitespace
+        text = ' '.join(text.split())
+        
+        # Only keep if meaningful length
+        if len(text) > 20:
+            cleaned.append(text)
+    
+    return cleaned
+
+
 def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20):
     """
     Generate labels for multiple topics in a single LLM call
@@ -400,10 +434,15 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
         model, tokenizer = llm_model
         
         topics_text = []
-        for i, item in enumerate(batch_data[:max_topics_per_batch], 1):
+        for i, item in enumerate(batch_data[:max_topics_per_topic], 1):
             topic_id = item['topic_id']
             keywords = item['keywords']
             all_docs = item['docs']
+            
+            # ✅ NEW: Clean documents FIRST to remove sanitized tokens
+            all_docs = clean_documents_for_llm(all_docs)
+            if not all_docs:
+                continue
             
             # ✅ IMPROVEMENT 1: Sample DIVERSE documents (not just first 3)
             # Take from beginning, middle, and end to get variety
@@ -429,56 +468,64 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
                 
                 sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
             
-            # ✅ IMPROVEMENT 2: Show FULL document content (500 chars, not 150!)
+            # ✅ IMPROVEMENT 2: Show MORE content (600 chars, not 500!)
             # This gives LLM actual context to understand the topic themes
             docs_preview = "\n".join([
-                f"  Doc {j+1}: {doc[:500]}{'...' if len(doc) > 500 else ''}" 
+                f"  Message {j+1}: {doc[:600]}{'...' if len(doc) > 600 else ''}" 
                 for j, doc in enumerate(sample_docs)
             ])
             
-            # ✅ IMPROVEMENT 3: Structure that emphasizes documents over keywords
+            # ✅ IMPROVEMENT 3: Structure that emphasizes actual content
             topics_text.append(
-                f"\n{'='*60}\n"
+                f"\n{'='*70}\n"
                 f"TOPIC {i} (ID: {topic_id})\n"
-                f"{'='*60}\n"
+                f"{'='*70}\n"
                 f"Reference keywords: {keywords}\n"
                 f"\n"
-                f"ACTUAL DOCUMENTS (read these carefully):\n"
+                f"ACTUAL USER MESSAGES:\n"
                 f"{docs_preview}\n"
             )
         
-        # ✅ IMPROVEMENT 4: Much better prompt emphasizing document content
-        batch_prompt = f"""You are analyzing document topics. For each topic below, read the ACTUAL DOCUMENTS carefully and create a descriptive label that captures the main theme.
+        # ✅ IMPROVEMENT 4: MUCH STRONGER prompt for anonymized customer support data
+        batch_prompt = f"""You are analyzing customer support messages. These messages have been anonymized for privacy (some words are removed). Your job is to create a SPECIFIC category name for each topic that describes what customers are actually asking about or trying to do.
 
-CRITICAL INSTRUCTIONS:
-1. READ THE DOCUMENTS - base your label on what the documents are actually about
-2. Keywords are just hints - focus on understanding the actual document content
-3. Each label should be 2-5 words describing the main category/theme
-4. Make labels DISTINCT from each other - avoid duplicates or very similar labels
-5. Be SPECIFIC - use actual themes you see in the documents, not generic terms
+CRITICAL RULES:
+1. READ THE MESSAGES CAREFULLY - understand the customer's actual intent/need
+2. IGNORE these generic words that appear everywhere: "editing", "order", "help", "question", "product", "entity_type"
+3. Focus on the SPECIFIC REQUEST, ISSUE, or PRODUCT mentioned in the messages
+4. Each label must be 3-6 words and describe the ACTUAL customer need
+5. Make labels VERY DISTINCT - avoid any repetitive patterns
+6. Be SPECIFIC about what product, service, or action is involved
 
-GOOD LABEL EXAMPLES:
-✓ "Customer Support Inquiries"
-✓ "Product Development Updates"  
-✓ "Marketing Campaign Performance"
-✓ "Technical Infrastructure Issues"
-✓ "Employee Onboarding Process"
+GOOD LABELS (specific, clear customer need):
+✓ "Student Discount Program Inquiries"
+✓ "Galaxy Phone Wireless Charging Issues"
+✓ "Refrigerator Return Policy Questions"
+✓ "Samsung Account Login Problems"
+✓ "Model Number Identification Help"
+✓ "Promotional Code Redemption Errors"
 
-BAD LABEL EXAMPLES:
-✗ "Various Documents" (too vague)
-✗ "Customer Service" (too generic without context)
-✗ "Information" (meaningless)
+BAD LABELS (too generic, repetitive):
+✗ "Editing Order Product" ← What product? What's the issue?
+✗ "Question Discounts Entity_type" ← Not specific enough
+✗ "Order Help" ← Help with what?
+✗ "Product Question" ← Which product? What question?
+
+REMEMBER: These are REAL customer messages. Look for:
+- What product/service are they asking about?
+- What problem are they having?
+- What are they trying to accomplish?
 
 {chr(10).join(topics_text)}
 
-{'='*60}
+{'='*70}
 
-Now, carefully read each topic's DOCUMENTS above and create specific, descriptive labels based on what you read.
+Now create SPECIFIC category names. Ask yourself: "If I saw this topic name, would I know exactly what customers need help with?"
 
-Format your response EXACTLY like this:
-Topic 1: [Specific label based on documents]
-Topic 2: [Specific label based on documents]
-Topic 3: [Specific label based on documents]
+Format EXACTLY:
+Topic 1: [Specific customer need/issue]
+Topic 2: [Specific customer need/issue]
+Topic 3: [Specific customer need/issue]
 
 Your labels:"""
         
@@ -490,11 +537,11 @@ Your labels:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=200,  # More space for quality labels
-                temperature=0.5,     # Lower for more focused, consistent output
+                max_new_tokens=250,  # More space for quality labels
+                temperature=0.3,     # Lower for more focused, less random output
                 do_sample=True,
-                top_p=0.85,          # Slightly lower for better quality
-                repetition_penalty=1.2,  # ✅ NEW: Discourage repetitive labels
+                top_p=0.75,          # Narrower for better quality
+                repetition_penalty=1.8,  # ✅ MUCH HIGHER: Strongly discourage repetition
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -503,23 +550,31 @@ Your labels:"""
         # Extract only the generated labels part
         if "Your labels:" in response:
             response = response.split("Your labels:")[-1]
-        elif "Now, carefully" in response:
-            response = response.split("Now, carefully")[-1]
-        elif "Now generate" in response:
-            response = response.split("Now generate")[-1]
+        elif "Format EXACTLY" in response:
+            response = response.split("Format EXACTLY")[-1]
+        elif "Now create" in response:
+            response = response.split("Now create")[-1]
         
         labels_dict = {}
         lines = response.strip().split('\n')
         
-        # ✅ IMPROVEMENT 6: Expanded invalid patterns to catch more placeholders
+        # ✅ Expanded invalid patterns
         invalid_patterns = [
             '[label]', '[your', 'your label', 'descriptive label', 
             'label here', 'topic name', '[insert', 'placeholder',
-            'based on documents', '[', ']',  # Reject anything with brackets
-            'specific label', 'various', 'documents only'
+            'based on', '[', ']',  # Reject anything with brackets
+            'entity_type', 'entity type',  # Reject sanitization artifacts
+            'customer need', 'customer issue',  # Reject prompt echoes
         ]
         
-        # ✅ IMPROVEMENT 7: Track seen labels to avoid duplicates
+        # ✅ NEW: Aggressive generic pattern rejection
+        generic_starts = [
+            'editing order', 'question discounts', 'question about', 'help with',
+            'order help', 'order product', 'product question', 'product help',
+            'existing order', 'question ', 'help ', 'order ', 'product '
+        ]
+        
+        # Track seen labels to avoid duplicates
         seen_labels = set()
         
         for line in lines:
@@ -539,19 +594,26 @@ Your labels:"""
                     # Reject placeholder text
                     is_placeholder = any(pattern in label_lower for pattern in invalid_patterns)
                     
-                    # ✅ IMPROVEMENT 8: Reject duplicates
+                    # ✅ NEW: Reject generic starts
+                    is_generic = any(label_lower.startswith(start) for start in generic_starts)
+                    
+                    # Reject duplicates
                     is_duplicate = label_lower in seen_labels
                     
+                    # ✅ NEW: Require meaningful word count
+                    word_count = len(label.split())
+                    
                     if 1 <= topic_num <= len(batch_data):
-                        # Validate: proper length, not placeholder, not duplicate
-                        if (5 <= len(label) <= 70 and 
-                            2 <= len(label.split()) <= 8 and 
+                        # ✅ STRICTER validation: longer, more words, not generic
+                        if (15 <= len(label) <= 80 and 
+                            3 <= word_count <= 8 and 
                             not is_placeholder and
-                            not is_duplicate):
+                            not is_duplicate and
+                            not is_generic):
                             
                             actual_topic_id = batch_data[topic_num - 1]['topic_id']
                             labels_dict[actual_topic_id] = label
-                            seen_labels.add(label_lower)  # Track to prevent duplicates
+                            seen_labels.add(label_lower)
                             
             except (ValueError, IndexError):
                 continue
@@ -2124,7 +2186,6 @@ def main():
                         "LLM Model",
                         [
                             "microsoft/Phi-3-mini-4k-instruct",  # 3.8GB - Fast, good quality
-                            "microsoft/Phi-3-mini-128k-instruct",  # 3.8GB - Better context window, good quality
                             "mistralai/Mistral-7B-Instruct-v0.2",  # 14GB - Better quality
                             "HuggingFaceH4/zephyr-7b-beta",  # 14GB - Good quality
                         ],
