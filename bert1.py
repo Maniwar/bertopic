@@ -972,10 +972,6 @@ def main():
         st.session_state.browser_df = None
     if 'topic_human' not in st.session_state:
         st.session_state.topic_human = {}
-    if 'browser_page' not in st.session_state:
-        st.session_state.browser_page = 0
-    if 'browser_page_size' not in st.session_state:
-        st.session_state.browser_page_size = 100
 
     # Check GPU capabilities
     gpu_capabilities = check_gpu_capabilities()
@@ -1277,9 +1273,6 @@ def main():
                     if 'processed_df' in st.session_state:
                         del st.session_state.processed_df
                     
-                    # Reset browser page
-                    st.session_state.browser_page = 0
-                    
                     st.success(f"✅ Reclustered into {len(topic_info[topic_info['Topic'] != -1])} topics!")
                     st.rerun()  # CRITICAL: Force full page refresh
                 else:
@@ -1537,142 +1530,92 @@ def main():
                 else:
                     st.info("Need at least 2 topics for visualization")
 
-            with tabs[4]:  # OPTIMIZED Topic Browser
-                st.subheader("📄 Topic Browser (Fast & Optimized)")
-                
-                st.info("⚡ **Performance Improvements**: Pagination enabled for faster browsing. Browser now handles large datasets efficiently!")
+            with tabs[4]:  # Fast Topic Browser
+                st.subheader("📄 Topic Browser")
 
                 browser_df = st.session_state.browser_df
                 text_col = st.session_state.text_col or (st.session_state.df.columns[0] if len(st.session_state.df.columns) else None)
 
-                # Controls row
-                c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
-
-                # Topic multi-select (human labels)
-                topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_values(ascending=False)
-                topic_choices = [
-                    f"{tid} — {st.session_state.topic_human.get(tid, f'Topic {tid}')} ({topic_counts.get(tid, 0)} docs)"
-                    for tid in topic_counts.index.tolist()
-                ]
-                with c1:
-                    selected_topics = st.multiselect(
-                        "Choose topics",
-                        options=topic_choices + (["Outliers (noise)"] if -1 in topics else []),
-                        default=topic_choices[:3] if len(topic_choices) > 0 else (["Outliers (noise)"] if -1 in topics else []),
-                        help="Select one or more topics to view"
-                    )
-
-                # Text filter
-                with c2:
-                    text_query = st.text_input(
-                        f"Filter by text ({text_col})",
-                        value="",
-                        placeholder="Type to filter rows by substring (case-insensitive)"
-                    )
-
-                # Truncate toggle
-                with c3:
-                    truncate = st.checkbox("Truncate text", value=True)
-
-                # Page size selector
-                with c4:
-                    page_size = st.selectbox(
-                        "Rows per page",
-                        options=[50, 100, 200, 500],
-                        index=1,
-                        help="Fewer rows = faster display"
-                    )
-
-                # Resolve selected topic IDs
-                selected_ids = set()
-                show_outliers = False
-                for s in selected_topics:
-                    if s == "Outliers (noise)":
-                        show_outliers = True
-                        continue
-                    try:
-                        tid = int(s.split(" — ")[0])
-                        selected_ids.add(tid)
-                    except Exception:
-                        pass
-
-                # OPTIMIZED: Use numpy boolean indexing for speed
-                topic_array = browser_df['Topic'].values
+                # Simple dropdown for topic selection
+                topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_index()
                 
-                if selected_ids or show_outliers:
-                    # Build mask efficiently with numpy
-                    if selected_ids and show_outliers:
-                        mask = np.isin(topic_array, list(selected_ids)) | (topic_array == -1)
-                    elif selected_ids:
-                        mask = np.isin(topic_array, list(selected_ids))
-                    else:
-                        mask = topic_array == -1
+                # Build topic options with human labels
+                topic_options = {}
+                topic_options["All Topics"] = "all"
+                
+                for tid in sorted(topic_counts.index):
+                    count = topic_counts.get(tid, 0)
+                    human_label = st.session_state.topic_human.get(tid, f"Topic {tid}")
+                    topic_options[f"Topic {tid}: {human_label} ({count} docs)"] = tid
+                
+                if -1 in topics:
+                    outlier_count = sum(1 for t in topics if t == -1)
+                    topic_options[f"Outliers ({outlier_count} docs)"] = -1
+
+                # Single dropdown selector
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    selected_option = st.selectbox(
+                        "Select a topic to view documents:",
+                        options=list(topic_options.keys()),
+                        index=0,
+                        help="Choose one topic at a time for fast rendering"
+                    )
+                
+                with col2:
+                    max_rows = st.number_input(
+                        "Max rows to display:",
+                        min_value=10,
+                        max_value=10000,
+                        value=1000,
+                        step=100,
+                        help="Limit rows for faster display"
+                    )
+
+                # Get the selected topic ID
+                selected_topic_id = topic_options[selected_option]
+
+                # Fast filtering - single topic only
+                if selected_topic_id == "all":
+                    display_df = browser_df.head(max_rows)
+                    st.info(f"📊 Showing first {len(display_df):,} of {len(browser_df):,} total documents")
+                else:
+                    # Use numpy for fast filtering
+                    mask = browser_df['Topic'].values == selected_topic_id
+                    filtered_df = browser_df[mask]
+                    display_df = filtered_df.head(max_rows)
                     
-                    # Get indices and use iloc (faster than boolean indexing on pandas)
-                    matching_indices = np.where(mask)[0]
-                    view_df = browser_df.iloc[matching_indices]
-                else:
-                    view_df = browser_df
+                    if selected_topic_id == -1:
+                        st.info(f"📊 Showing {len(display_df):,} of {len(filtered_df):,} outlier documents")
+                    else:
+                        human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
+                        st.info(f"📊 Topic {selected_topic_id}: **{human_label}** — Showing {len(display_df):,} of {len(filtered_df):,} documents")
 
-                # Apply text filter on the chosen text column (if available)
-                if text_col and text_query.strip():
-                    view_df = view_df[view_df[text_col].astype(str).str.contains(text_query, case=False, na=False)]
-
-                # Calculate pagination
-                total_rows = len(view_df)
-                total_pages = max(1, (total_rows + page_size - 1) // page_size)
-                
-                # Page navigation
-                page_col1, page_col2, page_col3 = st.columns([1, 2, 1])
-                with page_col1:
-                    if st.button("◀ Previous", disabled=st.session_state.browser_page == 0):
-                        st.session_state.browser_page = max(0, st.session_state.browser_page - 1)
-                        st.rerun()
-                with page_col2:
-                    current_page = st.number_input(
-                        "Page",
-                        min_value=1,
-                        max_value=total_pages,
-                        value=min(st.session_state.browser_page + 1, total_pages),
-                        key="page_selector"
-                    )
-                    if current_page != st.session_state.browser_page + 1:
-                        st.session_state.browser_page = current_page - 1
-                        st.rerun()
-                    st.caption(f"Page {current_page} of {total_pages} ({total_rows:,} total rows)")
-                with page_col3:
-                    if st.button("Next ▶", disabled=st.session_state.browser_page >= total_pages - 1):
-                        st.session_state.browser_page = min(total_pages - 1, st.session_state.browser_page + 1)
-                        st.rerun()
-
-                # Get current page data (don't copy yet)
-                start_idx = st.session_state.browser_page * page_size
-                end_idx = min(start_idx + page_size, total_rows)
-                page_df = view_df.iloc[start_idx:end_idx]
-
-                # Optionally truncate text for skimming speed (copy only for display)
-                if text_col and truncate and text_col in page_df.columns:
-                    display_df = page_df.copy()  # Only copy the small page
-                    display_df[text_col] = display_df[text_col].astype(str).str.slice(0, 300) + "..."
-                else:
-                    display_df = page_df
-
-                # Put topic metadata columns up front
-                meta_cols = ['Topic', 'Topic_Label', 'Topic_Human_Label', 'Topic_Keywords', 'Valid_Document']
-                ordered_cols = [c for c in meta_cols if c in display_df.columns] + [c for c in display_df.columns if c not in meta_cols]
+                # Reorder columns - put topic metadata first
+                meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_Keywords']
+                other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
+                ordered_cols = [c for c in meta_cols if c in display_df.columns] + other_cols
                 display_df = display_df[ordered_cols]
 
-                st.caption("Tip: Use the column header menus to sort/filter; everything is dark-mode friendly.")
-                st.dataframe(display_df, use_container_width=True, height=600)
-                
-                # Performance info
-                st.caption(f"⚡ Displaying {len(display_df)} of {total_rows:,} filtered rows (from {len(browser_df):,} total docs)")
+                # Simple, fast dataframe display
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    height=600
+                )
 
-                # Download full filtered view (not just current page)
+                # Download button
+                if selected_topic_id == "all":
+                    download_df = browser_df
+                    filename = f"all_topics_{st.session_state.uploaded_file_name}.csv"
+                else:
+                    download_df = browser_df[browser_df['Topic'] == selected_topic_id]
+                    filename = f"topic_{selected_topic_id}_{st.session_state.uploaded_file_name}.csv"
+
                 st.download_button(
-                    label=f"📥 Download all filtered data ({total_rows:,} rows as CSV)",
-                    data=view_df.to_csv(index=False).encode('utf-8'),
-                    file_name=f"topic_browser_filtered_{st.session_state.uploaded_file_name}.csv",
+                    label=f"📥 Download {selected_option} ({len(download_df):,} rows)",
+                    data=download_df.to_csv(index=False).encode('utf-8'),
+                    file_name=filename,
                     mime="text/csv"
                 )
 
