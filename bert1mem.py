@@ -2124,6 +2124,7 @@ def main():
                         "LLM Model",
                         [
                             "microsoft/Phi-3-mini-4k-instruct",  # 3.8GB - Fast, good quality
+                            "microsoft/Phi-3-mini-128k-instruct",  # 3.8GB - Better context window, good quality
                             "mistralai/Mistral-7B-Instruct-v0.2",  # 14GB - Better quality
                             "HuggingFaceH4/zephyr-7b-beta",  # 14GB - Good quality
                         ],
