@@ -208,16 +208,25 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=5, 
                 f"Sample docs:\n{docs_preview}"
             )
         
-        batch_prompt = f"""Generate short, descriptive topic labels (2-5 words each) for these topics.
-Return ONLY the labels in this exact format:
-Topic 1: [label]
-Topic 2: [label]
-Topic 3: [label]
-etc.
+        batch_prompt = f"""Generate short, descriptive topic labels (2-5 words each) for these topics based on the keywords and sample documents provided.
+
+IMPORTANT: Generate actual descriptive labels, NOT placeholder text like "[label]" or "topic name".
+
+Examples of GOOD labels:
+- Customer Support Services
+- Marketing Campaign Analysis
+- Product Development Updates
+- Technical Documentation
+- Sales Pipeline Management
+
+Return your labels in this format:
+Topic 1: Your descriptive label here
+Topic 2: Your descriptive label here
+Topic 3: Your descriptive label here
 
 {chr(10).join(topics_text)}
 
-Labels:
+Now generate actual descriptive labels for each topic:
 """
         
         inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=2048)
@@ -227,19 +236,27 @@ Labels:
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=100,
-                temperature=0.5,
+                max_new_tokens=150,  # Increased for better labels
+                temperature=0.7,     # Slightly higher for more creativity
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id
             )
         
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract only the generated labels part
+        if "Now generate" in response:
+            response = response.split("Now generate")[-1]
         if "Labels:" in response:
             response = response.split("Labels:")[-1]
         
         labels_dict = {}
         lines = response.strip().split('\n')
+        
+        # Invalid placeholder patterns to reject
+        invalid_patterns = ['[label]', '[your', 'your label', 'descriptive label', 
+                           'label here', 'topic name', '[insert', 'placeholder']
         
         for line in lines:
             line = line.strip()
@@ -251,9 +268,17 @@ Labels:
                 if len(parts) == 2:
                     topic_num = int(parts[0].replace('Topic', '').strip())
                     label = parts[1].strip().strip('"\'.,;')
+                    label_lower = label.lower()
+                    
+                    # Reject placeholder text
+                    is_placeholder = any(pattern in label_lower for pattern in invalid_patterns)
                     
                     if 1 <= topic_num <= len(batch_data):
-                        if 3 <= len(label) <= 70 and len(label.split()) <= 8:
+                        # Validate: not too short, not too long, not a placeholder
+                        if (3 <= len(label) <= 70 and 
+                            len(label.split()) <= 8 and 
+                            not is_placeholder and
+                            len(label.split()) >= 2):  # At least 2 words
                             actual_topic_id = batch_data[topic_num - 1]['topic_id']
                             labels_dict[actual_topic_id] = label
             except (ValueError, IndexError):
