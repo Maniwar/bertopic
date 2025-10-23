@@ -187,8 +187,17 @@ class AdaptiveProgressTracker:
             self.status_container.success(f"✅ {self.operation_name} complete! (took {elapsed:.1f}s, {self.total_items/elapsed:.1f} items/sec)")
 
 
-def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=5, max_topics_per_batch=20):
-    """Generate labels for multiple topics in a single LLM call"""
+def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20):
+    """
+    Generate labels for multiple topics in a single LLM call
+    
+    IMPROVEMENTS:
+    - Shows 8 documents instead of 3 (more context)
+    - Shows 500 chars per document instead of 150 (full context)
+    - Samples diverse documents from beginning, middle, end (not just first 3)
+    - Better prompt emphasizing document CONTENT over keywords
+    - Duplicate detection to ensure unique labels
+    """
     if not batch_data or llm_model is None:
         return {}
     
@@ -199,102 +208,173 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=5, 
         for i, item in enumerate(batch_data[:max_topics_per_batch], 1):
             topic_id = item['topic_id']
             keywords = item['keywords']
-            sample_docs = item['docs'][:max_docs_per_topic]
-            docs_preview = "\n".join([f"  • {doc[:150]}" for doc in sample_docs[:3]])
+            all_docs = item['docs']
             
+            # ✅ IMPROVEMENT 1: Sample DIVERSE documents (not just first 3)
+            # Take from beginning, middle, and end to get variety
+            sample_docs = []
+            if len(all_docs) <= max_docs_per_topic:
+                sample_docs = all_docs
+            else:
+                # Sample diverse positions to capture topic breadth
+                import random
+                indices = [
+                    0,  # First doc
+                    len(all_docs) // 4,  # 25% through
+                    len(all_docs) // 2,  # Middle
+                    3 * len(all_docs) // 4,  # 75% through
+                    len(all_docs) - 1,  # Last doc
+                ]
+                # Add more random ones if needed
+                remaining = max_docs_per_topic - len(indices)
+                if remaining > 0:
+                    available = [idx for idx in range(len(all_docs)) if idx not in indices]
+                    if available:
+                        indices.extend(random.sample(available, min(remaining, len(available))))
+                
+                sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
+            
+            # ✅ IMPROVEMENT 2: Show FULL document content (500 chars, not 150!)
+            # This gives LLM actual context to understand the topic themes
+            docs_preview = "\n".join([
+                f"  Doc {j+1}: {doc[:500]}{'...' if len(doc) > 500 else ''}" 
+                for j, doc in enumerate(sample_docs)
+            ])
+            
+            # ✅ IMPROVEMENT 3: Structure that emphasizes documents over keywords
             topics_text.append(
-                f"Topic {i} (ID: {topic_id}):\n"
-                f"Keywords: {keywords}\n"
-                f"Sample docs:\n{docs_preview}"
+                f"\n{'='*60}\n"
+                f"TOPIC {i} (ID: {topic_id})\n"
+                f"{'='*60}\n"
+                f"Reference keywords: {keywords}\n"
+                f"\n"
+                f"ACTUAL DOCUMENTS (read these carefully):\n"
+                f"{docs_preview}\n"
             )
         
-        batch_prompt = f"""Generate short, descriptive topic labels (2-5 words each) for these topics based on the keywords and sample documents provided.
+        # ✅ IMPROVEMENT 4: Much better prompt emphasizing document content
+        batch_prompt = f"""You are analyzing document topics. For each topic below, read the ACTUAL DOCUMENTS carefully and create a descriptive label that captures the main theme.
 
-IMPORTANT: Generate actual descriptive labels, NOT placeholder text like "[label]" or "topic name".
+CRITICAL INSTRUCTIONS:
+1. READ THE DOCUMENTS - base your label on what the documents are actually about
+2. Keywords are just hints - focus on understanding the actual document content
+3. Each label should be 2-5 words describing the main category/theme
+4. Make labels DISTINCT from each other - avoid duplicates or very similar labels
+5. Be SPECIFIC - use actual themes you see in the documents, not generic terms
 
-Examples of GOOD labels:
-- Customer Support Services
-- Marketing Campaign Analysis
-- Product Development Updates
-- Technical Documentation
-- Sales Pipeline Management
+GOOD LABEL EXAMPLES:
+✓ "Customer Support Inquiries"
+✓ "Product Development Updates"  
+✓ "Marketing Campaign Performance"
+✓ "Technical Infrastructure Issues"
+✓ "Employee Onboarding Process"
 
-Return your labels in this format:
-Topic 1: Your descriptive label here
-Topic 2: Your descriptive label here
-Topic 3: Your descriptive label here
+BAD LABEL EXAMPLES:
+✗ "Various Documents" (too vague)
+✗ "Customer Service" (too generic without context)
+✗ "Information" (meaningless)
 
 {chr(10).join(topics_text)}
 
-Now generate actual descriptive labels for each topic:
-"""
+{'='*60}
+
+Now, carefully read each topic's DOCUMENTS above and create specific, descriptive labels based on what you read.
+
+Format your response EXACTLY like this:
+Topic 1: [Specific label based on documents]
+Topic 2: [Specific label based on documents]
+Topic 3: [Specific label based on documents]
+
+Your labels:"""
         
-        inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=2048)
+        # ✅ IMPROVEMENT 5: More space for longer document context
+        inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=4096)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=150,  # Increased for better labels
-                temperature=0.7,     # Slightly higher for more creativity
+                max_new_tokens=200,  # More space for quality labels
+                temperature=0.5,     # Lower for more focused, consistent output
                 do_sample=True,
-                top_p=0.9,
+                top_p=0.85,          # Slightly lower for better quality
+                repetition_penalty=1.2,  # ✅ NEW: Discourage repetitive labels
                 pad_token_id=tokenizer.eos_token_id
             )
         
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
         # Extract only the generated labels part
-        if "Now generate" in response:
+        if "Your labels:" in response:
+            response = response.split("Your labels:")[-1]
+        elif "Now, carefully" in response:
+            response = response.split("Now, carefully")[-1]
+        elif "Now generate" in response:
             response = response.split("Now generate")[-1]
-        if "Labels:" in response:
-            response = response.split("Labels:")[-1]
         
         labels_dict = {}
         lines = response.strip().split('\n')
         
-        # Invalid placeholder patterns to reject
-        invalid_patterns = ['[label]', '[your', 'your label', 'descriptive label', 
-                           'label here', 'topic name', '[insert', 'placeholder']
+        # ✅ IMPROVEMENT 6: Expanded invalid patterns to catch more placeholders
+        invalid_patterns = [
+            '[label]', '[your', 'your label', 'descriptive label', 
+            'label here', 'topic name', '[insert', 'placeholder',
+            'based on documents', '[', ']',  # Reject anything with brackets
+            'specific label', 'various', 'documents only'
+        ]
+        
+        # ✅ IMPROVEMENT 7: Track seen labels to avoid duplicates
+        seen_labels = set()
         
         for line in lines:
             line = line.strip()
-            if not line or not line.startswith('Topic '):
+            if not line or not line.lower().startswith('topic '):
                 continue
             
             try:
+                # Parse "Topic X: Label"
                 parts = line.split(':', 1)
                 if len(parts) == 2:
-                    topic_num = int(parts[0].replace('Topic', '').strip())
+                    # Extract topic number
+                    topic_num = int(''.join(filter(str.isdigit, parts[0])))
                     label = parts[1].strip().strip('"\'.,;')
                     label_lower = label.lower()
                     
                     # Reject placeholder text
                     is_placeholder = any(pattern in label_lower for pattern in invalid_patterns)
                     
+                    # ✅ IMPROVEMENT 8: Reject duplicates
+                    is_duplicate = label_lower in seen_labels
+                    
                     if 1 <= topic_num <= len(batch_data):
-                        # Validate: not too short, not too long, not a placeholder
-                        if (3 <= len(label) <= 70 and 
-                            len(label.split()) <= 8 and 
+                        # Validate: proper length, not placeholder, not duplicate
+                        if (5 <= len(label) <= 70 and 
+                            2 <= len(label.split()) <= 8 and 
                             not is_placeholder and
-                            len(label.split()) >= 2):  # At least 2 words
+                            not is_duplicate):
+                            
                             actual_topic_id = batch_data[topic_num - 1]['topic_id']
                             labels_dict[actual_topic_id] = label
+                            seen_labels.add(label_lower)  # Track to prevent duplicates
+                            
             except (ValueError, IndexError):
                 continue
         
         return labels_dict
-    except Exception:
+        
+    except Exception as e:
+        # Silent fail with empty dict for graceful fallback
         return {}
 
 
 class AdaptiveParallelLLMLabeler:
     """Production-ready parallel LLM labeler with adaptive batch sizing and detailed progress"""
     
-    def __init__(self, llm_model, system_params=None, max_docs_per_topic=5):
+    def __init__(self, llm_model, system_params=None, max_docs_per_topic=8):
         self.llm_model = llm_model
-        self.max_docs_per_topic = max_docs_per_topic
+        # ✅ Use at least 8 documents for better label quality
+        self.max_docs_per_topic = max(max_docs_per_topic, 8)
         
         if system_params is None:
             system_params = SystemPerformanceDetector.detect_optimal_parameters()
@@ -2495,6 +2575,9 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
         st.success("""
         **🎯 Improved Human-Readable Labels**: Topic labels are now actual category names like "Customer Support" or "Marketing & Advertising" 
         instead of just keyword lists!
+        
+        **⚡ Enhanced LLM Label Quality**: LLM now analyzes 8 full documents (500 chars each) from diverse positions in each topic, 
+        not just 3 truncated docs. This produces much more accurate, specific labels that reflect actual document content instead of just keywords.
         
         **⚡ Optimized Topic Browser**: Added pagination for much faster browsing of large datasets. No more lag when viewing thousands of documents!
         """)
