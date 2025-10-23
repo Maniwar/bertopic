@@ -460,13 +460,9 @@ def clean_documents_for_llm(docs, max_docs=50):
 
 def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20, model_name=None):
     """
-    ✅ SIMPLIFIED LLM label generation - clearer prompts, less aggressive validation
+    ✅ REIMAGINED: Trust the LLM with rich context and chain-of-thought reasoning
     
-    Generate labels for multiple topics in a single LLM call with:
-    - Clearer, more focused prompts
-    - Reasonable validation (not over-aggressive)
-    - Better document sampling
-    - Smooth fallback to keywords when needed
+    Let the LLM actually READ and THINK instead of forcing it into a box.
     """
     if not batch_data or llm_model is None:
         return {}
@@ -476,11 +472,11 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
         
         # Calculate max prompt length based on model's context window
         if model_name:
-            max_prompt_length = int(get_max_tokens_for_model(model_name) * 0.80)  # Use 80% for prompt
+            max_prompt_length = int(get_max_tokens_for_model(model_name) * 0.70)  # Use 70% for prompt
         else:
-            max_prompt_length = 3200  # Conservative default
+            max_prompt_length = 3000
         
-        # Build topic information for the prompt
+        # Build rich topic descriptions
         topics_text = []
         for i, item in enumerate(batch_data[:max_topics_per_batch], 1):
             topic_id = item['topic_id']
@@ -494,79 +490,87 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
             if len(all_docs) <= max_docs_per_topic:
                 sample_docs = all_docs
             else:
-                # Get documents from different positions for diversity
+                # Strategic sampling: beginning, middle, end, plus random
                 indices = [
-                    0,  # First
-                    len(all_docs) // 3,  # Early third
-                    len(all_docs) // 2,  # Middle
-                    2 * len(all_docs) // 3,  # Late third
-                    len(all_docs) - 1,  # Last
+                    0,
+                    len(all_docs) // 4,
+                    len(all_docs) // 2,
+                    3 * len(all_docs) // 4,
+                    len(all_docs) - 1,
                 ]
-                # Add random samples for variety
+                import random
                 remaining = max_docs_per_topic - len(indices)
                 if remaining > 0:
-                    import random
                     available = [idx for idx in range(len(all_docs)) if idx not in indices]
                     if available:
                         indices.extend(random.sample(available, min(remaining, len(available))))
                 
                 sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
             
-            # Show substantial content (400 chars per doc)
-            docs_preview = "\n".join([
-                f"  {j+1}. {doc[:400]}{'...' if len(doc) > 400 else ''}" 
+            # Show FULL documents (up to 800 chars each) - let LLM see the real content
+            docs_preview = "\n\n".join([
+                f"Document {j+1}:\n{doc[:800]}" 
                 for j, doc in enumerate(sample_docs[:max_docs_per_topic])
             ])
             
             topics_text.append(
-                f"\n{'='*60}\n"
-                f"TOPIC {i} (ID: {topic_id})\n"
+                f"\n{'='*70}\n"
+                f"TOPIC {i}\n"
                 f"Keywords: {keywords}\n"
-                f"Sample Documents ({len(sample_docs)} shown):\n"
-                f"{docs_preview}\n"
+                f"Total documents in topic: {len(all_docs)}\n"
+                f"\n{docs_preview}\n"
             )
         
-        # ✅ IMPROVED PROMPT - Forces longer, more specific labels
-        batch_prompt = f"""You are analyzing customer support topics. Create a DESCRIPTIVE label (5-7 words) for each topic that captures EXACTLY what makes it unique.
+        # ✅ CHAIN-OF-THOUGHT PROMPT: Let the LLM think, then label
+        batch_prompt = f"""You are an expert at analyzing customer support conversations and creating descriptive category names.
 
-CRITICAL RULES:
-1. **5-7 WORDS MINIMUM** - Shorter labels are too generic
-2. **BE ULTRA-SPECIFIC** - Include actual product names, actions, or issues from documents
-3. **EVERY LABEL MUST BE UNIQUE** - If you write "Help Order Placed", you've failed
-4. **FORMAT: [Specific Product/Service] + [Specific Action/Issue]**
+I'll show you several topics with real customer messages. For each topic:
+1. Read the actual customer messages carefully
+2. Think about what common issue or request they share
+3. Create a clear, descriptive category name that captures the essence
 
-EXCELLENT EXAMPLES (specific, detailed, unique):
-✓ "Samsung Galaxy Z Fold Trade-In Process"
-✓ "Washer Dryer Delivery Door Width Issue"
-✓ "Student Discount Verification Code Problems"
-✓ "Refrigerator Installation Service Scheduling Request"
-✓ "Unlocked Phone Purchase Before Contract Ends"
-✓ "Order Status Tracking Number Not Working"
-✓ "Existing Order Product Addition Request"
+**YOUR TASK:**
+For each topic, write:
+- A brief analysis (1-2 sentences) of what the customers need
+- A descriptive category name (as many words as needed to be clear and specific)
 
-TERRIBLE EXAMPLES (too generic - NEVER do this):
-✗ "Help Order Placed" (which order? what help?)
-✗ "Help Product" (which product? what issue?)
-✗ "Order Help" (too vague)
-✗ "Help Buy" (buy what? what problem?)
-✗ "Product Question" (what product? what question?)
+**WHAT MAKES A GOOD CATEGORY NAME:**
+- Uses specific products, services, or issues mentioned by customers
+- Clear enough that someone could route the conversation to the right team
+- Descriptive enough to understand without seeing the documents
+- Natural language (how a human would describe it)
 
-**IF TWO TOPICS SEEM SIMILAR**: Find the ONE thing that makes each different and PUT IT IN THE LABEL
+**EXAMPLES OF GOOD CATEGORY NAMES:**
+- "Samsung Galaxy Z Fold Trade-In Value Questions"
+- "Washer and Dryer Delivery Scheduling and Installation"
+- "Student Discount Verification and Approval Process"
+- "Adding Products to Existing Orders Before Shipment"
+- "Unlocked Phone Compatibility With Current Carrier"
+- "Order Status Tracking Number Issues and Updates"
+
+**AVOID:**
+- Generic phrases like "Help with Order" or "Product Question"
+- Single words or very short phrases
+- Abstract categories that don't tell you what the issue is
 
 {chr(10).join(topics_text)}
 
-{'='*60}
+{'='*70}
 
-Now create a specific, unique label for each topic.
+Now analyze each topic and create category names:
 
-Format (one per line):
-Topic 1: [Your Label]
-Topic 2: [Your Label]
-Topic 3: [Your Label]
+FORMAT (one per topic):
+Topic 1:
+Analysis: [What are customers trying to do/asking about?]
+Category: [Descriptive category name]
 
-Your labels:"""
+Topic 2:
+Analysis: [What are customers trying to do/asking about?]
+Category: [Descriptive category name]
+
+Begin:"""
         
-        # Generate with appropriate max_length
+        # Generate with much more space for thoughtful responses
         inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
@@ -574,81 +578,60 @@ Your labels:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=300,  # More space for detailed labels
-                temperature=0.4,     # Slightly higher for creativity
+                max_new_tokens=800,  # ✅ MUCH LONGER: Let LLM think and explain
+                temperature=0.5,     # ✅ More creative
                 do_sample=True,
-                top_p=0.90,
-                repetition_penalty=2.0,  # Strongly discourage repetition
+                top_p=0.92,         # ✅ Higher diversity
+                repetition_penalty=1.5,  # ✅ Gentler
                 pad_token_id=tokenizer.eos_token_id
             )
         
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # Extract generated labels (after the prompt)
-        if "Your labels:" in response:
-            response = response.split("Your labels:")[-1]
-        elif "Topic 1:" in response:
-            # Find where topics start
-            idx = response.find("Topic 1:")
-            if idx > 0:
-                response = response[idx:]
+        # Extract the generated part
+        if "Begin:" in response:
+            response = response.split("Begin:")[-1]
         
-        # Parse the response
+        # Parse the chain-of-thought responses
         labels_dict = {}
-        seen_labels = set()
+        current_topic = None
+        current_analysis = None
         
         for line in response.strip().split('\n'):
             line = line.strip()
-            if not line or not line.lower().startswith('topic '):
+            if not line:
                 continue
             
-            try:
-                # Parse "Topic X: Label"
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    topic_num = int(''.join(filter(str.isdigit, parts[0])))
-                    label = parts[1].strip().strip('"\'.,;')
+            # Look for "Topic X:"
+            if line.lower().startswith('topic '):
+                try:
+                    topic_num = int(''.join(filter(str.isdigit, line.split(':')[0])))
+                    if 1 <= topic_num <= len(batch_data):
+                        current_topic = batch_data[topic_num - 1]['topic_id']
+                except:
+                    continue
+            
+            # Look for "Analysis:"
+            elif line.lower().startswith('analysis:') and current_topic:
+                current_analysis = line.split(':', 1)[1].strip() if ':' in line else None
+            
+            # Look for "Category:"
+            elif line.lower().startswith('category:') and current_topic:
+                category = line.split(':', 1)[1].strip() if ':' in line else None
+                if category:
+                    # Clean up the category
+                    category = category.strip('"\'.,;')
                     
-                    # Basic validation only
-                    word_count = len(label.split())
-                    if (1 <= topic_num <= len(batch_data) and
-                        20 <= len(label) <= 100 and  # Longer labels (was 10-80)
-                        5 <= word_count <= 9 and  # Require 5-9 words (was 2-8)
-                        label.lower() not in seen_labels and  # No exact duplicates
-                        not any(bad in label.lower() for bad in ['[', ']', 'label', 'your', 'topic name'])):  # No placeholder text
+                    # ✅ MINIMAL VALIDATION: Just avoid obvious junk
+                    if (len(category) >= 15 and  # At least 15 chars
+                        len(category.split()) >= 3 and  # At least 3 words
+                        not any(bad in category.lower() for bad in ['[', ']', 'category name', 'topic', 'analysis'])):
                         
-                        actual_topic_id = batch_data[topic_num - 1]['topic_id']
-                        labels_dict[actual_topic_id] = label
-                        seen_labels.add(label.lower())
-                        
-            except (ValueError, IndexError):
-                continue
+                        labels_dict[current_topic] = category
+                        current_topic = None
+                        current_analysis = None
         
-        # ✅ POST-PROCESSING: Reject overly generic patterns and duplicates
-        generic_starters = ['help order', 'help product', 'help buy', 'order help', 'product help', 'help']
-        cleaned_labels = {}
-        label_usage_count = {}
-        
-        for topic_id, label in labels_dict.items():
-            label_lower = label.lower()
-            
-            # Track how many times each label is used
-            label_usage_count[label_lower] = label_usage_count.get(label_lower, 0) + 1
-            
-            # Check if label starts with generic pattern
-            is_generic = any(label_lower.startswith(pattern) for pattern in generic_starters)
-            
-            if not is_generic:
-                cleaned_labels[topic_id] = label
-        
-        # ✅ CRITICAL: If any label is used more than twice, reject ALL of them (LLM is confused)
-        max_usage = max(label_usage_count.values()) if label_usage_count else 0
-        if max_usage > 2:
-            # LLM is producing repetitive labels - better to use fallback
-            return {}
-        
-        # If we rejected labels, they'll be handled by fallback in the caller
-        return cleaned_labels
+        return labels_dict
         
     except Exception as e:
         # Silent fail - fallback will handle it
@@ -3083,17 +3066,20 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
 
         st.header("✨ What's New")
         st.success("""
-        **🎯 Simplified LLM Labeling**: Cleaner prompts and smarter validation for better, more reliable topic labels!
+        **🧠 Chain-of-Thought LLM Labeling**: LLM now reads full documents and THINKS before labeling! 
+        It analyzes what customers need, then creates descriptive category names. Much smarter than forcing it into a box.
         
-        **⚡ Faster Label Generation**: Reduced complexity in LLM processing while maintaining high-quality output.
+        **📖 Richer Context**: Shows up to 800 characters per document (was 400) - LLM sees the full story!
         
-        **🚀 Better Fallback**: Smoother transition to TF-IDF when LLM encounters issues - no more confusing errors!
+        **🎯 Trust the AI**: Removed restrictive validation. Let the LLM use as many words as needed to be clear and specific.
         
-        **🎯 Improved Human-Readable Labels**: Topic labels are actual category names like "Customer Support" instead of keyword lists!
+        **🚀 Longer Responses**: 800 tokens for LLM output (was 200-300) - room for thoughtful analysis.
         
-        **🚀 Phi-3-mini-128k Support**: Analyze 50+ full documents per topic for maximum accuracy with 128k context window!
+        **⚡ Better Generation**: Higher temperature (0.5), more diverse sampling (top_p 0.92), gentler repetition penalty.
         
-        **⚡ Dynamic Document Selection**: Optimal number of documents based on each model's context window.
+        **🎯 Improved Labels**: Instead of "Help Order Placed", you'll get "Samsung Washer Delivery Scheduling and Installation"!
+        
+        **🚀 Phi-3-mini-128k Support**: Analyze 50+ full documents per topic with 128k context window!
         
         **🚀 Memory Optimization Profiles**: Choose Conservative (8GB), Balanced (16GB), Aggressive (32GB+), or Extreme (64GB+)!
         """)
