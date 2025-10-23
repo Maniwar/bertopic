@@ -652,6 +652,119 @@ def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
     
     return "Miscellaneous Topic"
 
+# -----------------------------------------------------
+# LOCAL LLM FOR BETTER TOPIC LABELS
+# -----------------------------------------------------
+def generate_topic_label_with_llm(topic_docs, keywords_str, llm_model=None, max_docs=10):
+    """
+    Generate a descriptive topic label using a local LLM.
+    
+    Args:
+        topic_docs: List of documents in the topic
+        keywords_str: Comma-separated keywords
+        llm_model: Loaded HuggingFace model and tokenizer (tuple)
+        max_docs: Number of sample documents to show the LLM
+    
+    Returns:
+        str: Generated topic label
+    """
+    if llm_model is None:
+        # Fallback to non-LLM method
+        return make_human_label(topic_docs, keywords_str)
+    
+    try:
+        model, tokenizer = llm_model
+        
+        # Sample documents for context
+        sample_docs = topic_docs[:max_docs]
+        docs_text = "\n".join([f"- {doc[:200]}" for doc in sample_docs])
+        
+        # Create prompt for LLM
+        prompt = f"""Based on these sample documents and keywords, generate a short, descriptive topic label (2-5 words).
+
+Keywords: {keywords_str}
+
+Sample documents:
+{docs_text}
+
+Generate only the topic label, nothing else. Make it specific and descriptive.
+Topic label:"""
+
+        # Generate label
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+        
+        # Move to same device as model
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=20,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode output
+        label = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Extract just the label part (after the prompt)
+        label = label.split("Topic label:")[-1].strip()
+        
+        # Clean up the label
+        label = label.split("\n")[0]  # Take first line only
+        label = label.strip('"\'')  # Remove quotes
+        label = label[:70]  # Limit length
+        
+        # If label is too short or looks bad, fallback
+        if len(label) < 3 or len(label.split()) > 8:
+            return make_human_label(topic_docs, keywords_str)
+        
+        return label
+        
+    except Exception as e:
+        # Fallback to non-LLM method on any error
+        return make_human_label(topic_docs, keywords_str)
+
+
+@st.cache_resource
+def load_local_llm(model_name):
+    """
+    Load a local LLM for topic labeling.
+    Cached to avoid reloading on every rerun.
+    
+    Recommended models:
+    - "microsoft/Phi-3-mini-4k-instruct" (3.8GB, fast)
+    - "mistralai/Mistral-7B-Instruct-v0.2" (14GB, better quality)
+    - "HuggingFaceH4/zephyr-7b-beta" (14GB, good quality)
+    """
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        st.info(f"Loading {model_name}... This may take a few minutes the first time.")
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True
+        )
+        
+        if not torch.cuda.is_available():
+            # CPU mode - load in 8-bit for efficiency
+            st.warning("Running on CPU - labels will be slower to generate")
+        
+        return (model, tokenizer)
+        
+    except Exception as e:
+        st.error(f"Failed to load LLM: {str(e)}")
+        st.info("Install transformers: pip install transformers accelerate")
+        return None
+
+
 def make_human_label(topic_docs, fallback_keywords, max_len=70):
     """
     Build a unique, descriptive topic label based on the actual content.
@@ -690,6 +803,7 @@ class FastReclusterer:
         self.embeddings = embeddings
         self.umap_embeddings = umap_embeddings
         self.use_gpu = torch.cuda.is_available() and cuml_available
+        self.llm_model = None  # Will be set if LLM labeling is enabled
 
     def recluster(self, n_topics, min_topic_size=10, use_reduced=True, method='kmeans'):
         """Quickly recluster documents into new topics"""
@@ -787,7 +901,11 @@ class FastReclusterer:
             keywords_str = ', '.join(keywords[:5])
 
             # --- human label (actual category name) ---
-            human_label = make_human_label(topic_docs, keywords_str)
+            # Use LLM if available, otherwise fall back to TF-IDF method
+            if self.llm_model is not None:
+                human_label = generate_topic_label_with_llm(topic_docs, keywords_str, self.llm_model)
+            else:
+                human_label = make_human_label(topic_docs, keywords_str)
 
             topic_info_list.append({
                 'Topic': topic_id,
@@ -1104,6 +1222,28 @@ def main():
 
                 # Representation model (placeholder toggle kept for parity)
                 use_mmr = st.checkbox("Use MMR for diverse keywords", value=True)
+                
+                # LLM-based topic labeling
+                st.subheader("🤖 AI-Enhanced Topic Labels")
+                use_llm_labeling = st.checkbox(
+                    "Use Local LLM for Better Labels",
+                    value=False,
+                    help="Generate topic labels using a local language model (requires transformers library)"
+                )
+                
+                llm_model_name = None
+                if use_llm_labeling:
+                    llm_model_name = st.selectbox(
+                        "LLM Model",
+                        [
+                            "microsoft/Phi-3-mini-4k-instruct",  # 3.8GB - Fast, good quality
+                            "mistralai/Mistral-7B-Instruct-v0.2",  # 14GB - Better quality
+                            "HuggingFaceH4/zephyr-7b-beta",  # 14GB - Good quality
+                        ],
+                        help="Smaller models are faster. First load takes time to download."
+                    )
+                    st.caption("⚠️ First-time download may be large (3-14GB). Model is cached after first use.")
+                    st.caption("💡 Phi-3 recommended for speed, Mistral for quality.")
 
                 # Seed words
                 st.subheader("🎯 Seed Words (Optional)")
@@ -1151,6 +1291,10 @@ def main():
                             show_progress=True
                         )
                         st.session_state.embeddings = embeddings
+                        
+                        # Store model for semantic search
+                        st.session_state.embedding_model_name = embedding_model
+                        st.session_state.safe_model = safe_model
                     except RuntimeError as e:
                         st.error(f"Embedding error: {str(e)}")
                         st.info("If this persists, lower the batch size and/or max document length.")
@@ -1165,10 +1309,24 @@ def main():
                     umap_embeddings = compute_umap_embeddings(embeddings, n_neighbors, n_components)
                     st.session_state.umap_embeddings = umap_embeddings
 
+                # Step 3.5: Load LLM if enabled
+                llm_model = None
+                if use_llm_labeling and llm_model_name:
+                    with st.spinner(f"Loading {llm_model_name} for enhanced labeling..."):
+                        llm_model = load_local_llm(llm_model_name)
+                        if llm_model:
+                            st.success("✅ LLM loaded successfully!")
+                        else:
+                            st.warning("⚠️ LLM failed to load, using TF-IDF labels")
+
                 # Step 4: Create reclusterer
                 st.session_state.reclusterer = FastReclusterer(
                     cleaned_docs, embeddings, umap_embeddings
                 )
+                
+                # Set LLM model if loaded
+                if llm_model:
+                    st.session_state.reclusterer.llm_model = llm_model
 
                 # Step 5: (optional) Seed words parsed
                 seed_topic_list = []
@@ -1647,11 +1805,11 @@ def main():
                         with st.spinner("🤖 Computing semantic similarity..."):
                             try:
                                 # Get the embedding model
-                                if 'model' not in st.session_state or st.session_state.model is None:
+                                if 'safe_model' not in st.session_state or st.session_state.safe_model is None:
                                     st.error("❌ Model not loaded. Please run topic modeling first.")
                                 else:
                                     # Encode the search query
-                                    query_embedding = st.session_state.model.encode(
+                                    query_embedding = st.session_state.safe_model.model.encode(
                                         [search_query],
                                         convert_to_numpy=True,
                                         normalize_embeddings=True
