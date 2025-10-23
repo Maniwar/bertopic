@@ -1,8 +1,3 @@
-File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 2504
-  if __name__ == "__main__":
-                            ^
-IndentationError: expected an indented block after 'if' statement on line 2504
-
 import streamlit as st
 import pandas as pd
 import torch
@@ -2507,3 +2502,4 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                             st.write(f"{icon} {key.replace('_available', '').title()}")
 
 if __name__ == "__main__":
+    main()
