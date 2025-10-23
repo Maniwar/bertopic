@@ -477,6 +477,13 @@ class SafeEmbeddingModel:
 # -----------------------------------------------------
 # IMPROVED HUMAN-READABLE TOPIC LABELS
 # -----------------------------------------------------
+# IMPROVED HUMAN-READABLE LABEL GENERATION
+# This replaces the old _infer_category_name and make_human_label functions
+
+import re
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 def _top_phrases(texts, ngram_range=(2,3), top_k=5, max_features=5000):
     """Return top_k high-signal phrases from texts using TF-IDF (prefers bigrams/trigrams)."""
     if not texts:
@@ -497,154 +504,153 @@ def _top_phrases(texts, ngram_range=(2,3), top_k=5, max_features=5000):
     except Exception:
         return []
 
-def _to_title(label):
-    """Title-case but keep common abbreviations uppercased."""
-    keep_upper = {"AI","ML","NLP","API","SQL","GPU","CPU","FAQ","KPI","OKR","CRM","IT","HR","PR","SEO","SEM","ROI","B2B","B2C"}
-    words = label.replace("_"," ").split()
-    nice = []
-    for w in words:
-        w_clean = re.sub(r"[^A-Za-z0-9\-]+", "", w)
-        if not w_clean:
-            continue
-        if w_clean.upper() in keep_upper:
-            nice.append(w_clean.upper())
-        else:
-            if w_clean.lower() in {"and","or","of","in","on","for","to","a","the","an","with","by","at","from"}:
-                nice.append(w_clean.lower())
-            else:
-                nice.append(w_clean.capitalize())
-    label = " ".join(nice)
-    label = re.sub(r"\s{2,}", " ", label).strip(" -–—")
-    return label
+def _clean_phrase(phrase):
+    """Clean and normalize a phrase for use in labels."""
+    # Remove punctuation but keep spaces
+    phrase = re.sub(r'[^\w\s-]', ' ', phrase)
+    # Normalize whitespace
+    phrase = ' '.join(phrase.split())
+    return phrase.strip()
 
-def _infer_category_name(phrases, keywords):
-    """
-    Infer a semantic category name from phrases and keywords.
-    This creates actual category names like 'Customer Support' instead of just listing keywords.
-    """
-    all_terms = phrases + keywords
-    if not all_terms:
-        return "General Topic"
-    
-    # Common category patterns
-    category_patterns = {
-        # Technology
-        r'\b(software|app|application|code|programming|developer|development)\b': 'Software Development',
-        r'\b(machine learning|deep learning|neural network|ai|artificial intelligence)\b': 'AI & Machine Learning',
-        r'\b(data|database|analytics|analysis|visualization)\b': 'Data & Analytics',
-        r'\b(cloud|server|infrastructure|deployment|devops)\b': 'Cloud Infrastructure',
-        r'\b(mobile|ios|android|smartphone)\b': 'Mobile Technology',
-        r'\b(web|website|frontend|backend|fullstack)\b': 'Web Development',
-        r'\b(security|encryption|authentication|cybersecurity)\b': 'Security & Privacy',
-        
-        # Business
-        r'\b(customer|client|support|service|help|assistance)\b': 'Customer Support',
-        r'\b(sale|sales|selling|revenue|deal)\b': 'Sales & Revenue',
-        r'\b(marketing|campaign|advertising|promotion|brand)\b': 'Marketing & Advertising',
-        r'\b(finance|financial|budget|cost|expense|accounting)\b': 'Finance & Accounting',
-        r'\b(product|feature|release|roadmap|planning)\b': 'Product Management',
-        r'\b(project|management|planning|coordination|workflow)\b': 'Project Management',
-        r'\b(hr|human resource|recruitment|hiring|employee)\b': 'Human Resources',
-        r'\b(legal|compliance|regulation|contract|agreement)\b': 'Legal & Compliance',
-        
-        # Communication
-        r'\b(email|message|communication|correspondence|notification)\b': 'Communication & Messaging',
-        r'\b(social media|facebook|twitter|instagram|linkedin)\b': 'Social Media',
-        r'\b(documentation|document|manual|guide|instruction)\b': 'Documentation & Guides',
-        r'\b(meeting|conference|call|video|zoom)\b': 'Meetings & Conferences',
-        
-        # Content
-        r'\b(content|article|blog|post|writing)\b': 'Content & Publishing',
-        r'\b(design|graphic|ui|ux|interface|visual)\b': 'Design & UX',
-        r'\b(video|media|multimedia|streaming)\b': 'Video & Media',
-        r'\b(image|photo|picture|photography)\b': 'Images & Photography',
-        
-        # Operations
-        r'\b(operations|operational|process|procedure|workflow)\b': 'Operations & Processes',
-        r'\b(quality|testing|qa|assurance|bug)\b': 'Quality Assurance',
-        r'\b(performance|optimization|speed|efficiency)\b': 'Performance & Optimization',
-        r'\b(monitor|monitoring|tracking|logging)\b': 'Monitoring & Tracking',
-        
-        # Research & Learning
-        r'\b(research|study|analysis|investigation|experiment)\b': 'Research & Analysis',
-        r'\b(education|learning|training|tutorial|course)\b': 'Education & Training',
-        r'\b(science|scientific|academic|scholarly)\b': 'Science & Academia',
-        
-        # Health & Medical
-        r'\b(health|medical|healthcare|clinical|patient)\b': 'Health & Medical',
-        r'\b(fitness|exercise|workout|wellness)\b': 'Fitness & Wellness',
-        
-        # General Business Functions
-        r'\b(strategy|strategic|planning|vision|goal)\b': 'Strategy & Planning',
-        r'\b(report|reporting|dashboard|metric|kpi)\b': 'Reporting & Metrics',
-        r'\b(issue|problem|error|bug|troubleshoot)\b': 'Issues & Troubleshooting',
-        r'\b(feedback|review|rating|survey|opinion)\b': 'Feedback & Reviews',
+def _to_title_case(text):
+    """Smart title case that preserves acronyms and common patterns."""
+    # Common acronyms and abbreviations to keep uppercase
+    keep_upper = {
+        "AI", "ML", "NLP", "API", "SQL", "GPU", "CPU", "FAQ", "KPI", "OKR", 
+        "CRM", "IT", "HR", "PR", "SEO", "SEM", "ROI", "B2B", "B2C", "SaaS",
+        "UI", "UX", "iOS", "AWS", "API", "REST", "HTTP", "JSON", "XML", "CSV",
+        "PDF", "URL", "HTML", "CSS", "JS", "PHP", "SQL", "NoSQL", "CI", "CD"
     }
     
-    # Try to match patterns
-    combined_text = ' '.join(all_terms).lower()
-    for pattern, category in category_patterns.items():
-        if re.search(pattern, combined_text):
-            return category
+    # Words to keep lowercase
+    keep_lower = {
+        "a", "an", "and", "or", "but", "for", "nor", "on", "at", "to", "by",
+        "in", "of", "the", "with", "from", "into", "onto", "upon", "as", "vs"
+    }
     
-    # If no pattern matches, create a descriptive name from top phrases
-    # Remove common stop words and get distinctive terms
-    distinctive_terms = []
-    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'was', 'are'}
+    words = text.split()
+    result = []
     
-    for phrase in phrases[:3]:  # Use top 3 phrases
-        words = phrase.split()
-        for word in words:
-            if word.lower() not in stop_words and len(word) > 2:
-                distinctive_terms.append(word)
-                if len(distinctive_terms) >= 3:
-                    break
-        if len(distinctive_terms) >= 3:
-            break
-    
-    if distinctive_terms:
-        # Create a category name from distinctive terms
-        category_name = ' '.join(distinctive_terms[:3])
-        return _to_title(category_name)
-    
-    # Final fallback: use the first phrase
-    if phrases:
-        return _to_title(phrases[0])
-    
-    return "General Category"
-
-def make_human_label(topic_docs, fallback_keywords, max_len=60):
-    """
-    Build a pleasant, human-readable topic label that represents an actual CATEGORY,
-    not just a list of keywords.
-    
-    Examples:
-    - Instead of "customer service • support team" → "Customer Support"
-    - Instead of "marketing campaign • social media" → "Marketing & Advertising"
-    """
-    # Extract phrases using TF-IDF
-    phrases_23 = _top_phrases(topic_docs, (2,3), top_k=5)
-    phrases_1 = _top_phrases(topic_docs, (1,1), top_k=5)
-    
-    # Combine all phrases
-    all_phrases = phrases_23 + phrases_1
-    
-    # Parse fallback keywords
-    keywords = []
-    if fallback_keywords:
-        if isinstance(fallback_keywords, str):
-            keywords = [k.strip() for k in fallback_keywords.split(",") if k.strip()]
+    for i, word in enumerate(words):
+        word_clean = re.sub(r'[^\w-]', '', word)
+        
+        # First word or after certain punctuation - capitalize
+        if i == 0:
+            if word_clean.upper() in keep_upper:
+                result.append(word_clean.upper())
+            else:
+                result.append(word_clean.capitalize())
+        # Check if it's an acronym
+        elif word_clean.upper() in keep_upper:
+            result.append(word_clean.upper())
+        # Check if it should be lowercase
+        elif word_clean.lower() in keep_lower:
+            result.append(word_clean.lower())
+        # Default: capitalize
         else:
-            keywords = list(fallback_keywords)
+            result.append(word_clean.capitalize())
     
-    # Infer a semantic category name
-    category_name = _infer_category_name(all_phrases, keywords[:5])
+    return ' '.join(result)
+
+def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
+    """
+    Create a unique, descriptive label from phrases and keywords.
+    This generates labels like "Customer Service Response" instead of generic "Customer Support"
+    """
+    # Clean all phrases
+    clean_phrases_23 = [_clean_phrase(p) for p in phrases_23 if p and len(_clean_phrase(p)) > 3]
+    clean_phrases_1 = [_clean_phrase(p) for p in phrases_1 if p and len(_clean_phrase(p)) > 2]
     
-    # Ensure it's not too long
-    if len(category_name) > max_len:
-        category_name = category_name[:max_len].rstrip() + "…"
+    # Parse keywords
+    if isinstance(keywords, str):
+        keyword_list = [k.strip() for k in keywords.split(',') if k.strip()]
+    else:
+        keyword_list = list(keywords) if keywords else []
     
-    return category_name
+    # PRIORITY 1: Use the longest trigram if available and descriptive (3+ words)
+    for phrase in clean_phrases_23:
+        word_count = len(phrase.split())
+        if word_count >= 3:
+            label = _to_title_case(phrase)
+            if len(label) <= max_len:
+                return label
+    
+    # PRIORITY 2: Combine top 2 bigrams/trigrams if they complement each other
+    if len(clean_phrases_23) >= 2:
+        first = clean_phrases_23[0]
+        first_words = set(first.lower().split())
+        
+        # Find a second phrase that adds information (at least 1 new word, not a subset)
+        for second in clean_phrases_23[1:3]:
+            second_words = set(second.lower().split())
+            
+            # Skip if second is completely contained in first
+            if second_words.issubset(first_words):
+                continue
+            
+            # Skip if first is completely contained in second (use second instead)
+            if first_words.issubset(second_words):
+                label = _to_title_case(second)
+                if len(label) <= max_len:
+                    return label
+                continue
+            
+            # Check if they share too many words (>50% overlap)
+            overlap = len(first_words & second_words)
+            total = len(first_words | second_words)
+            if overlap / total < 0.5:  # Less than 50% overlap is good
+                label = f"{first} & {second}"
+                label = _to_title_case(label)
+                if len(label) <= max_len:
+                    return label
+        
+        # If no good pair found, use the first phrase alone
+        label = _to_title_case(first)
+        if len(label) <= max_len:
+            return label
+    
+    # PRIORITY 3: Use single best bigram
+    if len(clean_phrases_23) >= 1:
+        label = _to_title_case(clean_phrases_23[0])
+        if len(label) <= max_len:
+            return label
+    
+    # PRIORITY 4: Combine 2-3 distinctive unigrams
+    if len(clean_phrases_1) >= 2:
+        # Take unique words only
+        seen = set()
+        unique_words = []
+        for word in clean_phrases_1:
+            if word.lower() not in seen:
+                unique_words.append(word)
+                seen.add(word.lower())
+                if len(unique_words) >= 3:
+                    break
+        
+        if len(unique_words) >= 2:
+            label = _to_title_case(' '.join(unique_words))
+            if len(label) <= max_len:
+                return label
+    
+    # PRIORITY 5: Use keywords
+    if len(keyword_list) >= 2:
+        seen = set()
+        unique_keywords = []
+        for kw in keyword_list:
+            if kw.lower() not in seen:
+                unique_keywords.append(kw)
+                seen.add(kw.lower())
+                if len(unique_keywords) >= 3:
+                    break
+        
+        if len(unique_keywords) >= 2:
+            label = _to_title_case(' '.join(unique_keywords))
+            if len(label) <= max_len:
+                return label
+    
+    # Fallback: Single best available
+    if clean_phrases_23:
+        return _to_title_case(clean_phrases_23[0][:max_len])
 
 # -----------------------------------------------------
 # FAST RECLUSTERING ENGINE
