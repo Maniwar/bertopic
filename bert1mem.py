@@ -15,31 +15,7 @@ import time
 import psutil
 import os
 
-"""
-================================================================================
-✅ FIXED: TOPIC-ORIENTED LLM LABELING ARCHITECTURE
-================================================================================
-
-CHANGES MADE (2025-10-23):
-1. Replaced batch-oriented processing with topic-oriented processing
-2. Each worker now processes ONE topic (not 20 topics in a batch)
-3. Prevents context window overflow and LLM confusion
-4. Results in specific, unique labels instead of generic duplicates
-
-KEY IMPROVEMENTS:
-- Better label quality (focused LLM attention per topic)
-- No more duplicate labels (no cross-topic confusion)
-- True parallelism (4-16 topics processed concurrently)
-- More predictable performance
-
-ARCHITECTURE:
-- OLD: 367 topics → 18 batches → 3 workers (batch-level parallelism)
-- NEW: 367 topics → 4-16 workers (topic-level parallelism)
-
-Each topic now gets a focused 7,000 char prompt instead of a crowded 90,000 char batch.
-================================================================================
-"""
-
+ 
 
 # =====================================================
 # 🚀 MEMORY OPTIMIZATION PROFILES
