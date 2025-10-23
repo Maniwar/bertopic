@@ -1607,52 +1607,204 @@ def main():
                         help="Limit rows for faster display"
                     )
 
-                # Get the selected topic ID
-                selected_topic_id = topic_options[selected_option]
-
-                # Fast filtering - single topic only
-                if selected_topic_id == "all":
-                    display_df = browser_df.head(max_rows)
-                    st.info(f"📊 Showing first {len(display_df):,} of {len(browser_df):,} total documents")
-                else:
-                    # Use numpy for fast filtering
-                    mask = browser_df['Topic'].values == selected_topic_id
-                    filtered_df = browser_df[mask]
-                    display_df = filtered_df.head(max_rows)
+                # Semantic Search Feature
+                st.markdown("---")
+                with st.expander("🔍 Semantic Search (AI-powered)", expanded=False):
+                    st.caption("Find documents similar to your query using AI embeddings (not just keywords)")
                     
-                    if selected_topic_id == -1:
-                        st.info(f"📊 Showing {len(display_df):,} of {len(filtered_df):,} outlier documents")
-                    else:
-                        human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
-                        st.info(f"📊 Topic {selected_topic_id}: **{human_label}** — Showing {len(display_df):,} of {len(filtered_df):,} documents")
+                    search_col1, search_col2, search_col3 = st.columns([3, 1, 1])
+                    
+                    with search_col1:
+                        search_query = st.text_input(
+                            "Search query:",
+                            placeholder="e.g., 'customer complaints about shipping delays'",
+                            key="semantic_search_query",
+                            help="Enter a phrase or question - AI will find semantically similar documents"
+                        )
+                    
+                    with search_col2:
+                        search_top_n = st.number_input(
+                            "Top results:",
+                            min_value=5,
+                            max_value=500,
+                            value=50,
+                            step=5,
+                            key="semantic_search_top_n",
+                            help="Number of most similar documents to show"
+                        )
+                    
+                    with search_col3:
+                        search_scope = st.selectbox(
+                            "Search in:",
+                            options=["Current Topic", "All Topics"],
+                            key="semantic_search_scope",
+                            help="Search within current topic or across all topics"
+                        )
+                    
+                    search_button = st.button("🔍 Search", key="semantic_search_button", type="primary")
+                    
+                    if search_button and search_query.strip():
+                        with st.spinner("🤖 Computing semantic similarity..."):
+                            try:
+                                # Get the embedding model
+                                if 'model' not in st.session_state or st.session_state.model is None:
+                                    st.error("❌ Model not loaded. Please run topic modeling first.")
+                                else:
+                                    # Encode the search query
+                                    query_embedding = st.session_state.model.encode(
+                                        [search_query],
+                                        convert_to_numpy=True,
+                                        normalize_embeddings=True
+                                    )[0]
+                                    
+                                    # Get embeddings and valid indices
+                                    embeddings = st.session_state.embeddings
+                                    valid_indices = st.session_state.valid_indices
+                                    
+                                    # Determine which documents to search
+                                    if search_scope == "Current Topic" and selected_topic_id != "all":
+                                        # Get indices for current topic
+                                        topic_mask = browser_df['Topic'].values == selected_topic_id
+                                        topic_indices = np.where(topic_mask)[0]
+                                        
+                                        # Map to valid_indices
+                                        search_indices = []
+                                        for idx in topic_indices:
+                                            if idx in valid_indices:
+                                                search_indices.append(valid_indices.index(idx))
+                                        
+                                        if len(search_indices) == 0:
+                                            st.warning("No valid documents in current topic to search")
+                                            search_indices = list(range(len(embeddings)))
+                                    else:
+                                        # Search all documents
+                                        search_indices = list(range(len(embeddings)))
+                                    
+                                    # Calculate cosine similarity for selected documents
+                                    similarities = []
+                                    for idx in search_indices:
+                                        if idx < len(embeddings):
+                                            similarity = np.dot(query_embedding, embeddings[idx])
+                                            similarities.append((idx, similarity, valid_indices[idx]))
+                                    
+                                    # Sort by similarity (highest first)
+                                    similarities.sort(key=lambda x: x[1], reverse=True)
+                                    
+                                    # Get top N results
+                                    top_results = similarities[:search_top_n]
+                                    
+                                    if len(top_results) > 0:
+                                        # Get the browser indices for top results
+                                        result_browser_indices = [x[2] for x in top_results]
+                                        result_similarities = [x[1] for x in top_results]
+                                        
+                                        # Create results dataframe
+                                        search_results_df = browser_df.iloc[result_browser_indices].copy()
+                                        search_results_df.insert(0, 'Similarity', [f"{sim:.3f}" for sim in result_similarities])
+                                        
+                                        # Store in session state to display below
+                                        st.session_state.search_active = True
+                                        st.session_state.search_results_df = search_results_df
+                                        st.session_state.search_query_display = search_query
+                                        
+                                        st.success(f"✅ Found {len(top_results)} similar documents!")
+                                    else:
+                                        st.warning("No results found")
+                                        
+                            except Exception as e:
+                                st.error(f"❌ Search error: {str(e)}")
+                    
+                    elif search_button:
+                        st.warning("Please enter a search query")
+                
+                st.markdown("---")
 
-                # Reorder columns - put topic metadata first
-                meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_Keywords']
-                other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
-                ordered_cols = [c for c in meta_cols if c in display_df.columns] + other_cols
-                display_df = display_df[ordered_cols]
-
-                # Simple, fast dataframe display
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    height=600
-                )
-
-                # Download button
-                if selected_topic_id == "all":
-                    download_df = browser_df
-                    filename = f"all_topics_{st.session_state.uploaded_file_name}.csv"
+                # Check if we should display search results instead of topic view
+                display_search_results = st.session_state.get('search_active', False)
+                
+                if display_search_results and 'search_results_df' in st.session_state:
+                    # Display search results
+                    search_results_df = st.session_state.search_results_df
+                    search_query_display = st.session_state.get('search_query_display', '')
+                    
+                    st.info(f"🔍 **Semantic Search Results** for: \"{search_query_display}\" — Showing {len(search_results_df)} most similar documents")
+                    
+                    # Add a button to clear search and return to normal view
+                    if st.button("❌ Clear Search Results", key="clear_search"):
+                        st.session_state.search_active = False
+                        if 'search_results_df' in st.session_state:
+                            del st.session_state.search_results_df
+                        st.rerun()
+                    
+                    # Reorder columns
+                    meta_cols = ['Similarity', 'Topic', 'Topic_Human_Label', 'Topic_Keywords']
+                    other_cols = [c for c in search_results_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
+                    ordered_cols = [c for c in meta_cols if c in search_results_df.columns] + other_cols
+                    search_results_df = search_results_df[ordered_cols]
+                    
+                    # Display
+                    st.dataframe(
+                        search_results_df,
+                        use_container_width=True,
+                        height=600
+                    )
+                    
+                    # Download button
+                    st.download_button(
+                        label=f"📥 Download Search Results ({len(search_results_df)} rows)",
+                        data=search_results_df.to_csv(index=False).encode('utf-8'),
+                        file_name=f"semantic_search_{search_query_display[:30]}_{st.session_state.uploaded_file_name}.csv",
+                        mime="text/csv"
+                    )
+                    
                 else:
-                    download_df = browser_df[browser_df['Topic'] == selected_topic_id]
-                    filename = f"topic_{selected_topic_id}_{st.session_state.uploaded_file_name}.csv"
+                    # Normal topic browsing view
+                    # Get the selected topic ID
+                    selected_topic_id = topic_options[selected_option]
 
-                st.download_button(
-                    label=f"📥 Download {selected_option} ({len(download_df):,} rows)",
-                    data=download_df.to_csv(index=False).encode('utf-8'),
-                    file_name=filename,
-                    mime="text/csv"
-                )
+                    # Fast filtering - single topic only
+                    if selected_topic_id == "all":
+                        display_df = browser_df.head(max_rows)
+                        st.info(f"📊 Showing first {len(display_df):,} of {len(browser_df):,} total documents")
+                    else:
+                        # Use numpy for fast filtering
+                        mask = browser_df['Topic'].values == selected_topic_id
+                        filtered_df = browser_df[mask]
+                        display_df = filtered_df.head(max_rows)
+                        
+                        if selected_topic_id == -1:
+                            st.info(f"📊 Showing {len(display_df):,} of {len(filtered_df):,} outlier documents")
+                        else:
+                            human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
+                            st.info(f"📊 Topic {selected_topic_id}: **{human_label}** — Showing {len(display_df):,} of {len(filtered_df):,} documents")
+
+                    # Reorder columns - put topic metadata first
+                    meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_Keywords']
+                    other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
+                    ordered_cols = [c for c in meta_cols if c in display_df.columns] + other_cols
+                    display_df = display_df[ordered_cols]
+
+                    # Simple, fast dataframe display
+                    st.dataframe(
+                        display_df,
+                        use_container_width=True,
+                        height=600
+                    )
+
+                    # Download button
+                    if selected_topic_id == "all":
+                        download_df = browser_df
+                        filename = f"all_topics_{st.session_state.uploaded_file_name}.csv"
+                    else:
+                        download_df = browser_df[browser_df['Topic'] == selected_topic_id]
+                        filename = f"topic_{selected_topic_id}_{st.session_state.uploaded_file_name}.csv"
+
+                    st.download_button(
+                        label=f"📥 Download {selected_option} ({len(download_df):,} rows)",
+                        data=download_df.to_csv(index=False).encode('utf-8'),
+                        file_name=filename,
+                        mime="text/csv"
+                    )
 
             with tabs[5]:  # Export
                 st.subheader("💾 Export Results")
