@@ -398,6 +398,7 @@ class SafeEmbeddingModel:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
+        self.model_name = model_name  # Store the model name
         self.model = SentenceTransformer(model_name, device=device)
         self.device = device
         self.model.max_seq_length = min(self.model.max_seq_length, 512)
@@ -637,7 +638,10 @@ def load_embedding_model(model_name):
 @st.cache_data
 def compute_embeddings(_model, documents, batch_size=32):
     """Compute and cache embeddings"""
-    safe_model = SafeEmbeddingModel(model_name=_model.model_name_or_path)
+    # Create a SafeEmbeddingModel instance with the model
+    safe_model = SafeEmbeddingModel()
+    safe_model.model = _model  # Use the provided model directly
+    safe_model.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     return safe_model.encode_safe(documents, batch_size=batch_size)
 
 @st.cache_data
