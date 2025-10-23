@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Set Streamlit to wide mode for better layout
-st.set_page_config(layout="wide", page_title="Windows CUDA-Optimized BERTopic", page_icon="🚀")
+st.set_page_config(layout="wide", page_title="Interactive BERTopic with Dynamic Adjustment", page_icon="🎯")
 
 # Make accelerate optional - not strictly required
 try:
@@ -14,22 +14,16 @@ try:
     accelerate_available = True
 except ImportError:
     accelerate_available = False
-    # Don't stop the app - just warn
-    st.warning("""
-    ⚠️ **Optional: 'accelerate' package not found**
-    
-    For better GPU performance with some models, consider installing:
-    ```bash
-    pip install accelerate
-    ```
-    The app will work without it, but may be slower in some cases.
-    """)
 
 from bertopic import BERTopic
 from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.cluster import KMeans
+from collections import Counter
+from scipy.spatial.distance import cosine
+import plotly.express as px
+import plotly.graph_objects as go
 
 # Try to import GPU-accelerated libraries
 try:
@@ -47,28 +41,13 @@ except ImportError:
     from hdbscan import HDBSCAN
     cuml_available = False
 
-# Try to import FAISS for GPU-accelerated similarity search
-try:
-    import faiss
-    faiss_available = True
-    # Check if GPU version is available
-    if torch.cuda.is_available() and hasattr(faiss, 'StandardGpuResources'):
-        faiss_gpu_available = True
-    else:
-        faiss_gpu_available = False
-except ImportError:
-    faiss_available = False
-    faiss_gpu_available = False
-
 # Force CUDA initialization if available
 if torch.cuda.is_available():
     try:
         torch.cuda.init()
         torch.cuda.empty_cache()
-        # Enable TF32 for better performance on newer GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set memory fraction to prevent OOM
         torch.cuda.set_per_process_memory_fraction(0.8)
     except Exception as e:
         st.warning(f"CUDA initialization warning: {e}")
@@ -83,18 +62,7 @@ class TopicMerger:
     def merge_small_topics(topics, embeddings, min_size=10):
         """
         Merge topics that are smaller than min_size with their nearest neighbors
-        
-        Args:
-            topics: Array of topic assignments
-            embeddings: Document embeddings
-            min_size: Minimum number of documents per topic
-            
-        Returns:
-            Merged topic assignments
         """
-        from collections import Counter
-        from scipy.spatial.distance import cosine
-        
         topics = np.array(topics)
         topic_counts = Counter(topics)
         
@@ -148,183 +116,146 @@ class TopicMerger:
         return final_topics
 
 # -----------------------------------------------------
-# CATEGORY BALANCE ANALYZER
+# FAST RECLUSTERING ENGINE
 # -----------------------------------------------------
-class CategoryBalanceAnalyzer:
-    """Analyzes topic distribution and suggests splits for oversized categories"""
+class FastReclusterer:
+    """Fast reclustering using pre-computed embeddings and reduced embeddings"""
     
-    def __init__(self, min_topic_ratio=0.30, ideal_max_ratio=0.20):
+    def __init__(self, documents, embeddings, umap_embeddings=None):
+        self.documents = documents
+        self.embeddings = embeddings
+        self.umap_embeddings = umap_embeddings
+        self.use_gpu = torch.cuda.is_available() and cuml_available
+        
+    def recluster(self, n_topics, min_topic_size=10, use_reduced=True, method='kmeans'):
         """
+        Quickly recluster documents into new topics
+        
         Args:
-            min_topic_ratio: If a topic has more than this ratio of docs, flag it
-            ideal_max_ratio: Ideal maximum ratio for any single topic
-        """
-        self.min_topic_ratio = min_topic_ratio
-        self.ideal_max_ratio = ideal_max_ratio
-    
-    def analyze_distribution(self, labels, include_outliers=False):
-        """
-        Analyze the distribution of documents across topics
+            n_topics: Number of topics to create
+            min_topic_size: Minimum size per topic
+            use_reduced: Whether to use UMAP-reduced embeddings (faster)
+            method: 'kmeans' or 'hdbscan'
         
         Returns:
-            dict with analysis results
+            topics: Array of topic assignments
+            topic_info: DataFrame with topic information
         """
-        total_docs = len(labels)
-        unique_topics = set(labels)
+        # Choose embeddings to use
+        clustering_embeddings = self.umap_embeddings if (use_reduced and self.umap_embeddings is not None) else self.embeddings
         
-        # Remove outliers from analysis if requested
-        if not include_outliers:
-            labels_filtered = [l for l in labels if l != -1]
-            total_docs = len(labels_filtered)
-            unique_topics = set(labels_filtered)
+        # Perform clustering
+        if method == 'kmeans':
+            if self.use_gpu:
+                try:
+                    from cuml.cluster import KMeans as cuKMeans
+                    clusterer = cuKMeans(n_clusters=n_topics, random_state=42, max_iter=300)
+                except:
+                    clusterer = KMeans(n_clusters=n_topics, random_state=42, max_iter=300)
+            else:
+                clusterer = KMeans(n_clusters=n_topics, random_state=42, max_iter=300)
+            
+            topics = clusterer.fit_predict(clustering_embeddings)
         else:
-            labels_filtered = labels
-        
-        if total_docs == 0:
-            return {
-                'balanced': False,
-                'oversized_topics': [],
-                'distribution': {},
-                'warnings': ['No documents to analyze']
-            }
-        
-        # Calculate distribution
-        topic_counts = {}
-        for topic in unique_topics:
-            count = labels_filtered.count(topic)
-            topic_counts[topic] = {
-                'count': count,
-                'ratio': count / total_docs
-            }
-        
-        # Find oversized topics
-        oversized_topics = []
-        warnings_list = []
-        
-        for topic, stats in topic_counts.items():
-            if stats['ratio'] > self.min_topic_ratio:
-                oversized_topics.append({
-                    'topic': topic,
-                    'count': stats['count'],
-                    'ratio': stats['ratio'],
-                    'suggested_splits': max(2, int(stats['ratio'] / self.ideal_max_ratio))
-                })
-                warnings_list.append(
-                    f"Topic {topic}: {stats['count']} docs ({stats['ratio']*100:.1f}%) - Consider splitting into {max(2, int(stats['ratio'] / self.ideal_max_ratio))} subtopics"
+            # HDBSCAN with dynamic parameters
+            min_cluster_size = max(min_topic_size, len(self.documents) // (n_topics * 2))
+            
+            if self.use_gpu:
+                clusterer = cumlHDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=max(1, min_cluster_size // 5),
+                    prediction_data=True
                 )
+            else:
+                clusterer = HDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=max(1, min_cluster_size // 5),
+                    prediction_data=True
+                )
+            
+            topics = clusterer.fit_predict(clustering_embeddings)
         
-        # Calculate balance metrics
-        ratios = [stats['ratio'] for stats in topic_counts.values()]
-        balance_score = 1 - (np.std(ratios) if len(ratios) > 1 else 0)
+        # Merge small topics if necessary
+        if min_topic_size > 2:
+            topics = TopicMerger.merge_small_topics(topics, self.embeddings, min_topic_size)
         
-        return {
-            'balanced': len(oversized_topics) == 0,
-            'balance_score': balance_score,
-            'oversized_topics': oversized_topics,
-            'distribution': topic_counts,
-            'warnings': warnings_list,
-            'total_topics': len(unique_topics),
-            'outlier_ratio': (len(labels) - len(labels_filtered)) / len(labels) if len(labels) > 0 else 0
-        }
-
-# -----------------------------------------------------
-# OUTLIER REDUCTION STRATEGIES
-# -----------------------------------------------------
-class OutlierReducer:
-    """Strategies to reduce outliers in topic modeling"""
+        # Extract topic keywords using c-TF-IDF
+        topic_info = self._extract_topic_keywords(topics)
+        
+        return topics, topic_info
     
-    @staticmethod
-    def suggest_parameters(num_docs, current_outlier_ratio, min_topic_size=10):
-        """
-        Suggest better parameters to reduce outliers
+    def _extract_topic_keywords(self, topics, top_n_words=10):
+        """Extract keywords for each topic using c-TF-IDF"""
+        from sklearn.feature_extraction.text import CountVectorizer
         
-        Args:
-            num_docs: Number of documents
-            current_outlier_ratio: Current outlier percentage (0-1)
-            min_topic_size: User-defined minimum topic size
+        # Prepare documents per topic
+        topics_dict = {}
+        for idx, topic in enumerate(topics):
+            if topic not in topics_dict:
+                topics_dict[topic] = []
+            topics_dict[topic].append(self.documents[idx])
         
-        Returns:
-            dict of suggested parameters
-        """
-        suggestions = {
-            'method': '',
-            'parameters': {},
-            'explanation': ''
-        }
+        # Vectorize
+        vectorizer = CountVectorizer(
+            ngram_range=(1, 2),
+            stop_words='english',
+            max_features=100
+        )
         
-        if current_outlier_ratio > 0.3:
-            # High outliers - use K-means
-            suggestions['method'] = 'kmeans'
-            # Adjust number of topics based on min_topic_size
-            max_topics = max(5, num_docs // min_topic_size)
-            suggested_topics = min(max_topics, max(5, num_docs // 50))
+        # Calculate c-TF-IDF for each topic
+        topic_info_list = []
+        for topic_id in sorted(topics_dict.keys()):
+            if topic_id == -1:
+                continue
+                
+            topic_docs = topics_dict[topic_id]
             
-            suggestions['parameters'] = {
-                'use_kmeans': True,
-                'use_gpu_kmeans': True,
-                'nr_topics': suggested_topics,
-                'min_topic_size': min_topic_size,
-                'merge_small_topics': True  # New parameter
-            }
-            suggestions['explanation'] = f"High outliers detected. K-means will assign all documents to topics. Topics smaller than {min_topic_size} will be merged."
-            
-        elif current_outlier_ratio > 0.15:
-            # Moderate outliers - adjust HDBSCAN
-            suggestions['method'] = 'hdbscan'
-            suggestions['parameters'] = {
-                'use_kmeans': False,
-                'min_cluster_size': max(3, min_topic_size // 3),  # Dynamic based on min_topic_size
-                'min_samples': max(1, min_topic_size // 5),
-                'prediction_data': True,
-                'min_topic_size': min_topic_size
-            }
-            suggestions['explanation'] = f"Moderate outliers. Using lenient HDBSCAN parameters with min topic size of {min_topic_size}."
-            
-        else:
-            # Low outliers - standard parameters
-            suggestions['method'] = 'hdbscan'
-            suggestions['parameters'] = {
-                'use_kmeans': False,
-                'min_cluster_size': min_topic_size,
-                'min_samples': max(1, min_topic_size // 2),
-                'prediction_data': False,
-                'min_topic_size': min_topic_size
-            }
-            suggestions['explanation'] = f"Low outliers. Using standard HDBSCAN with min topic size of {min_topic_size}."
-        
-        return suggestions
-
-# GPU-accelerated K-means wrapper
-class GPUKMeans:
-    """K-means clustering with GPU acceleration if available"""
-    
-    def __init__(self, n_clusters=5, random_state=42):
-        self.n_clusters = n_clusters
-        self.random_state = random_state
-        
-        # Try to use GPU-accelerated version
-        if cuml_available and torch.cuda.is_available():
+            # Get top words for this topic
             try:
-                from cuml.cluster import KMeans as cuKMeans
-                self.model = cuKMeans(n_clusters=n_clusters, random_state=random_state)
-                self.use_gpu = True
-            except Exception:
-                from sklearn.cluster import KMeans
-                self.model = KMeans(n_clusters=n_clusters, random_state=random_state)
-                self.use_gpu = False
-        else:
-            from sklearn.cluster import KMeans
-            self.model = KMeans(n_clusters=n_clusters, random_state=random_state)
-            self.use_gpu = False
-    
-    def fit(self, X):
-        return self.model.fit(X)
-    
-    def predict(self, X):
-        return self.model.predict(X)
-    
-    def fit_predict(self, X):
-        return self.model.fit_predict(X)
+                # Join documents for this topic
+                topic_text = ' '.join(topic_docs[:100])  # Sample for speed
+                
+                # Simple keyword extraction
+                words = topic_text.lower().split()
+                word_counts = Counter(words)
+                
+                # Filter common words
+                common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+                               'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+                               'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                               'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'it', 'this',
+                               'that', 'these', 'those', 'i', 'you', 'he', 'she', 'we', 'they'}
+                
+                filtered_counts = {w: c for w, c in word_counts.items() 
+                                 if w not in common_words and len(w) > 2}
+                
+                # Get top words
+                top_words = sorted(filtered_counts.items(), key=lambda x: x[1], reverse=True)[:top_n_words]
+                keywords = [word for word, _ in top_words]
+                
+                if not keywords:
+                    keywords = ['topic', str(topic_id)]
+                
+            except Exception as e:
+                keywords = [f'topic_{topic_id}']
+            
+            topic_info_list.append({
+                'Topic': topic_id,
+                'Count': len(topic_docs),
+                'Keywords': ', '.join(keywords[:5]),
+                'Name': f"Topic {topic_id}: {', '.join(keywords[:3])}"
+            })
+        
+        # Add outliers if present
+        if -1 in topics_dict:
+            topic_info_list.append({
+                'Topic': -1,
+                'Count': len(topics_dict[-1]),
+                'Keywords': 'Outliers',
+                'Name': 'Outliers'
+            })
+        
+        return pd.DataFrame(topic_info_list)
 
 # -----------------------------------------------------
 # MAIN APPLICATION
@@ -335,26 +266,12 @@ def check_gpu_capabilities():
         'cuda_available': torch.cuda.is_available(),
         'device_count': 0,
         'device_name': None,
-        'gpu_memory_total': None,
-        'gpu_memory_free': None,
-        'cupy_available': cupy_available,
         'cuml_available': cuml_available,
-        'faiss_available': faiss_available,
-        'faiss_gpu_available': faiss_gpu_available,
-        'accelerate_available': accelerate_available
     }
     
     if torch.cuda.is_available():
         capabilities['device_count'] = torch.cuda.device_count()
         capabilities['device_name'] = torch.cuda.get_device_name(0)
-        
-        # Get memory info
-        try:
-            mem_info = torch.cuda.mem_get_info(0)
-            capabilities['gpu_memory_free'] = f"{mem_info[0] / 1024**3:.1f} GB"
-            capabilities['gpu_memory_total'] = f"{mem_info[1] / 1024**3:.1f} GB"
-        except Exception:
-            pass
     
     return capabilities
 
@@ -367,25 +284,73 @@ def load_embedding_model(model_name):
     """Load and cache the embedding model"""
     if torch.cuda.is_available():
         model = SentenceTransformer(model_name, device='cuda')
-        # Optimize for GPU
         model.max_seq_length = 512
         model.encode = torch.compile(model.encode) if hasattr(torch, 'compile') else model.encode
     else:
         model = SentenceTransformer(model_name, device='cpu')
     return model
 
+@st.cache_data
+def compute_embeddings(_model, documents, batch_size=32):
+    """Compute and cache embeddings"""
+    if torch.cuda.is_available():
+        with torch.cuda.amp.autocast():
+            embeddings = _model.encode(
+                documents,
+                show_progress_bar=True,
+                batch_size=batch_size,
+                convert_to_numpy=True
+            )
+    else:
+        embeddings = _model.encode(
+            documents,
+            show_progress_bar=True,
+            batch_size=batch_size,
+            convert_to_numpy=True
+        )
+    return embeddings
+
+@st.cache_data
+def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
+    """Compute and cache UMAP reduced embeddings"""
+    if cuml_available and torch.cuda.is_available():
+        reducer = cumlUMAP(
+            n_neighbors=n_neighbors,
+            n_components=n_components,
+            metric='cosine',
+            random_state=42
+        )
+    else:
+        reducer = UMAP(
+            n_neighbors=n_neighbors,
+            n_components=n_components,
+            metric='cosine',
+            random_state=42
+        )
+    
+    umap_embeddings = reducer.fit_transform(embeddings)
+    return umap_embeddings
+
 def main():
-    st.title("🚀 Windows CUDA-Optimized BERTopic with Smart Balancing")
+    st.title("🎯 Interactive BERTopic with Dynamic Topic Adjustment")
     
     # Initialize session state
-    if 'model' not in st.session_state:
-        st.session_state.model = None
-    if 'processed_df' not in st.session_state:
-        st.session_state.processed_df = None
+    if 'embeddings_computed' not in st.session_state:
+        st.session_state.embeddings_computed = False
     if 'embeddings' not in st.session_state:
         st.session_state.embeddings = None
-    if 'min_topic_size_used' not in st.session_state:
-        st.session_state.min_topic_size_used = 10  # Default value
+    if 'umap_embeddings' not in st.session_state:
+        st.session_state.umap_embeddings = None
+    if 'documents' not in st.session_state:
+        st.session_state.documents = None
+    if 'df' not in st.session_state:
+        st.session_state.df = None
+    if 'reclusterer' not in st.session_state:
+        st.session_state.reclusterer = None
+    if 'current_topics' not in st.session_state:
+        st.session_state.current_topics = None
+    if 'current_topic_info' not in st.session_state:
+        st.session_state.current_topic_info = None
     
     # Check GPU capabilities
     gpu_capabilities = check_gpu_capabilities()
@@ -396,31 +361,18 @@ def main():
         
         # GPU Status Display
         if gpu_capabilities['cuda_available']:
-            st.success(f"✅ GPU Detected: {gpu_capabilities['device_name']}")
-            st.info(f"Memory: {gpu_capabilities['gpu_memory_free']} free / {gpu_capabilities['gpu_memory_total']} total")
+            st.success(f"✅ GPU: {gpu_capabilities['device_name']}")
         else:
             st.warning("⚠️ No GPU detected. Using CPU (slower)")
-        
-        # Acceleration packages status
-        st.subheader("📦 Acceleration Status")
-        accel_cols = st.columns(2)
-        with accel_cols[0]:
-            st.write(f"{'✅' if gpu_capabilities['cuml_available'] else '❌'} cuML")
-            st.write(f"{'✅' if gpu_capabilities['cupy_available'] else '❌'} CuPy")
-        with accel_cols[1]:
-            st.write(f"{'✅' if gpu_capabilities['faiss_gpu_available'] else '❌'} FAISS GPU")
-            st.write(f"{'✅' if gpu_capabilities['accelerate_available'] else '❌'} Accelerate")
         
         # File upload
         st.header("📄 Data Input")
         uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
         
         if uploaded_file is not None:
-            # Store filename in session state
-            st.session_state.uploaded_file_name = uploaded_file.name.replace('.csv', '')
-            
-            # Load and preview data
+            # Load data
             df = pd.read_csv(uploaded_file)
+            st.session_state.df = df
             st.success(f"✅ Loaded {len(df):,} rows")
             
             # Column selection
@@ -430,10 +382,9 @@ def main():
                 help="Column containing the text to analyze"
             )
             
-            # Analysis Settings
-            st.header("🎯 Analysis Settings")
+            # Embedding Settings
+            st.header("🧮 Embedding Settings")
             
-            # Embedding model selection
             embedding_model = st.selectbox(
                 "Embedding Model",
                 [
@@ -445,492 +396,348 @@ def main():
                 help="Smaller models are faster but may be less accurate"
             )
             
-            # NEW: Minimum Topic Size Control
-            st.subheader("📏 Topic Size Control")
+            # UMAP Settings
+            with st.expander("🔧 UMAP Settings"):
+                n_neighbors = st.slider("n_neighbors", 5, 50, 15,
+                                       help="Affects local vs global structure")
+                n_components = st.slider("n_components", 2, 10, 5,
+                                       help="Dimensions for clustering")
+            
+            # Initial clustering settings
+            st.header("🎯 Initial Clustering")
+            
+            initial_method = st.selectbox(
+                "Clustering Method",
+                ["K-means (Fast, No Outliers)", "HDBSCAN (Quality, May Have Outliers)"]
+            )
+            
+            if "K-means" in initial_method:
+                initial_n_topics = st.slider(
+                    "Initial Number of Topics",
+                    min_value=2,
+                    max_value=min(50, len(df) // 10),
+                    value=min(10, len(df) // 50),
+                    help="Starting point - you can adjust this dynamically later!"
+                )
+            else:
+                initial_n_topics = None
+                
             min_topic_size = st.slider(
                 "Minimum Topic Size",
                 min_value=2,
                 max_value=min(100, len(df) // 10),
                 value=min(10, len(df) // 50),
-                help="Minimum number of documents per topic. Topics smaller than this will be merged with similar topics."
+                help="Topics smaller than this will be merged"
             )
             
-            st.info(f"ℹ️ Topics with fewer than {min_topic_size} documents will be merged with their most similar larger topic.")
-            
-            # Outlier Reduction Strategy
-            outlier_strategy = st.selectbox(
-                "Outlier Reduction Strategy",
-                ["Aggressive (K-means) - 0% outliers", 
-                 "Moderate (Lenient HDBSCAN) - <15% outliers",
-                 "Conservative (Standard HDBSCAN) - Natural clustering"],
-                help="Choose how aggressively to assign outliers to topics"
-            )
-            
-            # Advanced Settings
-            with st.expander("🔧 Advanced Settings"):
-                # Number of topics (for K-means)
-                if "Aggressive" in outlier_strategy:
-                    # Calculate reasonable max topics based on min_topic_size
-                    max_topics = max(5, len(df) // min_topic_size)
-                    default_topics = min(max_topics, max(5, len(df) // 50))
+            # Compute embeddings button
+            if st.button("🚀 Compute Embeddings & Initial Topics", type="primary"):
+                with st.spinner("Computing embeddings... This is the slow part, but only needs to be done once!"):
+                    # Load model and compute embeddings
+                    model = load_embedding_model(embedding_model)
+                    documents = df[text_col].tolist()
                     
-                    nr_topics = st.number_input(
-                        "Number of Topics",
-                        min_value=2,
-                        max_value=max_topics,
-                        value=default_topics,
-                        help=f"Number of topics to create (limited by min topic size of {min_topic_size})"
+                    # Compute full embeddings
+                    embeddings = compute_embeddings(model, documents)
+                    
+                    # Compute UMAP embeddings for faster reclustering
+                    with st.spinner("Computing UMAP reduction for fast reclustering..."):
+                        umap_embeddings = compute_umap_embeddings(embeddings, n_neighbors, n_components)
+                    
+                    # Store in session state
+                    st.session_state.embeddings = embeddings
+                    st.session_state.umap_embeddings = umap_embeddings
+                    st.session_state.documents = documents
+                    st.session_state.embeddings_computed = True
+                    st.session_state.text_col = text_col
+                    
+                    # Create reclusterer
+                    st.session_state.reclusterer = FastReclusterer(
+                        documents, embeddings, umap_embeddings
                     )
                     
-                    # Validate that nr_topics * min_topic_size doesn't exceed document count
-                    if nr_topics * min_topic_size > len(df):
-                        st.warning(f"⚠️ With {nr_topics} topics and min size {min_topic_size}, you need at least {nr_topics * min_topic_size} documents. Adjusting...")
-                        nr_topics = len(df) // min_topic_size
-                else:
-                    nr_topics = None
-                
-                # UMAP parameters
-                n_neighbors = st.slider("UMAP n_neighbors", 2, 50, 15)
-                n_components = st.slider("UMAP n_components", 2, 10, 5)
-                
-                # Representation model
-                use_mmr = st.checkbox("Use MMR for diverse keywords", value=True)
-                
-                # Seed words
-                st.subheader("🎯 Seed Words (Optional)")
-                seed_words_input = st.text_area(
-                    "Enter seed words (one set per line)",
-                    placeholder="Example:\nfinance, money, budget, cost\nmarketing, campaign, advertising",
-                    help="Guide topic discovery with predefined keyword sets"
-                )
-                
+                    # Perform initial clustering
+                    method = 'kmeans' if "K-means" in initial_method else 'hdbscan'
+                    topics, topic_info = st.session_state.reclusterer.recluster(
+                        n_topics=initial_n_topics if initial_n_topics else 10,
+                        min_topic_size=min_topic_size,
+                        use_reduced=True,
+                        method=method
+                    )
+                    
+                    st.session_state.current_topics = topics
+                    st.session_state.current_topic_info = topic_info
+                    st.session_state.min_topic_size = min_topic_size
+                    
+                    st.success("✅ Embeddings computed! Now you can adjust topics dynamically below.")
+                    st.balloons()
+    
     # Main content area
-    if uploaded_file is not None and 'text_col' in locals():
-        # Process button
-        if st.button("🚀 Run Topic Modeling", type="primary"):
-            # Clear any existing results
-            st.session_state.model = None
-            st.session_state.processed_df = None
-            
-            # Set up parameters based on strategy and min_topic_size
-            if "Aggressive" in outlier_strategy:
-                use_kmeans = True
-                if torch.cuda.is_available() and cuml_available:
-                    hdbscan_model = GPUKMeans(n_clusters=nr_topics)
-                else:
-                    hdbscan_model = KMeans(n_clusters=nr_topics, random_state=42)
-                clustering_method = "K-means"
-            elif "Moderate" in outlier_strategy:
-                use_kmeans = False
-                min_cluster_size = max(3, min_topic_size // 3)
-                if torch.cuda.is_available() and cuml_available:
-                    hdbscan_model = cumlHDBSCAN(
-                        min_cluster_size=min_cluster_size,
-                        min_samples=max(1, min_topic_size // 5),
-                        prediction_data=True
-                    )
-                else:
-                    hdbscan_model = HDBSCAN(
-                        min_cluster_size=min_cluster_size,
-                        min_samples=max(1, min_topic_size // 5),
-                        prediction_data=True
-                    )
-                clustering_method = "Lenient HDBSCAN"
-            else:  # Conservative
-                use_kmeans = False
-                if torch.cuda.is_available() and cuml_available:
-                    hdbscan_model = cumlHDBSCAN(
-                        min_cluster_size=min_topic_size,
-                        min_samples=max(1, min_topic_size // 2)
-                    )
-                else:
-                    hdbscan_model = HDBSCAN(
-                        min_cluster_size=min_topic_size,
-                        min_samples=max(1, min_topic_size // 2)
-                    )
-                clustering_method = "Standard HDBSCAN"
-            
-            # UMAP configuration
-            if torch.cuda.is_available() and cuml_available:
-                umap_model = cumlUMAP(
-                    n_neighbors=n_neighbors,
-                    n_components=n_components,
-                    random_state=42
-                )
-            else:
-                umap_model = UMAP(
-                    n_neighbors=n_neighbors,
-                    n_components=n_components,
-                    random_state=42
-                )
-            
-            # Representation model
-            representation_model = []
-            if use_mmr:
-                representation_model.append(MaximalMarginalRelevance())
-            representation_model.append(KeyBERTInspired())
-            
-            # Parse seed words if provided
-            seed_topic_list = []
-            if seed_words_input:
-                for line in seed_words_input.strip().split('\n'):
-                    if line.strip():
-                        words = [w.strip() for w in line.split(',')]
-                        if words:
-                            seed_topic_list.append(words)
-            
-            # Progress tracking
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            try:
-                # Step 1: Load embedding model (20%)
-                status_text.text("📚 Loading embedding model...")
-                progress_bar.progress(20)
-                
-                sentence_model = load_embedding_model(embedding_model)
-                
-                # Step 2: Generate embeddings (40%)
-                status_text.text(f"🔤 Generating embeddings for {len(df):,} documents...")
-                progress_bar.progress(40)
-                
-                documents = df[text_col].tolist()
-                
-                # GPU-optimized batch encoding
-                if torch.cuda.is_available():
-                    with torch.cuda.amp.autocast():
-                        embeddings = sentence_model.encode(
-                            documents,
-                            show_progress_bar=True,
-                            batch_size=32,
-                            convert_to_numpy=True
-                        )
-                else:
-                    embeddings = sentence_model.encode(
-                        documents,
-                        show_progress_bar=True,
-                        batch_size=32,
-                        convert_to_numpy=True
-                    )
-                
-                # Store embeddings in session state for later use
-                st.session_state.embeddings = embeddings
-                
-                # Step 3: Configure BERTopic (50%)
-                status_text.text("🔧 Configuring BERTopic model...")
-                progress_bar.progress(50)
-                
-                # Create BERTopic model with appropriate min_topic_size
-                topic_model = BERTopic(
-                    embedding_model=sentence_model,
-                    umap_model=umap_model,
-                    hdbscan_model=hdbscan_model,
-                    representation_model=representation_model,
-                    min_topic_size=min_topic_size,  # Use user-defined min_topic_size
-                    seed_topic_list=seed_topic_list if seed_topic_list else None,
-                    calculate_probabilities=False if use_kmeans else True,
-                    verbose=True
-                )
-                
-                # Step 4: Fit model (70%)
-                status_text.text(f"🎯 Fitting topics using {clustering_method}...")
-                progress_bar.progress(70)
-                
-                topics, probs = topic_model.fit_transform(documents, embeddings)
-                
-                # Step 5: Post-processing - Merge small topics if needed
-                if min_topic_size > 2:
-                    status_text.text(f"🔄 Merging topics smaller than {min_topic_size} documents...")
-                    progress_bar.progress(80)
-                    
-                    # Get original topic counts
-                    from collections import Counter
-                    original_counts = Counter(topics)
-                    small_topics = [t for t, count in original_counts.items() 
-                                  if t != -1 and count < min_topic_size]
-                    
-                    if small_topics:
-                        # Merge small topics
-                        merged_topics = TopicMerger.merge_small_topics(
-                            topics, embeddings, min_topic_size
-                        )
-                        
-                        # Update the model with merged topics
-                        topics = merged_topics
-                        
-                        # Re-fit the topic representations for merged topics
-                        topic_model._update_topic_size(topics)
-                        topic_model._extract_topics(documents, embeddings)
-                        
-                        st.info(f"ℹ️ Merged {len(small_topics)} small topics into larger ones")
-                
-                # Step 6: Prepare results (90%)
-                status_text.text("📊 Preparing results...")
-                progress_bar.progress(90)
-                
-                # Get topic information
-                topic_info = topic_model.get_topic_info()
-                
-                # Add results to dataframe
-                df_results = df.copy()
-                df_results['topic'] = topics
-                df_results['topic_label'] = df_results['topic'].apply(
-                    lambda x: f"Topic {x}" if x != -1 else "Outlier"
-                )
-                
-                # Add keywords for each topic
-                df_results['keywords'] = df_results['topic'].apply(
-                    lambda x: ', '.join([word for word, _ in topic_model.get_topic(x)[:5]]) 
-                    if x != -1 else "No keywords"
-                )
-                
-                # Store in session state
-                st.session_state.model = topic_model
-                st.session_state.processed_df = df_results
-                st.session_state.topic_info = topic_info
-                st.session_state.clustering_method = clustering_method
-                st.session_state.gpu_used = torch.cuda.is_available()
-                st.session_state.min_topic_size_used = min_topic_size
-                
-                # Complete
-                progress_bar.progress(100)
-                status_text.text("✅ Topic modeling complete!")
-                
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                st.info("💡 Try reducing the number of topics or adjusting parameters")
+    if st.session_state.embeddings_computed:
+        st.success("✅ Embeddings ready! Use the slider below to dynamically adjust the number of topics.")
         
-        # Display results if available
-        if st.session_state.model is not None:
-            model = st.session_state.model
-            processed_df = st.session_state.processed_df
-            topic_info = st.session_state.topic_info
+        # Interactive controls section
+        st.header("🎚️ Dynamic Topic Adjustment")
+        
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            # Determine max topics based on min_topic_size
+            max_topics = min(100, len(st.session_state.documents) // st.session_state.min_topic_size)
             
-            # Summary metrics
-            st.header("📊 Results Summary")
+            # Interactive slider for number of topics
+            n_topics_slider = st.slider(
+                "🎯 **Number of Topics** (Adjust in real-time!)",
+                min_value=2,
+                max_value=max_topics,
+                value=min(10, len(st.session_state.documents) // 50),
+                help="Move the slider to instantly re-cluster with different number of topics"
+            )
+        
+        with col2:
+            clustering_method = st.selectbox(
+                "Method",
+                ["K-means (Fast)", "HDBSCAN"],
+                help="K-means is faster for interactive adjustment"
+            )
+        
+        with col3:
+            use_reduced = st.checkbox(
+                "Use UMAP reduction",
+                value=True,
+                help="Faster reclustering using reduced dimensions"
+            )
+        
+        # Add a debounce mechanism using a form
+        with st.form(key='recluster_form'):
+            st.write(f"Click below to recluster with **{n_topics_slider} topics**")
+            recluster_button = st.form_submit_button("🔄 Recluster Now", use_container_width=True)
+        
+        if recluster_button or (st.session_state.current_topics is None):
+            with st.spinner(f"Reclustering into {n_topics_slider} topics... (This is fast!)"):
+                # Perform reclustering
+                method = 'kmeans' if "K-means" in clustering_method else 'hdbscan'
+                topics, topic_info = st.session_state.reclusterer.recluster(
+                    n_topics=n_topics_slider,
+                    min_topic_size=st.session_state.min_topic_size,
+                    use_reduced=use_reduced,
+                    method=method
+                )
+                
+                st.session_state.current_topics = topics
+                st.session_state.current_topic_info = topic_info
+                
+                st.success(f"✅ Reclustered into {len(topic_info[topic_info['Topic'] != -1])} topics!")
+        
+        # Display results
+        if st.session_state.current_topics is not None:
+            topics = st.session_state.current_topics
+            topic_info = st.session_state.current_topic_info
             
             # Calculate metrics
-            unique_topics = len(processed_df['topic'].unique()) - 1  # Exclude outliers
-            outlier_count = len(processed_df[processed_df['topic'] == -1])
-            total_docs = len(processed_df)
-            coverage = ((total_docs - outlier_count) / total_docs) * 100
+            total_docs = len(topics)
+            unique_topics = len(set(topics)) - (1 if -1 in topics else 0)
+            outlier_count = sum(1 for t in topics if t == -1)
+            coverage = ((total_docs - outlier_count) / total_docs) * 100 if total_docs > 0 else 0
             
-            # Display key metrics
+            # Metrics display
+            st.header("📊 Current Results")
+            
             col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
-                st.metric("Total Documents", f"{total_docs:,}")
+                st.metric("Documents", f"{total_docs:,}")
             with col2:
-                st.metric("Topics Found", unique_topics)
+                st.metric("Topics", unique_topics)
             with col3:
-                st.metric("Outliers", f"{outlier_count:,} ({100-coverage:.1f}%)")
+                st.metric("Outliers", f"{outlier_count:,}")
             with col4:
                 st.metric("Coverage", f"{coverage:.1f}%")
             with col5:
-                st.metric("Min Topic Size", st.session_state.get('min_topic_size_used', 'N/A'))
-            
-            # Run parameters used
-            ran_params = {
-                'Clustering': st.session_state.get('clustering_method', 'Unknown'),
-                'GPU Used': st.session_state.get('gpu_used', False),
-                'Min Topic Size': st.session_state.get('min_topic_size_used', 'N/A')
-            }
-            
-            with st.expander("🔍 Parameters Used"):
-                for key, value in ran_params.items():
-                    st.write(f"**{key}:** {value}")
-            
-            # Balance Analysis
-            balance_analyzer = CategoryBalanceAnalyzer()
-            balance_analysis = balance_analyzer.analyze_distribution(
-                processed_df['topic'].tolist(),
-                include_outliers=False
-            )
+                # Calculate balance score
+                topic_counts = Counter(topics)
+                counts = [c for t, c in topic_counts.items() if t != -1]
+                balance = 1 - (np.std(counts) / np.mean(counts)) if counts else 0
+                st.metric("Balance", f"{balance:.2f}")
             
             # Tabs for different views
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Topics Overview", "📈 Distribution Analysis", 
-                                              "🔍 Split Large Topics", "💾 Export"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "📊 Topic Overview", 
+                "📈 Interactive Visualization", 
+                "🔍 Document Explorer",
+                "📉 Distribution Analysis",
+                "💾 Export"
+            ])
             
             with tab1:
                 st.subheader("Topic Information")
                 
-                # Clean up topic display
+                # Display topic info
                 display_df = topic_info.copy()
-                display_df = display_df[display_df['Topic'] != -1]  # Exclude outliers from main display
-                
-                # Add percentage column
+                display_df = display_df[display_df['Topic'] != -1] if -1 in display_df['Topic'].values else display_df
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
                 
-                # Format the representation column
-                display_df['Keywords'] = display_df['Representation'].apply(
-                    lambda x: ', '.join(x[:5]) if isinstance(x, list) else str(x)[:100]
-                )
-                
-                # Select columns to display
-                display_df = display_df[['Topic', 'Count', 'Percentage', 'Name', 'Keywords']]
-                
-                # Highlight oversized topics
-                def highlight_oversized(row):
+                # Color code by size
+                def color_code_size(row):
                     if row['Percentage'] > 30:
                         return ['background-color: #ffcccc'] * len(row)
                     elif row['Percentage'] > 20:
                         return ['background-color: #fff4cc'] * len(row)
+                    elif row['Percentage'] < 2:
+                        return ['background-color: #ccf4ff'] * len(row)
                     else:
                         return [''] * len(row)
                 
-                styled_df = display_df.style.apply(highlight_oversized, axis=1)
+                styled_df = display_df.style.apply(color_code_size, axis=1)
                 st.dataframe(styled_df, use_container_width=True)
                 
-                # Show outliers separately if any
-                if outlier_count > 0:
-                    st.warning(f"⚠️ {outlier_count} documents ({100-coverage:.1f}%) were classified as outliers")
-                
-                # Balance warnings
-                if not balance_analysis['balanced']:
-                    st.error("⚠️ **Topic Distribution Imbalance Detected!**")
-                    for warning in balance_analysis['warnings']:
-                        st.warning(warning)
-                        
+                # Legend
+                st.caption("🔴 Red: >30% (Too Large) | 🟡 Yellow: >20% (Large) | 🔵 Blue: <2% (Small)")
+            
             with tab2:
-                st.subheader("📈 Topic Distribution Analysis")
+                st.subheader("Interactive Topic Visualization")
                 
-                # Create distribution chart
-                import plotly.express as px
+                # Create scatter plot of topics
+                if len(set(topics)) > 1:
+                    # Prepare data
+                    viz_df = pd.DataFrame({
+                        'Topic': topics,
+                        'Document': st.session_state.documents
+                    })
+                    
+                    # If we have 2D UMAP, use it for visualization
+                    if st.session_state.umap_embeddings is not None and st.session_state.umap_embeddings.shape[1] >= 2:
+                        viz_df['X'] = st.session_state.umap_embeddings[:, 0]
+                        viz_df['Y'] = st.session_state.umap_embeddings[:, 1]
+                    else:
+                        # Use PCA for 2D projection
+                        from sklearn.decomposition import PCA
+                        pca = PCA(n_components=2)
+                        coords = pca.fit_transform(st.session_state.embeddings)
+                        viz_df['X'] = coords[:, 0]
+                        viz_df['Y'] = coords[:, 1]
+                    
+                    viz_df['Topic_Label'] = viz_df['Topic'].apply(
+                        lambda x: f"Topic {x}" if x != -1 else "Outliers"
+                    )
+                    
+                    # Sample for performance if too many points
+                    if len(viz_df) > 5000:
+                        viz_df_sample = viz_df.sample(5000, random_state=42)
+                    else:
+                        viz_df_sample = viz_df
+                    
+                    # Create interactive scatter plot
+                    fig = px.scatter(
+                        viz_df_sample,
+                        x='X', y='Y',
+                        color='Topic_Label',
+                        hover_data={'Document': True, 'Topic': True},
+                        title='Document Clusters in 2D Space',
+                        height=600
+                    )
+                    
+                    fig.update_layout(
+                        xaxis_title="UMAP 1",
+                        yaxis_title="UMAP 2",
+                        showlegend=True
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Need at least 2 topics for visualization")
+            
+            with tab3:
+                st.subheader("Document Explorer")
                 
-                # Prepare data for visualization
-                viz_df = processed_df['topic'].value_counts().reset_index()
-                viz_df.columns = ['Topic', 'Count']
-                viz_df = viz_df[viz_df['Topic'] != -1]  # Exclude outliers
-                viz_df['Topic'] = viz_df['Topic'].apply(lambda x: f"Topic {x}")
-                viz_df = viz_df.sort_values('Count', ascending=False)
+                # Select topic to explore
+                topic_options = [f"Topic {t}" for t in sorted(set(topics)) if t != -1]
+                if -1 in topics:
+                    topic_options.append("Outliers")
+                
+                selected_topic_str = st.selectbox("Select topic to explore", topic_options)
+                
+                # Parse topic number
+                if selected_topic_str == "Outliers":
+                    selected_topic = -1
+                else:
+                    selected_topic = int(selected_topic_str.replace("Topic ", ""))
+                
+                # Get documents for this topic
+                topic_docs_idx = [i for i, t in enumerate(topics) if t == selected_topic]
+                topic_docs = [st.session_state.documents[i] for i in topic_docs_idx[:100]]  # Limit to 100
+                
+                st.write(f"**Showing up to 100 documents from {selected_topic_str} (Total: {len(topic_docs_idx)})**")
+                
+                # Display sample documents
+                for i, doc in enumerate(topic_docs[:10]):
+                    with st.expander(f"Document {i+1}"):
+                        st.write(doc[:500] + "..." if len(doc) > 500 else doc)
+                
+            with tab4:
+                st.subheader("Topic Distribution Analysis")
+                
+                # Prepare distribution data
+                topic_counts = Counter([t for t in topics if t != -1])
+                dist_df = pd.DataFrame(
+                    list(topic_counts.items()),
+                    columns=['Topic', 'Count']
+                )
+                dist_df = dist_df.sort_values('Count', ascending=False)
+                dist_df['Topic_Label'] = dist_df['Topic'].apply(lambda x: f"Topic {x}")
                 
                 # Bar chart
-                fig = px.bar(viz_df, x='Topic', y='Count', 
-                           title='Document Distribution Across Topics',
-                           color='Count',
-                           color_continuous_scale='Viridis')
+                fig_bar = px.bar(
+                    dist_df,
+                    x='Topic_Label',
+                    y='Count',
+                    title='Document Distribution Across Topics',
+                    color='Count',
+                    color_continuous_scale='Viridis',
+                    height=400
+                )
                 
-                # Add threshold line
-                threshold_count = total_docs * 0.3
-                fig.add_hline(y=threshold_count, line_dash="dash", line_color="red",
-                            annotation_text="30% threshold")
+                # Add mean line
+                mean_count = dist_df['Count'].mean()
+                fig_bar.add_hline(
+                    y=mean_count,
+                    line_dash="dash",
+                    line_color="red",
+                    annotation_text="Mean"
+                )
                 
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig_bar, use_container_width=True)
                 
-                # Balance score
-                st.subheader("📊 Balance Metrics")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    balance_score = balance_analysis['balance_score']
-                    st.metric("Balance Score", f"{balance_score:.2f}", 
-                            help="1.0 = perfectly balanced, 0 = highly imbalanced")
-                with col2:
-                    st.metric("Oversized Topics", len(balance_analysis['oversized_topics']))
-                with col3:
-                    avg_size = total_docs / unique_topics if unique_topics > 0 else 0
-                    st.metric("Avg Topic Size", f"{avg_size:.0f} docs")
-                    
-            with tab3:
-                st.subheader("🔍 Split Large Topics")
+                # Pie chart
+                fig_pie = px.pie(
+                    dist_df.head(10),  # Top 10 topics
+                    values='Count',
+                    names='Topic_Label',
+                    title='Top 10 Topics Distribution'
+                )
                 
-                if balance_analysis['oversized_topics']:
-                    st.warning(f"Found {len(balance_analysis['oversized_topics'])} oversized topic(s)")
-                    
-                    # Select topic to split
-                    oversized_options = [
-                        f"Topic {t['topic']}: {t['count']} docs ({t['ratio']*100:.1f}%)"
-                        for t in balance_analysis['oversized_topics']
-                    ]
-                    
-                    selected_topic_to_split = st.selectbox(
-                        "Select topic to split",
-                        oversized_options
-                    )
-                    
-                    # Extract topic number
-                    topic_to_split = int(selected_topic_to_split.split(':')[0].replace('Topic ', ''))
-                    
-                    # Get suggested splits
-                    suggested_splits = next(
-                        t['suggested_splits'] for t in balance_analysis['oversized_topics']
-                        if t['topic'] == topic_to_split
-                    )
-                    
-                    sub_n_topics = st.slider(
-                        "Number of subtopics",
-                        min_value=2,
-                        max_value=min(10, suggested_splits * 2),
-                        value=suggested_splits,
-                        help="How many subtopics to create from this large topic"
-                    )
-                    
-                    if st.button(f"🔍 Split Topic {topic_to_split} into {sub_n_topics} subtopics"):
-                        docs_to_split = processed_df[
-                            processed_df['topic'] == topic_to_split
-                        ][text_col].tolist()
-                        
-                        min_docs_for_split = max(10, sub_n_topics * 2)
-                        if len(docs_to_split) >= min_docs_for_split:
-                            with st.spinner(f"Analyzing {len(docs_to_split):,} documents..."):
-                                # Use K-means for splitting to ensure all docs are assigned
-                                if torch.cuda.is_available():
-                                    sub_model = BERTopic(
-                                        hdbscan_model=GPUKMeans(n_clusters=sub_n_topics),
-                                        min_topic_size=max(2, len(docs_to_split) // (sub_n_topics * 2)),
-                                        calculate_probabilities=False,
-                                        verbose=False
-                                    )
-                                else:
-                                    sub_model = BERTopic(
-                                        hdbscan_model=KMeans(n_clusters=sub_n_topics, random_state=42),
-                                        min_topic_size=max(2, len(docs_to_split) // (sub_n_topics * 2)),
-                                        calculate_probabilities=False,
-                                        verbose=False
-                                    )
-                                
-                                sub_topics, _ = sub_model.fit_transform(docs_to_split)
-                                
-                                st.success(f"✅ Split into {len(set(sub_topics))} subtopics")
-                                
-                                st.write("### 📊 Subtopics Found:")
-                                sub_topic_info = sub_model.get_topic_info()
-                                
-                                # Clean display
-                                sub_topic_display = sub_topic_info[['Topic', 'Count', 'Name']].copy()
-                                sub_topic_display['Keywords'] = sub_topic_info['Representation'].apply(
-                                    lambda x: ', '.join(x[:3]) if isinstance(x, list) else str(x)[:50]
-                                )
-                                sub_topic_display['% of Parent'] = (
-                                    sub_topic_display['Count'] / len(docs_to_split) * 100
-                                ).round(1)
-                                
-                                st.dataframe(sub_topic_display, use_container_width=True)
-                                
-                                # Summary
-                                sub_outliers = sum(1 for t in sub_topics if t == -1)
-                                sub_coverage = ((len(sub_topics) - sub_outliers) / len(sub_topics)) * 100
-                                
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("Subtopics Created", len(set(sub_topics)) - (1 if -1 in sub_topics else 0))
-                                with col2:
-                                    st.metric("Documents Reassigned", len(docs_to_split) - sub_outliers)
-                                with col3:
-                                    st.metric("Subtopic Coverage", f"{sub_coverage:.1f}%")
-                        else:
-                            st.warning(f"Not enough documents ({len(docs_to_split)} < {min_docs_for_split}) for splitting")
-                else:
-                    st.success("✅ No oversized categories detected. All topics are well-balanced!")
-                    
-            with tab4:
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with tab5:
                 st.subheader("💾 Export Results")
                 
-                col1, col2, col3 = st.columns(3)
+                # Prepare export dataframe
+                export_df = st.session_state.df.copy()
+                export_df['Topic'] = topics
+                export_df['Topic_Label'] = [f"Topic {t}" if t != -1 else "Outliers" for t in topics]
+                
+                # Add topic keywords
+                topic_keywords = {}
+                for _, row in topic_info.iterrows():
+                    topic_keywords[row['Topic']] = row['Keywords']
+                export_df['Topic_Keywords'] = export_df['Topic'].map(topic_keywords)
+                
+                col1, col2 = st.columns(2)
                 
                 with col1:
                     st.download_button(
                         label="📥 Download Results (CSV)",
-                        data=convert_df_to_csv(processed_df),
-                        file_name=f"bertopic_results_{st.session_state.uploaded_file_name}.csv",
+                        data=convert_df_to_csv(export_df),
+                        file_name=f"interactive_bertopic_results_{n_topics_slider}_topics.csv",
                         mime="text/csv",
                         help="Full dataset with topic assignments"
                     )
@@ -939,126 +746,94 @@ def main():
                     st.download_button(
                         label="📥 Download Topic Info (CSV)",
                         data=convert_df_to_csv(topic_info),
-                        file_name=f"topic_info_{st.session_state.uploaded_file_name}.csv",
+                        file_name=f"topic_info_{n_topics_slider}_topics.csv",
                         mime="text/csv",
                         help="Topic descriptions and statistics"
                     )
                 
-                with col3:
-                    # Create summary report
-                    summary = f"""Topic Modeling Report
-Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
-File: {st.session_state.uploaded_file_name}
-Documents: {len(processed_df)}
-Topics Found: {unique_topics}
-Outliers: {outlier_count} ({100-coverage:.1f}%)
-Coverage: {coverage:.1f}%
-Min Topic Size: {st.session_state.get('min_topic_size_used', 'N/A')}
-GPU Used: {ran_params.get('GPU Used', False)}
-Clustering Method: {ran_params.get('Clustering', 'Unknown')}
-Balance Status: {'Balanced' if balance_analysis['balanced'] else 'Needs Attention'}
-Oversized Categories: {len(balance_analysis['oversized_topics'])}
-"""
-                    st.download_button(
-                        label="📥 Download Report (TXT)",
-                        data=summary,
-                        file_name=f"report_{st.session_state.uploaded_file_name}.txt",
-                        mime="text/plain",
-                        help="Summary report"
-                    )
-                    
+                # Settings export
+                settings = {
+                    'n_topics': n_topics_slider,
+                    'min_topic_size': st.session_state.min_topic_size,
+                    'method': clustering_method,
+                    'coverage': f"{coverage:.1f}%",
+                    'outliers': outlier_count,
+                    'balance_score': f"{balance:.2f}"
+                }
+                
+                st.download_button(
+                    label="📥 Download Settings (JSON)",
+                    data=pd.Series(settings).to_json(),
+                    file_name=f"settings_{n_topics_slider}_topics.json",
+                    mime="application/json",
+                    help="Current configuration"
+                )
+    
     elif not uploaded_file:
         # Welcome screen
         st.info("👆 Please upload a CSV file in the sidebar to begin.")
         
-        # Display tips
-        st.header("🚀 Smart Category Balancing Features")
+        # Feature highlights
+        st.header("✨ Key Features")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.subheader("✅ Improved Topic Size Control")
-            st.markdown("""
-            **NEW: Configurable Minimum Topic Size**
-            
-            - **Set minimum topic size** for ALL clustering modes
-            - **Automatic merging** of small topics with similar larger ones
-            - **Smart topic number limits** based on your minimum size
-            - **Post-processing** ensures no tiny topics (1-2 documents)
-            
-            **Three Outlier Reduction Strategies:**
-            
-            1. **Aggressive (K-means)** - 0% outliers
-               - Forces ALL documents into topics
-               - Respects minimum topic size via merging
-               
-            2. **Moderate (Lenient HDBSCAN)** - <15% outliers
-               - Flexible clustering with size constraints
-               - Balances quality and coverage
-               
-            3. **Conservative (Standard HDBSCAN)** - Natural clustering
-               - Highest quality topics
-               - Enforces minimum size naturally
+            st.subheader("⚡ One-Time Embedding")
+            st.write("""
+            - Compute embeddings **only once**
+            - Embeddings are the slow part (30-60s)
+            - Cached for entire session
+            - No need to recompute
             """)
         
         with col2:
-            st.subheader("📊 Smart Category Detection")
-            st.markdown("""
-            **Automatic detection of problems:**
-            
-            - **Oversized Categories**: Warns when any topic has >30% of docs
-            - **Split Suggestions**: Recommends how many subtopics to create
-            - **Balance Monitoring**: Tracks distribution across all topics
-            - **Visual Warnings**: Red flags for categories needing attention
-            
-            **Split Large Topics Tool:**
-            - Analyze oversized categories
-            - Break them into meaningful subtopics
-            - Improve overall balance
-            - Maintains minimum size in subtopics
+            st.subheader("🎚️ Dynamic Adjustment")
+            st.write("""
+            - **Real-time reclustering** (<1 second)
+            - Interactive slider control
+            - Try different topic numbers
+            - Find your sweet spot quickly
             """)
         
-        # Installation tips
-        st.header("📦 Setup & Installation")
+        with col3:
+            st.subheader("📊 Instant Feedback")
+            st.write("""
+            - See results immediately
+            - Balance score updates
+            - Coverage metrics
+            - Visual distribution charts
+            """)
         
-        st.code("""
-# Required packages
-pip install streamlit bertopic sentence-transformers torch pandas plotly scipy
-
-# Optional: GPU acceleration (highly recommended!)
-pip install accelerate  # For better GPU performance
-pip install faiss-gpu   # For faster similarity search
-
-# Optional: CUDA optimization
-pip install cupy-cuda11x  # For GPU arrays
-        """, language="bash")
+        # Workflow
+        st.header("🔄 Workflow")
         
-        # System check
-        with st.expander("🔍 Check Your System"):
-            if st.button("Run System Check"):
-                capabilities = check_gpu_capabilities()
-                
-                st.write("### System Capabilities:")
-                
-                gpu_col, pkg_col = st.columns(2)
-                
-                with gpu_col:
-                    st.write("**GPU Status:**")
-                    for key in ['cuda_available', 'device_name', 'gpu_memory_total']:
-                        if key in capabilities and capabilities[key] is not None:
-                            icon = "✅" if capabilities.get('cuda_available', False) else "❌"
-                            value = capabilities[key]
-                            if isinstance(value, bool):
-                                st.write(f"{icon} {key.replace('_', ' ').title()}")
-                            else:
-                                st.write(f"{icon} {key.replace('_', ' ').title()}: {value}")
-                
-                with pkg_col:
-                    st.write("**Packages:**")
-                    for key in ['accelerate_available', 'cupy_available', 'faiss_available']:
-                        if key in capabilities:
-                            icon = "✅" if capabilities[key] else "❌"
-                            st.write(f"{icon} {key.replace('_available', '').title()}")
+        st.write("""
+        1. **Upload Data** → Load your CSV file
+        2. **Compute Embeddings** → One-time computation (30-60 seconds)
+        3. **Adjust Dynamically** → Use slider to change topic count instantly
+        4. **Find Sweet Spot** → Experiment until you get the perfect balance
+        5. **Export Results** → Download when satisfied
+        """)
+        
+        # Performance tips
+        with st.expander("🚀 Performance Tips"):
+            st.write("""
+            **For fastest interactive adjustment:**
+            - ✅ Use "K-means (Fast)" method
+            - ✅ Keep "Use UMAP reduction" checked
+            - ✅ Use GPU if available (auto-detected)
+            
+            **Reclustering speed:**
+            - With UMAP reduction + K-means: <1 second
+            - Without UMAP reduction: 2-5 seconds
+            - HDBSCAN: 3-10 seconds
+            
+            **Embedding computation (one-time):**
+            - Small dataset (1-5k docs): 10-30 seconds
+            - Medium dataset (5-20k docs): 30-90 seconds
+            - Large dataset (20k+ docs): 2-5 minutes
+            """)
 
 if __name__ == "__main__":
     main()
