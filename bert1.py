@@ -74,6 +74,80 @@ if torch.cuda.is_available():
         st.warning(f"CUDA initialization warning: {e}")
 
 # -----------------------------------------------------
+# TOPIC MERGER FOR MINIMUM SIZE ENFORCEMENT
+# -----------------------------------------------------
+class TopicMerger:
+    """Merge small topics to enforce minimum topic size"""
+    
+    @staticmethod
+    def merge_small_topics(topics, embeddings, min_size=10):
+        """
+        Merge topics that are smaller than min_size with their nearest neighbors
+        
+        Args:
+            topics: Array of topic assignments
+            embeddings: Document embeddings
+            min_size: Minimum number of documents per topic
+            
+        Returns:
+            Merged topic assignments
+        """
+        from collections import Counter
+        from scipy.spatial.distance import cosine
+        
+        topics = np.array(topics)
+        topic_counts = Counter(topics)
+        
+        # Identify small topics (excluding outliers -1)
+        small_topics = [t for t, count in topic_counts.items() 
+                       if t != -1 and count < min_size]
+        
+        if not small_topics:
+            return topics
+        
+        # Calculate topic centroids
+        topic_centroids = {}
+        for topic in set(topics):
+            if topic != -1:
+                topic_mask = topics == topic
+                topic_centroids[topic] = embeddings[topic_mask].mean(axis=0)
+        
+        # Merge small topics with nearest larger topic
+        merged_topics = topics.copy()
+        
+        for small_topic in small_topics:
+            if small_topic not in topic_centroids:
+                continue
+                
+            small_centroid = topic_centroids[small_topic]
+            
+            # Find nearest larger topic
+            min_distance = float('inf')
+            best_merge_topic = None
+            
+            for topic, centroid in topic_centroids.items():
+                if topic != small_topic and topic_counts[topic] >= min_size:
+                    distance = cosine(small_centroid, centroid)
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_merge_topic = topic
+            
+            # Merge if found suitable topic
+            if best_merge_topic is not None:
+                merged_topics[merged_topics == small_topic] = best_merge_topic
+                topic_counts[best_merge_topic] += topic_counts[small_topic]
+                del topic_counts[small_topic]
+        
+        # Renumber topics to be sequential
+        unique_topics = sorted(set(merged_topics[merged_topics != -1]))
+        topic_mapping = {old: new for new, old in enumerate(unique_topics)}
+        topic_mapping[-1] = -1  # Keep outliers as -1
+        
+        final_topics = np.array([topic_mapping.get(t, t) for t in merged_topics])
+        
+        return final_topics
+
+# -----------------------------------------------------
 # CATEGORY BALANCE ANALYZER
 # -----------------------------------------------------
 class CategoryBalanceAnalyzer:
@@ -160,13 +234,14 @@ class OutlierReducer:
     """Strategies to reduce outliers in topic modeling"""
     
     @staticmethod
-    def suggest_parameters(num_docs, current_outlier_ratio):
+    def suggest_parameters(num_docs, current_outlier_ratio, min_topic_size=10):
         """
         Suggest better parameters to reduce outliers
         
         Args:
             num_docs: Number of documents
             current_outlier_ratio: Current outlier percentage (0-1)
+            min_topic_size: User-defined minimum topic size
         
         Returns:
             dict of suggested parameters
@@ -180,1125 +255,716 @@ class OutlierReducer:
         if current_outlier_ratio > 0.3:
             # High outliers - use K-means
             suggestions['method'] = 'kmeans'
+            # Adjust number of topics based on min_topic_size
+            max_topics = max(5, num_docs // min_topic_size)
+            suggested_topics = min(max_topics, max(5, num_docs // 50))
+            
             suggestions['parameters'] = {
                 'use_kmeans': True,
                 'use_gpu_kmeans': True,
-                'nr_topics': max(5, num_docs // 50),  # More topics
-                'min_topic_size': max(2, num_docs // 100)  # Smaller min size
+                'nr_topics': suggested_topics,
+                'min_topic_size': min_topic_size,
+                'merge_small_topics': True  # New parameter
             }
-            suggestions['explanation'] = "High outliers detected. K-means will assign all documents to topics."
+            suggestions['explanation'] = f"High outliers detected. K-means will assign all documents to topics. Topics smaller than {min_topic_size} will be merged."
             
         elif current_outlier_ratio > 0.15:
             # Moderate outliers - adjust HDBSCAN
             suggestions['method'] = 'hdbscan'
             suggestions['parameters'] = {
                 'use_kmeans': False,
-                'min_cluster_size': 3,  # Smaller clusters
-                'min_samples': 1,  # More lenient
-                'n_components': 15,  # More dimensions
-                'min_topic_size': 3
+                'min_cluster_size': max(3, min_topic_size // 3),  # Dynamic based on min_topic_size
+                'min_samples': max(1, min_topic_size // 5),
+                'prediction_data': True,
+                'min_topic_size': min_topic_size
             }
-            suggestions['explanation'] = "Moderate outliers. Using lenient HDBSCAN parameters."
+            suggestions['explanation'] = f"Moderate outliers. Using lenient HDBSCAN parameters with min topic size of {min_topic_size}."
             
         else:
-            # Low outliers - current settings are good
-            suggestions['method'] = 'current'
-            suggestions['parameters'] = {}
-            suggestions['explanation'] = "Outlier ratio is acceptable. Current settings are working well."
+            # Low outliers - standard parameters
+            suggestions['method'] = 'hdbscan'
+            suggestions['parameters'] = {
+                'use_kmeans': False,
+                'min_cluster_size': min_topic_size,
+                'min_samples': max(1, min_topic_size // 2),
+                'prediction_data': False,
+                'min_topic_size': min_topic_size
+            }
+            suggestions['explanation'] = f"Low outliers. Using standard HDBSCAN with min topic size of {min_topic_size}."
         
         return suggestions
-    
-    @staticmethod
-    def reassign_outliers_to_nearest(model, docs, embeddings, labels, top_k=3):
-        """
-        Reassign outliers to nearest topics
-        
-        Args:
-            model: BERTopic model
-            docs: List of documents
-            embeddings: Document embeddings (numpy array)
-            labels: Current topic labels
-            top_k: Number of nearest topics to consider
-        
-        Returns:
-            Updated labels with outliers reassigned
-        """
-        from sklearn.metrics.pairwise import cosine_similarity
-        
-        outlier_indices = [i for i, label in enumerate(labels) if label == -1]
-        
-        if len(outlier_indices) == 0:
-            return labels
-        
-        # Try to get topic embeddings
-        try:
-            if hasattr(model, 'topic_embeddings_') and model.topic_embeddings_ is not None:
-                topic_embeddings = model.topic_embeddings_
-                # Skip outlier topic if it's at index 0
-                if -1 in model.get_topic_info()['Topic'].values:
-                    topic_embeddings = topic_embeddings[1:]
-            else:
-                # No topic embeddings available
-                return labels
-        except Exception as e:
-            # If anything goes wrong, just return original labels
-            return labels
-        
-        if len(topic_embeddings) == 0:
-            return labels
-        
-        # Ensure embeddings is a numpy array
-        if not isinstance(embeddings, np.ndarray):
-            embeddings = np.array(embeddings)
-        
-        # Calculate similarity between outlier docs and topics
-        new_labels = labels.copy()
-        
-        for idx in outlier_indices:
-            doc_embedding = embeddings[idx].reshape(1, -1)
-            similarities = cosine_similarity(doc_embedding, topic_embeddings)[0]
-            
-            # Assign to most similar topic if similarity is above threshold
-            max_sim_idx = np.argmax(similarities)
-            max_sim = similarities[max_sim_idx]
-            
-            if max_sim > 0.3:  # Threshold for reassignment
-                new_labels[idx] = max_sim_idx  # Topic indices start at 0 for non-outliers
-        
-        return new_labels
 
-# -----------------------------------------------------
-# HELPER FUNCTIONS
-# -----------------------------------------------------
-def safe_extract_embeddings(model, docs, verbose=False):
-    """
-    Safely extract embeddings from documents, trying multiple methods.
-    
-    Args:
-        model: BERTopic model
-        docs: List of documents
-        verbose: Print debug information
-    
-    Returns:
-        numpy array of embeddings
-    """
-    try:
-        # Method 1: Use BERTopic's internal method (newest versions)
-        if verbose:
-            st.info("Trying method 1: BERTopic internal extraction...")
-        embeddings = model._extract_embeddings(docs, method="document")
-        if verbose:
-            st.success("✅ Method 1 succeeded")
-        return embeddings
-    except Exception as e1:
-        if verbose:
-            st.warning(f"Method 1 failed: {e1}")
-        
-        try:
-            # Method 2: Access the underlying embedding model
-            if verbose:
-                st.info("Trying method 2: Direct model access...")
-            
-            if hasattr(model, 'embedding_model'):
-                emb_model = model.embedding_model
-                
-                # If it's a backend wrapper, get the underlying model
-                if hasattr(emb_model, 'embedding_model'):
-                    emb_model = emb_model.embedding_model
-                
-                embeddings = emb_model.encode(docs, show_progress_bar=False)
-                if verbose:
-                    st.success("✅ Method 2 succeeded")
-                return embeddings
-        except Exception as e2:
-            if verbose:
-                st.warning(f"Method 2 failed: {e2}")
-        
-        # Method 3: Create fresh embedding model (most reliable fallback)
-        if verbose:
-            st.info("Trying method 3: Fresh embedding model...")
-        
-        from sentence_transformers import SentenceTransformer
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        temp_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-        embeddings = temp_model.encode(docs, show_progress_bar=False)
-        del temp_model
-        
-        if verbose:
-            st.success("✅ Method 3 succeeded (fallback)")
-        
-        return embeddings
-
-# -----------------------------------------------------
-# GPU-ACCELERATED CLUSTERING FOR WINDOWS
-# -----------------------------------------------------
+# GPU-accelerated K-means wrapper
 class GPUKMeans:
-    """GPU-accelerated K-means using PyTorch for Windows"""
-    def __init__(self, n_clusters=8, max_iter=300, tol=1e-4, device='cuda'):
+    """K-means clustering with GPU acceleration if available"""
+    
+    def __init__(self, n_clusters=5, random_state=42):
         self.n_clusters = n_clusters
-        self.max_iter = max_iter
-        self.tol = tol
-        self.device = device if torch.cuda.is_available() else 'cpu'
-        self.cluster_centers_ = None
-        self.labels_ = None
+        self.random_state = random_state
         
-    def fit(self, X):
-        """Fit K-means using GPU acceleration"""
-        if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
-        
-        if self.device == 'cuda' and not X.is_cuda:
-            X = X.cuda()
-        
-        n_samples = X.shape[0]
-        
-        # Initialize cluster centers using K-means++
-        indices = torch.randperm(n_samples)[:self.n_clusters]
-        self.cluster_centers_ = X[indices].clone()
-        
-        for iteration in range(self.max_iter):
-            # Assign points to nearest cluster
-            distances = torch.cdist(X, self.cluster_centers_)
-            self.labels_ = torch.argmin(distances, dim=1)
-            
-            # Update cluster centers
-            new_centers = torch.zeros_like(self.cluster_centers_)
-            for k in range(self.n_clusters):
-                mask = self.labels_ == k
-                if mask.sum() > 0:
-                    new_centers[k] = X[mask].mean(dim=0)
-                else:
-                    # Handle empty clusters
-                    new_centers[k] = self.cluster_centers_[k]
-            
-            # Check convergence
-            shift = torch.norm(new_centers - self.cluster_centers_)
-            self.cluster_centers_ = new_centers
-            
-            if shift < self.tol:
-                break
-        
-        # Convert labels back to CPU numpy
-        self.labels_ = self.labels_.cpu().numpy()
-        return self
-    
-    def fit_predict(self, X):
-        """Fit and return labels"""
-        self.fit(X)
-        return self.labels_
-
-class WindowsOptimizedHDBSCAN:
-    """HDBSCAN with GPU-accelerated distance calculations for Windows"""
-    def __init__(self, min_cluster_size=5, min_samples=1, metric='euclidean', **kwargs):
-        self.min_cluster_size = min_cluster_size
-        self.min_samples = min_samples
-        self.metric = metric
-        self.kwargs = kwargs
-        self.labels_ = None
-        
-    def fit(self, X):
-        """Fit HDBSCAN with GPU-accelerated distance matrix if possible"""
-        if torch.cuda.is_available() and len(X) < 50000:  # Use GPU for reasonable sizes
+        # Try to use GPU-accelerated version
+        if cuml_available and torch.cuda.is_available():
             try:
-                # Compute distance matrix on GPU
-                X_tensor = torch.from_numpy(X).float().cuda()
-                # Try to use mixed precision if available
-                try:
-                    with torch.cuda.amp.autocast():  # Use mixed precision for speed
-                        dist_matrix = torch.cdist(X_tensor, X_tensor).cpu().numpy()
-                except:
-                    # Fallback to regular precision if amp fails
-                    dist_matrix = torch.cdist(X_tensor, X_tensor).cpu().numpy()
-                
-                # Run HDBSCAN on CPU with precomputed distances
-                from sklearn.cluster import HDBSCAN as skHDBSCAN
-                clusterer = skHDBSCAN(
-                    min_cluster_size=self.min_cluster_size,
-                    min_samples=self.min_samples,
-                    metric='precomputed',
-                    **self.kwargs
-                )
-                self.labels_ = clusterer.fit_predict(dist_matrix)
-            except Exception as e:
-                st.warning(f"GPU clustering failed, falling back to CPU: {e}")
-                # Fall back to regular HDBSCAN
-                clusterer = HDBSCAN(
-                    min_cluster_size=self.min_cluster_size,
-                    min_samples=self.min_samples,
-                    metric=self.metric,
-                    cluster_selection_method='leaf',
-                    **self.kwargs
-                )
-                self.labels_ = clusterer.fit_predict(X)
+                from cuml.cluster import KMeans as cuKMeans
+                self.model = cuKMeans(n_clusters=n_clusters, random_state=random_state)
+                self.use_gpu = True
+            except Exception:
+                from sklearn.cluster import KMeans
+                self.model = KMeans(n_clusters=n_clusters, random_state=random_state)
+                self.use_gpu = False
         else:
-            # Fall back to regular HDBSCAN
-            clusterer = HDBSCAN(
-                min_cluster_size=self.min_cluster_size,
-                min_samples=self.min_samples,
-                metric=self.metric,
-                cluster_selection_method='leaf',
-                **self.kwargs
-            )
-            self.labels_ = clusterer.fit_predict(X)
-        return self
+            from sklearn.cluster import KMeans
+            self.model = KMeans(n_clusters=n_clusters, random_state=random_state)
+            self.use_gpu = False
+    
+    def fit(self, X):
+        return self.model.fit(X)
+    
+    def predict(self, X):
+        return self.model.predict(X)
     
     def fit_predict(self, X):
-        """Fit and return labels"""
-        self.fit(X)
-        return self.labels_
+        return self.model.fit_predict(X)
 
 # -----------------------------------------------------
-# OPTIMIZED MODEL CREATION WITH BETTER OUTLIER HANDLING
-# -----------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def create_optimized_bertopic_model(
-    min_topic_size,
-    nr_topics,
-    min_cluster_size,
-    min_samples,
-    n_neighbors,
-    n_components,
-    num_docs=None,
-    use_kmeans=False,
-    use_gpu_kmeans=True,
-    calculate_probabilities=False,
-    embedding_batch_size=32,
-    use_fp16=False,
-    seed_topic_list=None
-):
-    """
-    Creates a Windows-optimized BERTopic model with better outlier handling.
-    
-    Args:
-        seed_topic_list: List of lists of seed words for guided topic modeling
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Embedding model with GPU support
-    if use_fp16 and device == "cuda":
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-        embedding_model.half()  # Use FP16
-    else:
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-    
-    # Dimensionality reduction
-    if cuml_available and device == "cuda":
-        umap_model = cumlUMAP(
-            n_neighbors=n_neighbors,
-            n_components=n_components,
-            min_dist=0.0,
-            metric='cosine',
-            random_state=42
-        )
-    else:
-        umap_model = UMAP(
-            n_neighbors=n_neighbors,
-            n_components=n_components,
-            min_dist=0.0,
-            metric='cosine',
-            random_state=42,
-            low_memory=False
-        )
-    
-    # Clustering - choose based on outlier reduction strategy
-    if use_kmeans:
-        # K-means has NO outliers - all docs assigned to topics
-        if use_gpu_kmeans and device == "cuda":
-            n_clusters = nr_topics if isinstance(nr_topics, int) else max(8, num_docs // 50 if num_docs else 8)
-            hdbscan_model = GPUKMeans(n_clusters=n_clusters, device=device)
-        else:
-            n_clusters = nr_topics if isinstance(nr_topics, int) else max(8, num_docs // 50 if num_docs else 8)
-            hdbscan_model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    else:
-        # HDBSCAN - optimize to reduce outliers
-        if cuml_available and device == "cuda":
-            hdbscan_model = cumlHDBSCAN(
-                min_cluster_size=min_cluster_size,
-                min_samples=min_samples,
-                metric='euclidean',
-                gen_min_span_tree=True,
-                prediction_data=calculate_probabilities
-            )
-        else:
-            hdbscan_model = WindowsOptimizedHDBSCAN(
-                min_cluster_size=min_cluster_size,
-                min_samples=min_samples,
-                metric='euclidean'
-            )
-    
-    # Vectorizer
-    vectorizer_model = CountVectorizer(
-        min_df=2,
-        max_df=0.95,
-        stop_words='english',
-        ngram_range=(1, 2)
-    )
-    
-    # Representation models for better topic descriptions
-    representation_models = [
-        KeyBERTInspired(),
-        MaximalMarginalRelevance(diversity=0.3)
-    ]
-    
-    # Create BERTopic model with optional seed topics
-    bertopic_params = {
-        'embedding_model': embedding_model,
-        'umap_model': umap_model,
-        'hdbscan_model': hdbscan_model,
-        'vectorizer_model': vectorizer_model,
-        'representation_model': representation_models,
-        'top_n_words': 10,
-        'min_topic_size': min_topic_size,
-        'nr_topics': nr_topics,
-        'calculate_probabilities': calculate_probabilities,
-        'verbose': False
-    }
-    
-    # Add seed topics for guided topic modeling if provided
-    if seed_topic_list and len(seed_topic_list) > 0:
-        bertopic_params['seed_topic_list'] = seed_topic_list
-    
-    topic_model = BERTopic(**bertopic_params)
-    
-    return topic_model
-
-# -----------------------------------------------------
-# GPU CAPABILITY CHECKER
+# MAIN APPLICATION
 # -----------------------------------------------------
 def check_gpu_capabilities():
-    """Check what GPU capabilities are available"""
-    caps = {
+    """Check and return GPU/CUDA capabilities"""
+    capabilities = {
         'cuda_available': torch.cuda.is_available(),
-        'cuda_version': torch.version.cuda if torch.cuda.is_available() else None,
-        'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        'device_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        'device_count': 0,
+        'device_name': None,
+        'gpu_memory_total': None,
+        'gpu_memory_free': None,
         'cupy_available': cupy_available,
         'cuml_available': cuml_available,
         'faiss_available': faiss_available,
         'faiss_gpu_available': faiss_gpu_available,
-        'accelerate_available': accelerate_available,
-        'torch_version': torch.__version__
+        'accelerate_available': accelerate_available
     }
     
     if torch.cuda.is_available():
-        caps['gpu_memory_total'] = f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
-        caps['gpu_memory_allocated'] = f"{torch.cuda.memory_allocated(0) / 1024**3:.2f} GB"
+        capabilities['device_count'] = torch.cuda.device_count()
+        capabilities['device_name'] = torch.cuda.get_device_name(0)
+        
+        # Get memory info
+        try:
+            mem_info = torch.cuda.mem_get_info(0)
+            capabilities['gpu_memory_free'] = f"{mem_info[0] / 1024**3:.1f} GB"
+            capabilities['gpu_memory_total'] = f"{mem_info[1] / 1024**3:.1f} GB"
+        except Exception:
+            pass
     
-    return caps
+    return capabilities
 
 @st.cache_data
 def convert_df_to_csv(df):
-    """Convert dataframe to CSV for download"""
     return df.to_csv(index=False).encode('utf-8')
 
-# -----------------------------------------------------
-# MAIN APP
-# -----------------------------------------------------
+@st.cache_resource
+def load_embedding_model(model_name):
+    """Load and cache the embedding model"""
+    if torch.cuda.is_available():
+        model = SentenceTransformer(model_name, device='cuda')
+        # Optimize for GPU
+        model.max_seq_length = 512
+        model.encode = torch.compile(model.encode) if hasattr(torch, 'compile') else model.encode
+    else:
+        model = SentenceTransformer(model_name, device='cpu')
+    return model
+
 def main():
-    st.title("🚀 Windows CUDA-Optimized BERTopic with Smart Category Balancing")
-    st.markdown("*Maximum GPU utilization with intelligent outlier reduction and category splitting*")
+    st.title("🚀 Windows CUDA-Optimized BERTopic with Smart Balancing")
     
-    # Check GPU status
-    caps = check_gpu_capabilities()
-    gpu_status = "🟢 GPU Enabled" if caps['cuda_available'] else "🔴 CPU Only"
-    st.sidebar.markdown(f"### {gpu_status}")
+    # Initialize session state
+    if 'model' not in st.session_state:
+        st.session_state.model = None
+    if 'processed_df' not in st.session_state:
+        st.session_state.processed_df = None
+    if 'embeddings' not in st.session_state:
+        st.session_state.embeddings = None
     
-    if caps['cuda_available']:
-        st.sidebar.success(f"**{caps['device_name']}**\n{caps['gpu_memory_total']}")
+    # Check GPU capabilities
+    gpu_capabilities = check_gpu_capabilities()
     
-    # File uploader
-    st.sidebar.header("📁 Upload Data")
-    uploaded_file = st.sidebar.file_uploader(
-        "Choose a CSV file",
-        type=['csv'],
-        help="Upload a CSV file with a text column to analyze"
-    )
-    
-    if uploaded_file:
-        # Store filename in session state
-        if 'uploaded_file_name' not in st.session_state:
-            st.session_state.uploaded_file_name = uploaded_file.name.replace('.csv', '')
+    # Sidebar Configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
         
-        # Load data
-        try:
+        # GPU Status Display
+        if gpu_capabilities['cuda_available']:
+            st.success(f"✅ GPU Detected: {gpu_capabilities['device_name']}")
+            st.info(f"Memory: {gpu_capabilities['gpu_memory_free']} free / {gpu_capabilities['gpu_memory_total']} total")
+        else:
+            st.warning("⚠️ No GPU detected. Using CPU (slower)")
+        
+        # Acceleration packages status
+        st.subheader("📦 Acceleration Status")
+        accel_cols = st.columns(2)
+        with accel_cols[0]:
+            st.write(f"{'✅' if gpu_capabilities['cuml_available'] else '❌'} cuML")
+            st.write(f"{'✅' if gpu_capabilities['cupy_available'] else '❌'} CuPy")
+        with accel_cols[1]:
+            st.write(f"{'✅' if gpu_capabilities['faiss_gpu_available'] else '❌'} FAISS GPU")
+            st.write(f"{'✅' if gpu_capabilities['accelerate_available'] else '❌'} Accelerate")
+        
+        # File upload
+        st.header("📄 Data Input")
+        uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+        
+        if uploaded_file is not None:
+            # Store filename in session state
+            st.session_state.uploaded_file_name = uploaded_file.name.replace('.csv', '')
+            
+            # Load and preview data
             df = pd.read_csv(uploaded_file)
-            st.sidebar.success(f"✅ Loaded {len(df):,} rows")
+            st.success(f"✅ Loaded {len(df):,} rows")
             
             # Column selection
-            text_col = st.sidebar.selectbox(
-                "Select text column",
-                options=df.columns.tolist(),
-                help="Choose the column containing text to analyze"
+            text_col = st.selectbox(
+                "Select text column", 
+                df.columns.tolist(),
+                help="Column containing the text to analyze"
             )
             
-            # Preview data
-            with st.expander("📋 Preview Data", expanded=False):
-                st.dataframe(df.head(10), use_container_width=True)
+            # Analysis Settings
+            st.header("🎯 Analysis Settings")
             
-            # Model Parameters
-            st.sidebar.header("⚙️ Model Parameters")
-            
-            # Outlier reduction preset
-            outlier_strategy = st.sidebar.selectbox(
-                "Outlier Reduction Strategy",
-                options=[
-                    "Aggressive (K-means, no outliers)",
-                    "Moderate (Lenient HDBSCAN)",
-                    "Conservative (Standard HDBSCAN)",
-                    "Custom"
+            # Embedding model selection
+            embedding_model = st.selectbox(
+                "Embedding Model",
+                [
+                    "all-MiniLM-L6-v2",
+                    "all-mpnet-base-v2", 
+                    "all-MiniLM-L12-v2",
+                    "paraphrase-multilingual-MiniLM-L12-v2"
                 ],
-                index=0,
-                help="Choose how aggressively to reduce outliers"
+                help="Smaller models are faster but may be less accurate"
             )
             
-            # Set parameters based on strategy
-            if outlier_strategy == "Aggressive (K-means, no outliers)":
-                use_kmeans = True
-                min_cluster_size = 2
-                min_samples = 1
-                min_topic_size = max(2, len(df) // 100)
-                nr_topics = max(8, len(df) // 50)
-                n_components = 10
-                n_neighbors = 10
-            elif outlier_strategy == "Moderate (Lenient HDBSCAN)":
-                use_kmeans = False
-                min_cluster_size = 3
-                min_samples = 1
-                min_topic_size = 3
-                nr_topics = "auto"
-                n_components = 15
-                n_neighbors = 15
-            elif outlier_strategy == "Conservative (Standard HDBSCAN)":
-                use_kmeans = False
-                min_cluster_size = 5
-                min_samples = 3
-                min_topic_size = 5
-                nr_topics = "auto"
-                n_components = 5
-                n_neighbors = 15
-            else:  # Custom
-                use_kmeans = st.sidebar.checkbox(
-                    "Use K-means (no outliers)",
-                    value=False,
-                    help="K-means assigns ALL documents to topics (0% outliers)"
-                )
-                
-                if use_kmeans:
-                    nr_topics = st.sidebar.number_input(
+            # NEW: Minimum Topic Size Control
+            st.subheader("📏 Topic Size Control")
+            min_topic_size = st.slider(
+                "Minimum Topic Size",
+                min_value=2,
+                max_value=min(100, len(df) // 10),
+                value=min(10, len(df) // 50),
+                help="Minimum number of documents per topic. Topics smaller than this will be merged with similar topics."
+            )
+            
+            st.info(f"ℹ️ Topics with fewer than {min_topic_size} documents will be merged with their most similar larger topic.")
+            
+            # Outlier Reduction Strategy
+            outlier_strategy = st.selectbox(
+                "Outlier Reduction Strategy",
+                ["Aggressive (K-means) - 0% outliers", 
+                 "Moderate (Lenient HDBSCAN) - <15% outliers",
+                 "Conservative (Standard HDBSCAN) - Natural clustering"],
+                help="Choose how aggressively to assign outliers to topics"
+            )
+            
+            # Advanced Settings
+            with st.expander("🔧 Advanced Settings"):
+                # Number of topics (for K-means)
+                if "Aggressive" in outlier_strategy:
+                    # Calculate reasonable max topics based on min_topic_size
+                    max_topics = max(5, len(df) // min_topic_size)
+                    default_topics = min(max_topics, max(5, len(df) // 50))
+                    
+                    nr_topics = st.number_input(
                         "Number of Topics",
                         min_value=2,
-                        max_value=100,
-                        value=max(8, len(df) // 50),
-                        help="How many topics to create"
+                        max_value=max_topics,
+                        value=default_topics,
+                        help=f"Number of topics to create (limited by min topic size of {min_topic_size})"
                     )
+                    
+                    # Validate that nr_topics * min_topic_size doesn't exceed document count
+                    if nr_topics * min_topic_size > len(df):
+                        st.warning(f"⚠️ With {nr_topics} topics and min size {min_topic_size}, you need at least {nr_topics * min_topic_size} documents. Adjusting...")
+                        nr_topics = len(df) // min_topic_size
                 else:
-                    nr_topics_auto = st.sidebar.checkbox("Auto-determine topics", value=True)
-                    if not nr_topics_auto:
-                        nr_topics = st.sidebar.number_input(
-                            "Number of Topics",
-                            min_value=2,
-                            max_value=100,
-                            value=10
-                        )
-                    else:
-                        nr_topics = "auto"
+                    nr_topics = None
                 
-                min_topic_size = st.sidebar.slider(
-                    "Min Topic Size",
-                    min_value=2,
-                    max_value=50,
-                    value=5,
-                    help="Minimum documents per topic"
+                # UMAP parameters
+                n_neighbors = st.slider("UMAP n_neighbors", 2, 50, 15)
+                n_components = st.slider("UMAP n_components", 2, 10, 5)
+                
+                # Representation model
+                use_mmr = st.checkbox("Use MMR for diverse keywords", value=True)
+                
+                # Seed words
+                st.subheader("🎯 Seed Words (Optional)")
+                seed_words_input = st.text_area(
+                    "Enter seed words (one set per line)",
+                    placeholder="Example:\nfinance, money, budget, cost\nmarketing, campaign, advertising",
+                    help="Guide topic discovery with predefined keyword sets"
                 )
                 
-                if not use_kmeans:
-                    min_cluster_size = st.sidebar.slider(
-                        "Min Cluster Size (HDBSCAN)",
-                        min_value=2,
-                        max_value=50,
-                        value=5,
-                        help="Smaller = more topics, fewer outliers"
-                    )
-                    
-                    min_samples = st.sidebar.slider(
-                        "Min Samples (HDBSCAN)",
-                        min_value=1,
-                        max_value=20,
-                        value=1,
-                        help="Lower = more lenient clustering"
-                    )
+    # Main content area
+    if uploaded_file is not None and 'text_col' in locals():
+        # Process button
+        if st.button("🚀 Run Topic Modeling", type="primary"):
+            # Clear any existing results
+            st.session_state.model = None
+            st.session_state.processed_df = None
+            
+            # Set up parameters based on strategy and min_topic_size
+            if "Aggressive" in outlier_strategy:
+                use_kmeans = True
+                if torch.cuda.is_available() and cuml_available:
+                    hdbscan_model = GPUKMeans(n_clusters=nr_topics)
                 else:
-                    min_cluster_size = 5
-                    min_samples = 1
-                
-                n_components = st.sidebar.slider(
-                    "UMAP Components",
-                    min_value=2,
-                    max_value=50,
-                    value=10,
-                    help="More = better separation, fewer outliers"
-                )
-                
-                n_neighbors = st.sidebar.slider(
-                    "UMAP Neighbors",
-                    min_value=5,
-                    max_value=50,
-                    value=15
-                )
-            
-            # GPU optimization options
-            with st.sidebar.expander("🚀 GPU Optimization"):
-                use_gpu_kmeans = st.checkbox(
-                    "Use GPU K-means",
-                    value=True,
-                    disabled=not torch.cuda.is_available(),
-                    help="Faster clustering on GPU"
-                )
-                
-                use_fp16 = st.checkbox(
-                    "Use FP16 (half precision)",
-                    value=False,
-                    disabled=not torch.cuda.is_available(),
-                    help="2x faster embeddings, may reduce quality slightly"
-                )
-                
-                embedding_batch_size = st.slider(
-                    "Embedding Batch Size",
-                    min_value=8,
-                    max_value=256,
-                    value=32,
-                    step=8,
-                    help="Higher = faster but uses more memory"
-                )
-            
-            # Seed words for guided topic modeling
-            with st.sidebar.expander("🎯 Seed Words (Optional)"):
-                st.markdown("""
-                **Guided Topic Modeling**: Steer topics toward specific keywords.
-                
-                Enter seed words for topics you want to create:
-                """)
-                
-                use_seed_words = st.checkbox(
-                    "Enable Seed Words",
-                    value=False,
-                    help="Guide topics with predefined keywords"
-                )
-                
-                seed_topics = []
-                if use_seed_words:
-                    num_seed_topics = st.number_input(
-                        "Number of Seed Topics",
-                        min_value=1,
-                        max_value=10,
-                        value=3,
-                        help="How many topics to guide"
-                    )
-                    
-                    st.write("**Enter keywords for each topic (comma-separated):**")
-                    for i in range(num_seed_topics):
-                        seed_words = st.text_input(
-                            f"Topic {i+1} Keywords",
-                            placeholder="e.g., email, inbox, message, reply",
-                            key=f"seed_topic_{i}",
-                            help="Comma-separated keywords"
-                        )
-                        if seed_words.strip():
-                            keywords = [w.strip() for w in seed_words.split(",") if w.strip()]
-                            if keywords:
-                                seed_topics.append(keywords)
-                    
-                    if seed_topics:
-                        st.success(f"✅ {len(seed_topics)} seed topics defined")
-                    else:
-                        st.info("Add keywords above to enable guided topics")
-            
-            # Category balance monitoring
-            with st.sidebar.expander("📊 Category Balance Settings"):
-                max_category_ratio = st.slider(
-                    "Max Category Size (%)",
-                    min_value=10,
-                    max_value=50,
-                    value=30,
-                    help="Warn if any category exceeds this % of documents"
-                )
-                
-                auto_suggest_split = st.checkbox(
-                    "Auto-suggest splits for large categories",
-                    value=True,
-                    help="Automatically suggest splitting oversized categories"
-                )
-            
-            # Run analysis
-            if st.sidebar.button("🔬 Run Analysis", type="primary"):
-                with st.spinner("Processing..."):
-                    # Prepare documents
-                    docs = df[text_col].fillna("").astype(str).tolist()
-                    
-                    # Filter out empty docs
-                    docs = [doc for doc in docs if len(doc.strip()) > 0]
-                    
-                    if len(docs) < 10:
-                        st.error("Not enough documents to analyze. Need at least 10 non-empty documents.")
-                        return
-                    
-                    # Progress tracking
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # Step 1: Create model
-                    status_text.text("Creating optimized model...")
-                    progress_bar.progress(20)
-                    
-                    # Add seed topics notification if used
-                    if seed_topics:
-                        status_text.text(f"Creating model with {len(seed_topics)} seed topics...")
-                    
-                    model = create_optimized_bertopic_model(
-                        min_topic_size=min_topic_size,
-                        nr_topics=nr_topics,
+                    hdbscan_model = KMeans(n_clusters=nr_topics, random_state=42)
+                clustering_method = "K-means"
+            elif "Moderate" in outlier_strategy:
+                use_kmeans = False
+                min_cluster_size = max(3, min_topic_size // 3)
+                if torch.cuda.is_available() and cuml_available:
+                    hdbscan_model = cumlHDBSCAN(
                         min_cluster_size=min_cluster_size,
-                        min_samples=min_samples,
-                        n_neighbors=n_neighbors,
-                        n_components=n_components,
-                        num_docs=len(docs),
-                        use_kmeans=use_kmeans,
-                        use_gpu_kmeans=use_gpu_kmeans,
-                        calculate_probabilities=False,
-                        embedding_batch_size=embedding_batch_size,
-                        use_fp16=use_fp16,
-                        seed_topic_list=seed_topics if seed_topics else None
+                        min_samples=max(1, min_topic_size // 5),
+                        prediction_data=True
                     )
-                    
-                    # Step 2: Fit model
-                    status_text.text("Fitting model and generating topics...")
-                    progress_bar.progress(40)
-                    
-                    topics, probs = model.fit_transform(docs)
-                    
-                    # Step 3: Get embeddings for outlier reassignment
-                    status_text.text("Analyzing document embeddings...")
-                    progress_bar.progress(60)
-                    
-                    # Use safe extraction method
-                    embeddings = safe_extract_embeddings(model, docs, verbose=False)
-                    
-                    # Step 4: Analyze category balance
-                    status_text.text("Analyzing category balance...")
-                    progress_bar.progress(70)
-                    
-                    analyzer = CategoryBalanceAnalyzer(
-                        min_topic_ratio=max_category_ratio / 100,
-                        ideal_max_ratio=0.20
+                else:
+                    hdbscan_model = HDBSCAN(
+                        min_cluster_size=min_cluster_size,
+                        min_samples=max(1, min_topic_size // 5),
+                        prediction_data=True
                     )
-                    balance_analysis = analyzer.analyze_distribution(topics, include_outliers=False)
-                    
-                    # Step 5: Try to reduce outliers if needed
-                    outlier_count = sum(1 for t in topics if t == -1)
-                    outlier_ratio = outlier_count / len(topics)
-                    
-                    if outlier_ratio > 0.10 and not use_kmeans:
-                        status_text.text("Attempting to reassign outliers...")
-                        progress_bar.progress(80)
-                        
-                        try:
-                            reducer = OutlierReducer()
-                            new_topics = reducer.reassign_outliers_to_nearest(
-                                model, docs, embeddings, topics
-                            )
-                            
-                            # Only update if we successfully reduced outliers
-                            new_outlier_count = sum(1 for t in new_topics if t == -1)
-                            if new_outlier_count < outlier_count:
-                                topics = new_topics
-                                outlier_count = new_outlier_count
-                                outlier_ratio = outlier_count / len(topics)
-                                status_text.text(f"✅ Reduced outliers by {outlier_count - new_outlier_count}")
-                        except Exception as e:
-                            # If reassignment fails, continue with original topics
-                            st.warning(f"Could not reassign outliers: {e}. Continuing with original results.")
-                            pass
-                    
-                    # Step 6: Prepare results
-                    status_text.text("Preparing results...")
-                    progress_bar.progress(90)
-                    
-                    # Create results dataframe
-                    processed_df = df.copy()
-                    processed_df['topic'] = topics[:len(df)]
-                    
-                    # Get topic info
-                    topic_info = model.get_topic_info()
-                    
-                    # Create readable topic labels
-                    topic_labels = {}
-                    for _, row in topic_info.iterrows():
-                        topic_id = row['Topic']
-                        if topic_id == -1:
-                            topic_labels[topic_id] = "Outliers"
-                        else:
-                            # Get top 3 words
-                            words = row['Representation'][:3] if isinstance(row['Representation'], list) else []
-                            topic_labels[topic_id] = f"Topic {topic_id}: {', '.join(words)}"
-                    
-                    processed_df['topic_label'] = processed_df['topic'].map(topic_labels)
-                    
-                    # Store in session state
-                    st.session_state.model = model
-                    st.session_state.topics = topics
-                    st.session_state.processed_df = processed_df
-                    st.session_state.topic_info = topic_info
-                    st.session_state.embeddings = embeddings
-                    st.session_state.text_col = text_col
-                    st.session_state.balance_analysis = balance_analysis
-                    st.session_state.outlier_ratio = outlier_ratio
-                    
-                    # Store run parameters
-                    st.session_state.ran_params = {
-                        'GPU Used': torch.cuda.is_available(),
-                        'Clustering': 'GPU K-means' if use_kmeans and use_gpu_kmeans else 'K-means' if use_kmeans else 'HDBSCAN',
-                        'FP16': use_fp16,
-                        'Documents': len(docs),
-                        'Outlier Strategy': outlier_strategy,
-                        'Seed Topics': len(seed_topics) if seed_topics else 0
-                    }
-                    
-                    progress_bar.progress(100)
-                    status_text.text("✅ Complete!")
-                    
-                    st.success("Analysis complete!")
-                    st.rerun()
-        
-        except Exception as e:
-            st.error(f"Error loading file: {str(e)}")
-            st.stop()
-    
-    # Display results if available
-    if 'processed_df' in st.session_state:
-        model = st.session_state.model
-        processed_df = st.session_state.processed_df
-        topic_info = st.session_state.topic_info
-        topics = st.session_state.topics
-        text_col = st.session_state.text_col
-        ran_params = st.session_state.ran_params
-        balance_analysis = st.session_state.balance_analysis
-        outlier_ratio = st.session_state.outlier_ratio
-        
-        # Recreate topic_labels from topic_info (needed for display)
-        topic_labels = {}
-        for _, row in topic_info.iterrows():
-            topic_id = row['Topic']
-            if topic_id == -1:
-                topic_labels[topic_id] = "Outliers"
+                clustering_method = "Lenient HDBSCAN"
+            else:  # Conservative
+                use_kmeans = False
+                if torch.cuda.is_available() and cuml_available:
+                    hdbscan_model = cumlHDBSCAN(
+                        min_cluster_size=min_topic_size,
+                        min_samples=max(1, min_topic_size // 2)
+                    )
+                else:
+                    hdbscan_model = HDBSCAN(
+                        min_cluster_size=min_topic_size,
+                        min_samples=max(1, min_topic_size // 2)
+                    )
+                clustering_method = "Standard HDBSCAN"
+            
+            # UMAP configuration
+            if torch.cuda.is_available() and cuml_available:
+                umap_model = cumlUMAP(
+                    n_neighbors=n_neighbors,
+                    n_components=n_components,
+                    random_state=42
+                )
             else:
-                # Get top 3 words
-                words = row['Representation'][:3] if isinstance(row['Representation'], list) else []
-                topic_labels[topic_id] = f"Topic {topic_id}: {', '.join(words)}"
+                umap_model = UMAP(
+                    n_neighbors=n_neighbors,
+                    n_components=n_components,
+                    random_state=42
+                )
+            
+            # Representation model
+            representation_model = []
+            if use_mmr:
+                representation_model.append(MaximalMarginalRelevance())
+            representation_model.append(KeyBERTInspired())
+            
+            # Parse seed words if provided
+            seed_topic_list = []
+            if seed_words_input:
+                for line in seed_words_input.strip().split('\n'):
+                    if line.strip():
+                        words = [w.strip() for w in line.split(',')]
+                        if words:
+                            seed_topic_list.append(words)
+            
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            try:
+                # Step 1: Load embedding model (20%)
+                status_text.text("📚 Loading embedding model...")
+                progress_bar.progress(20)
+                
+                sentence_model = load_embedding_model(embedding_model)
+                
+                # Step 2: Generate embeddings (40%)
+                status_text.text(f"🔤 Generating embeddings for {len(df):,} documents...")
+                progress_bar.progress(40)
+                
+                documents = df[text_col].tolist()
+                
+                # GPU-optimized batch encoding
+                if torch.cuda.is_available():
+                    with torch.cuda.amp.autocast():
+                        embeddings = sentence_model.encode(
+                            documents,
+                            show_progress_bar=True,
+                            batch_size=32,
+                            convert_to_numpy=True
+                        )
+                else:
+                    embeddings = sentence_model.encode(
+                        documents,
+                        show_progress_bar=True,
+                        batch_size=32,
+                        convert_to_numpy=True
+                    )
+                
+                # Store embeddings in session state for later use
+                st.session_state.embeddings = embeddings
+                
+                # Step 3: Configure BERTopic (50%)
+                status_text.text("🔧 Configuring BERTopic model...")
+                progress_bar.progress(50)
+                
+                # Create BERTopic model with appropriate min_topic_size
+                topic_model = BERTopic(
+                    embedding_model=sentence_model,
+                    umap_model=umap_model,
+                    hdbscan_model=hdbscan_model,
+                    representation_model=representation_model,
+                    min_topic_size=min_topic_size,  # Use user-defined min_topic_size
+                    seed_topic_list=seed_topic_list if seed_topic_list else None,
+                    calculate_probabilities=False if use_kmeans else True,
+                    verbose=True
+                )
+                
+                # Step 4: Fit model (70%)
+                status_text.text(f"🎯 Fitting topics using {clustering_method}...")
+                progress_bar.progress(70)
+                
+                topics, probs = topic_model.fit_transform(documents, embeddings)
+                
+                # Step 5: Post-processing - Merge small topics if needed
+                if min_topic_size > 2:
+                    status_text.text(f"🔄 Merging topics smaller than {min_topic_size} documents...")
+                    progress_bar.progress(80)
+                    
+                    # Get original topic counts
+                    from collections import Counter
+                    original_counts = Counter(topics)
+                    small_topics = [t for t, count in original_counts.items() 
+                                  if t != -1 and count < min_topic_size]
+                    
+                    if small_topics:
+                        # Merge small topics
+                        merged_topics = TopicMerger.merge_small_topics(
+                            topics, embeddings, min_topic_size
+                        )
+                        
+                        # Update the model with merged topics
+                        topics = merged_topics
+                        
+                        # Re-fit the topic representations for merged topics
+                        topic_model._update_topic_size(topics)
+                        topic_model._extract_topics(documents, embeddings)
+                        
+                        st.info(f"ℹ️ Merged {len(small_topics)} small topics into larger ones")
+                
+                # Step 6: Prepare results (90%)
+                status_text.text("📊 Preparing results...")
+                progress_bar.progress(90)
+                
+                # Get topic information
+                topic_info = topic_model.get_topic_info()
+                
+                # Add results to dataframe
+                df_results = df.copy()
+                df_results['topic'] = topics
+                df_results['topic_label'] = df_results['topic'].apply(
+                    lambda x: f"Topic {x}" if x != -1 else "Outlier"
+                )
+                
+                # Add keywords for each topic
+                df_results['keywords'] = df_results['topic'].apply(
+                    lambda x: ', '.join([word for word, _ in topic_model.get_topic(x)[:5]]) 
+                    if x != -1 else "No keywords"
+                )
+                
+                # Store in session state
+                st.session_state.model = topic_model
+                st.session_state.processed_df = df_results
+                st.session_state.topic_info = topic_info
+                st.session_state.clustering_method = clustering_method
+                st.session_state.gpu_used = torch.cuda.is_available()
+                st.session_state.min_topic_size_used = min_topic_size
+                
+                # Complete
+                progress_bar.progress(100)
+                status_text.text("✅ Topic modeling complete!")
+                
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.info("💡 Try reducing the number of topics or adjusting parameters")
         
-        # Summary metrics
-        st.header("📊 Results Summary")
-        
-        unique_topics = len(set(topics)) - (1 if -1 in topics else 0)
-        outlier_count = sum(1 for t in topics if t == -1)
-        coverage = ((len(topics) - outlier_count) / len(topics)) * 100
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Documents", f"{len(processed_df):,}")
-        with col2:
-            st.metric("Topics Found", unique_topics)
-        with col3:
-            # Color code outliers
-            outlier_pct = 100 - coverage
-            outlier_color = "🟢" if outlier_pct < 10 else "🟡" if outlier_pct < 25 else "🔴"
-            st.metric(
-                "Outliers",
-                f"{outlier_count:,}",
-                delta=f"{outlier_pct:.1f}%",
-                delta_color="inverse"
+        # Display results if available
+        if st.session_state.model is not None:
+            model = st.session_state.model
+            processed_df = st.session_state.processed_df
+            topic_info = st.session_state.topic_info
+            
+            # Summary metrics
+            st.header("📊 Results Summary")
+            
+            # Calculate metrics
+            unique_topics = len(processed_df['topic'].unique()) - 1  # Exclude outliers
+            outlier_count = len(processed_df[processed_df['topic'] == -1])
+            total_docs = len(processed_df)
+            coverage = ((total_docs - outlier_count) / total_docs) * 100
+            
+            # Display key metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Total Documents", f"{total_docs:,}")
+            with col2:
+                st.metric("Topics Found", unique_topics)
+            with col3:
+                st.metric("Outliers", f"{outlier_count:,} ({100-coverage:.1f}%)")
+            with col4:
+                st.metric("Coverage", f"{coverage:.1f}%")
+            with col5:
+                st.metric("Min Topic Size", st.session_state.min_topic_size_used)
+            
+            # Run parameters used
+            ran_params = {
+                'Clustering': st.session_state.clustering_method,
+                'GPU Used': st.session_state.gpu_used,
+                'Min Topic Size': st.session_state.min_topic_size_used
+            }
+            
+            with st.expander("🔍 Parameters Used"):
+                for key, value in ran_params.items():
+                    st.write(f"**{key}:** {value}")
+            
+            # Balance Analysis
+            balance_analyzer = CategoryBalanceAnalyzer()
+            balance_analysis = balance_analyzer.analyze_distribution(
+                processed_df['topic'].tolist(),
+                include_outliers=False
             )
-        with col4:
-            st.metric("Coverage", f"{coverage:.1f}%")
-        
-        # Category balance warnings
-        if not balance_analysis['balanced']:
-            st.warning("⚠️ **Category Balance Issues Detected**")
             
-            for warning in balance_analysis['warnings']:
-                st.warning(f"📌 {warning}")
+            # Tabs for different views
+            tab1, tab2, tab3, tab4 = st.tabs(["📊 Topics Overview", "📈 Distribution Analysis", 
+                                              "🔍 Split Large Topics", "💾 Export"])
             
-            if auto_suggest_split and balance_analysis['oversized_topics']:
-                st.info("""
-                💡 **Suggestion:** Some categories are too large and should be split.
-                Use the 'Split Topics' tab below to analyze these categories further.
-                """)
-        else:
-            st.success("✅ **Category distribution is well-balanced!**")
-        
-        # Outlier improvement suggestions
-        if outlier_ratio > 0.15:
-            reducer = OutlierReducer()
-            suggestions = reducer.suggest_parameters(len(topics), outlier_ratio)
-            
-            if suggestions['method'] != 'current':
-                st.info(f"""
-                💡 **Outlier Reduction Suggestion:**
+            with tab1:
+                st.subheader("Topic Information")
                 
-                {suggestions['explanation']}
+                # Clean up topic display
+                display_df = topic_info.copy()
+                display_df = display_df[display_df['Topic'] != -1]  # Exclude outliers from main display
                 
-                Try changing your settings in the sidebar to:
-                - Strategy: {'Aggressive (K-means, no outliers)' if suggestions['method'] == 'kmeans' else 'Moderate (Lenient HDBSCAN)'}
-                """)
-        
-        # Run parameters
-        with st.expander("⚙️ Run Parameters"):
-            cols = st.columns(len(ran_params))
-            for col, (key, value) in zip(cols, ran_params.items()):
-                with col:
-                    st.metric(key, value)
-        
-        # Show seed topics if used
-        if ran_params.get('Seed Topics', 0) > 0:
-            with st.expander("🎯 Seed Topics Used"):
-                st.info(f"""
-                This analysis used **{ran_params['Seed Topics']} guided seed topics**.
+                # Add percentage column
+                display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
                 
-                Seed topics help steer the model toward specific themes or concepts you care about.
-                The topics found may be influenced by the seed words you provided.
-                """)
-        
-        # Tabs for different views
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📈 Topic Overview",
-            "🔍 Document Explorer",
-            "✂️ Split Large Topics",
-            "💾 Export"
-        ])
-        
-        with tab1:
-            st.subheader("Topic Distribution")
-            
-            # Topic size distribution
-            topic_sizes = processed_df[processed_df['topic'] != -1]['topic'].value_counts().sort_index()
-            
-            if len(topic_sizes) > 0:
+                # Format the representation column
+                display_df['Keywords'] = display_df['Representation'].apply(
+                    lambda x: ', '.join(x[:5]) if isinstance(x, list) else str(x)[:100]
+                )
+                
+                # Select columns to display
+                display_df = display_df[['Topic', 'Count', 'Percentage', 'Name', 'Keywords']]
+                
+                # Highlight oversized topics
+                def highlight_oversized(row):
+                    if row['Percentage'] > 30:
+                        return ['background-color: #ffcccc'] * len(row)
+                    elif row['Percentage'] > 20:
+                        return ['background-color: #fff4cc'] * len(row)
+                    else:
+                        return [''] * len(row)
+                
+                styled_df = display_df.style.apply(highlight_oversized, axis=1)
+                st.dataframe(styled_df, use_container_width=True)
+                
+                # Show outliers separately if any
+                if outlier_count > 0:
+                    st.warning(f"⚠️ {outlier_count} documents ({100-coverage:.1f}%) were classified as outliers")
+                
+                # Balance warnings
+                if not balance_analysis['balanced']:
+                    st.error("⚠️ **Topic Distribution Imbalance Detected!**")
+                    for warning in balance_analysis['warnings']:
+                        st.warning(warning)
+                        
+            with tab2:
+                st.subheader("📈 Topic Distribution Analysis")
+                
+                # Create distribution chart
                 import plotly.express as px
                 
-                fig = px.bar(
-                    x=topic_sizes.index,
-                    y=topic_sizes.values,
-                    labels={'x': 'Topic', 'y': 'Document Count'},
-                    title='Documents per Topic'
-                )
+                # Prepare data for visualization
+                viz_df = processed_df['topic'].value_counts().reset_index()
+                viz_df.columns = ['Topic', 'Count']
+                viz_df = viz_df[viz_df['Topic'] != -1]  # Exclude outliers
+                viz_df['Topic'] = viz_df['Topic'].apply(lambda x: f"Topic {x}")
+                viz_df = viz_df.sort_values('Count', ascending=False)
                 
-                # Add warning line for oversized categories
-                if max_category_ratio:
-                    max_size = len(processed_df) * (max_category_ratio / 100)
-                    fig.add_hline(
-                        y=max_size,
-                        line_dash="dash",
-                        line_color="red",
-                        annotation_text=f"Max Recommended ({max_category_ratio}%)"
-                    )
+                # Bar chart
+                fig = px.bar(viz_df, x='Topic', y='Count', 
+                           title='Document Distribution Across Topics',
+                           color='Count',
+                           color_continuous_scale='Viridis')
+                
+                # Add threshold line
+                threshold_count = total_docs * 0.3
+                fig.add_hline(y=threshold_count, line_dash="dash", line_color="red",
+                            annotation_text="30% threshold")
                 
                 st.plotly_chart(fig, use_container_width=True)
-            
-            # Topic details table
-            st.subheader("Topic Details")
-            
-            # Enhance topic info with size warnings
-            topic_display = topic_info[['Topic', 'Count', 'Name']].copy()
-            topic_display['Keywords'] = topic_info['Representation'].apply(
-                lambda x: ', '.join(x[:5]) if isinstance(x, list) else str(x)[:100]
-            )
-            topic_display['% of Docs'] = (topic_display['Count'] / len(processed_df) * 100).round(1)
-            
-            # Add warning column
-            max_size = len(processed_df) * (max_category_ratio / 100)
-            topic_display['Status'] = topic_display.apply(
-                lambda row: '🔴 Too Large' if row['Count'] > max_size and row['Topic'] != -1
-                else '🟢 Good' if row['Topic'] != -1
-                else '⚪ Outliers',
-                axis=1
-            )
-            
-            # Reorder columns
-            topic_display = topic_display[['Status', 'Topic', 'Count', '% of Docs', 'Name', 'Keywords']]
-            
-            st.dataframe(topic_display, use_container_width=True, height=400)
-        
-        with tab2:
-            st.subheader("Explore Documents by Topic")
-            
-            # Topic selector
-            topic_options = ["All Topics"] + [
-                f"{topic_labels[t]}" for t in sorted(set(topics)) if t in topic_labels
-            ]
-            
-            selected_topic_label = st.selectbox(
-                "Select Topic",
-                options=topic_options
-            )
-            
-            # Filter documents
-            if selected_topic_label == "All Topics":
-                filtered_df = processed_df
-            else:
-                filtered_df = processed_df[processed_df['topic_label'] == selected_topic_label]
-            
-            st.write(f"**{len(filtered_df):,} documents**")
-            
-            # Display documents
-            display_cols = [col for col in [text_col, 'topic_label'] if col in filtered_df.columns]
-            st.dataframe(
-                filtered_df[display_cols].head(100),
-                use_container_width=True,
-                height=500
-            )
-        
-        with tab3:
-            st.subheader("Split Large Topics into Subtopics")
-            
-            st.info("""
-            Use this tool to analyze large topics and split them into more specific subtopics.
-            This is useful when one category contains too many diverse documents.
-            """)
-            
-            # Get topics that are too large
-            max_size = len(processed_df) * (max_category_ratio / 100)
-            large_topics = processed_df[
-                (processed_df['topic'] != -1) &
-                (processed_df.groupby('topic')['topic'].transform('count') > max_size)
-            ]['topic_label'].unique()
-            
-            if len(large_topics) > 0:
-                st.warning(f"**{len(large_topics)} oversized categories detected:**")
-                for topic in large_topics:
-                    count = len(processed_df[processed_df['topic_label'] == topic])
-                    pct = count / len(processed_df) * 100
-                    st.write(f"- {topic}: {count:,} docs ({pct:.1f}%)")
                 
-                selected_topic_to_split = st.selectbox(
-                    "Select topic to split",
-                    options=large_topics
-                )
-                
-                # Get suggested number of splits
-                topic_count = len(processed_df[processed_df['topic_label'] == selected_topic_to_split])
-                topic_ratio = topic_count / len(processed_df)
-                suggested_splits = max(2, int(topic_ratio / 0.20))
-                
-                sub_n_topics = st.slider(
-                    "Number of subtopics",
-                    min_value=2,
-                    max_value=20,
-                    value=suggested_splits,
-                    help="How many subtopics to create from this large topic"
-                )
-                
-                if st.button(f"🔍 Split '{selected_topic_to_split}' into {sub_n_topics} subtopics"):
-                    docs_to_split = processed_df[
-                        processed_df['topic_label'] == selected_topic_to_split
-                    ][text_col].tolist()
+                # Balance score
+                st.subheader("📊 Balance Metrics")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    balance_score = balance_analysis['balance_score']
+                    st.metric("Balance Score", f"{balance_score:.2f}", 
+                            help="1.0 = perfectly balanced, 0 = highly imbalanced")
+                with col2:
+                    st.metric("Oversized Topics", len(balance_analysis['oversized_topics']))
+                with col3:
+                    avg_size = total_docs / unique_topics if unique_topics > 0 else 0
+                    st.metric("Avg Topic Size", f"{avg_size:.0f} docs")
                     
-                    if len(docs_to_split) >= 10:
-                        with st.spinner(f"Analyzing {len(docs_to_split):,} documents..."):
-                            # Use K-means for splitting to ensure all docs are assigned
-                            if torch.cuda.is_available():
-                                sub_model = BERTopic(
-                                    hdbscan_model=GPUKMeans(n_clusters=sub_n_topics),
-                                    min_topic_size=2,
-                                    calculate_probabilities=False,
-                                    verbose=False
+            with tab3:
+                st.subheader("🔍 Split Large Topics")
+                
+                if balance_analysis['oversized_topics']:
+                    st.warning(f"Found {len(balance_analysis['oversized_topics'])} oversized topic(s)")
+                    
+                    # Select topic to split
+                    oversized_options = [
+                        f"Topic {t['topic']}: {t['count']} docs ({t['ratio']*100:.1f}%)"
+                        for t in balance_analysis['oversized_topics']
+                    ]
+                    
+                    selected_topic_to_split = st.selectbox(
+                        "Select topic to split",
+                        oversized_options
+                    )
+                    
+                    # Extract topic number
+                    topic_to_split = int(selected_topic_to_split.split(':')[0].replace('Topic ', ''))
+                    
+                    # Get suggested splits
+                    suggested_splits = next(
+                        t['suggested_splits'] for t in balance_analysis['oversized_topics']
+                        if t['topic'] == topic_to_split
+                    )
+                    
+                    sub_n_topics = st.slider(
+                        "Number of subtopics",
+                        min_value=2,
+                        max_value=min(10, suggested_splits * 2),
+                        value=suggested_splits,
+                        help="How many subtopics to create from this large topic"
+                    )
+                    
+                    if st.button(f"🔍 Split Topic {topic_to_split} into {sub_n_topics} subtopics"):
+                        docs_to_split = processed_df[
+                            processed_df['topic'] == topic_to_split
+                        ][text_col].tolist()
+                        
+                        min_docs_for_split = max(10, sub_n_topics * 2)
+                        if len(docs_to_split) >= min_docs_for_split:
+                            with st.spinner(f"Analyzing {len(docs_to_split):,} documents..."):
+                                # Use K-means for splitting to ensure all docs are assigned
+                                if torch.cuda.is_available():
+                                    sub_model = BERTopic(
+                                        hdbscan_model=GPUKMeans(n_clusters=sub_n_topics),
+                                        min_topic_size=max(2, len(docs_to_split) // (sub_n_topics * 2)),
+                                        calculate_probabilities=False,
+                                        verbose=False
+                                    )
+                                else:
+                                    sub_model = BERTopic(
+                                        hdbscan_model=KMeans(n_clusters=sub_n_topics, random_state=42),
+                                        min_topic_size=max(2, len(docs_to_split) // (sub_n_topics * 2)),
+                                        calculate_probabilities=False,
+                                        verbose=False
+                                    )
+                                
+                                sub_topics, _ = sub_model.fit_transform(docs_to_split)
+                                
+                                st.success(f"✅ Split into {len(set(sub_topics))} subtopics")
+                                
+                                st.write("### 📊 Subtopics Found:")
+                                sub_topic_info = sub_model.get_topic_info()
+                                
+                                # Clean display
+                                sub_topic_display = sub_topic_info[['Topic', 'Count', 'Name']].copy()
+                                sub_topic_display['Keywords'] = sub_topic_info['Representation'].apply(
+                                    lambda x: ', '.join(x[:3]) if isinstance(x, list) else str(x)[:50]
                                 )
-                            else:
-                                sub_model = BERTopic(
-                                    hdbscan_model=KMeans(n_clusters=sub_n_topics, random_state=42),
-                                    min_topic_size=2,
-                                    calculate_probabilities=False,
-                                    verbose=False
-                                )
-                            
-                            sub_topics, _ = sub_model.fit_transform(docs_to_split)
-                            
-                            st.success(f"✅ Split into {len(set(sub_topics))} subtopics")
-                            
-                            st.write("### 📊 Subtopics Found:")
-                            sub_topic_info = sub_model.get_topic_info()
-                            
-                            # Clean display
-                            sub_topic_display = sub_topic_info[['Topic', 'Count', 'Name']].copy()
-                            sub_topic_display['Keywords'] = sub_topic_info['Representation'].apply(
-                                lambda x: ', '.join(x[:3]) if isinstance(x, list) else str(x)[:50]
-                            )
-                            sub_topic_display['% of Parent'] = (
-                                sub_topic_display['Count'] / len(docs_to_split) * 100
-                            ).round(1)
-                            
-                            st.dataframe(sub_topic_display, use_container_width=True)
-                            
-                            # Summary
-                            sub_outliers = sum(1 for t in sub_topics if t == -1)
-                            sub_coverage = ((len(sub_topics) - sub_outliers) / len(sub_topics)) * 100
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Subtopics Created", len(set(sub_topics)) - (1 if -1 in sub_topics else 0))
-                            with col2:
-                                st.metric("Documents Reassigned", len(docs_to_split) - sub_outliers)
-                            with col3:
-                                st.metric("Subtopic Coverage", f"{sub_coverage:.1f}%")
-                    else:
-                        st.warning(f"Not enough documents ({len(docs_to_split)} < 10) for splitting")
-            else:
-                st.success("✅ No oversized categories detected. All topics are well-balanced!")
-        
-        with tab4:
-            st.subheader("💾 Export Results")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.download_button(
-                    label="📥 Download Results (CSV)",
-                    data=convert_df_to_csv(processed_df),
-                    file_name=f"bertopic_results_{st.session_state.uploaded_file_name}.csv",
-                    mime="text/csv",
-                    help="Full dataset with topic assignments"
-                )
-            
-            with col2:
-                st.download_button(
-                    label="📥 Download Topic Info (CSV)",
-                    data=convert_df_to_csv(topic_info),
-                    file_name=f"topic_info_{st.session_state.uploaded_file_name}.csv",
-                    mime="text/csv",
-                    help="Topic descriptions and statistics"
-                )
-            
-            with col3:
-                # Create summary report
-                summary = f"""Topic Modeling Report
+                                sub_topic_display['% of Parent'] = (
+                                    sub_topic_display['Count'] / len(docs_to_split) * 100
+                                ).round(1)
+                                
+                                st.dataframe(sub_topic_display, use_container_width=True)
+                                
+                                # Summary
+                                sub_outliers = sum(1 for t in sub_topics if t == -1)
+                                sub_coverage = ((len(sub_topics) - sub_outliers) / len(sub_topics)) * 100
+                                
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Subtopics Created", len(set(sub_topics)) - (1 if -1 in sub_topics else 0))
+                                with col2:
+                                    st.metric("Documents Reassigned", len(docs_to_split) - sub_outliers)
+                                with col3:
+                                    st.metric("Subtopic Coverage", f"{sub_coverage:.1f}%")
+                        else:
+                            st.warning(f"Not enough documents ({len(docs_to_split)} < {min_docs_for_split}) for splitting")
+                else:
+                    st.success("✅ No oversized categories detected. All topics are well-balanced!")
+                    
+            with tab4:
+                st.subheader("💾 Export Results")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.download_button(
+                        label="📥 Download Results (CSV)",
+                        data=convert_df_to_csv(processed_df),
+                        file_name=f"bertopic_results_{st.session_state.uploaded_file_name}.csv",
+                        mime="text/csv",
+                        help="Full dataset with topic assignments"
+                    )
+                
+                with col2:
+                    st.download_button(
+                        label="📥 Download Topic Info (CSV)",
+                        data=convert_df_to_csv(topic_info),
+                        file_name=f"topic_info_{st.session_state.uploaded_file_name}.csv",
+                        mime="text/csv",
+                        help="Topic descriptions and statistics"
+                    )
+                
+                with col3:
+                    # Create summary report
+                    summary = f"""Topic Modeling Report
 Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 File: {st.session_state.uploaded_file_name}
 Documents: {len(processed_df)}
 Topics Found: {unique_topics}
 Outliers: {outlier_count} ({100-coverage:.1f}%)
 Coverage: {coverage:.1f}%
+Min Topic Size: {st.session_state.min_topic_size_used}
 GPU Used: {ran_params.get('GPU Used', False)}
 Clustering Method: {ran_params.get('Clustering', 'Unknown')}
 Balance Status: {'Balanced' if balance_analysis['balanced'] else 'Needs Attention'}
 Oversized Categories: {len(balance_analysis['oversized_topics'])}
 """
-                st.download_button(
-                    label="📥 Download Report (TXT)",
-                    data=summary,
-                    file_name=f"report_{st.session_state.uploaded_file_name}.txt",
-                    mime="text/plain",
-                    help="Summary report"
-                )
-            
+                    st.download_button(
+                        label="📥 Download Report (TXT)",
+                        data=summary,
+                        file_name=f"report_{st.session_state.uploaded_file_name}.txt",
+                        mime="text/plain",
+                        help="Summary report"
+                    )
+                    
     elif not uploaded_file:
         # Welcome screen
         st.info("👆 Please upload a CSV file in the sidebar to begin.")
@@ -1309,26 +975,28 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
         col1, col2 = st.columns(2)
         
         with col1:
-            st.subheader("✅ Outlier Reduction")
+            st.subheader("✅ Improved Topic Size Control")
             st.markdown("""
-            **Three strategies to minimize outliers:**
+            **NEW: Configurable Minimum Topic Size**
+            
+            - **Set minimum topic size** for ALL clustering modes
+            - **Automatic merging** of small topics with similar larger ones
+            - **Smart topic number limits** based on your minimum size
+            - **Post-processing** ensures no tiny topics (1-2 documents)
+            
+            **Three Outlier Reduction Strategies:**
             
             1. **Aggressive (K-means)** - 0% outliers
                - Forces ALL documents into topics
-               - Best for balanced categorization
+               - Respects minimum topic size via merging
                
             2. **Moderate (Lenient HDBSCAN)** - <15% outliers
-               - More flexible clustering
+               - Flexible clustering with size constraints
                - Balances quality and coverage
                
             3. **Conservative (Standard HDBSCAN)** - Natural clustering
                - Highest quality topics
-               - May have more outliers
-            
-            **🎯 NEW: Seed Words**
-            - Guide topics with predefined keywords
-            - Steer model toward topics you care about
-            - Great for domain-specific analysis
+               - Enforces minimum size naturally
             """)
         
         with col2:
@@ -1345,6 +1013,7 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
             - Analyze oversized categories
             - Break them into meaningful subtopics
             - Improve overall balance
+            - Maintains minimum size in subtopics
             """)
         
         # Installation tips
@@ -1352,7 +1021,7 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
         
         st.code("""
 # Required packages
-pip install streamlit bertopic sentence-transformers torch pandas plotly
+pip install streamlit bertopic sentence-transformers torch pandas plotly scipy
 
 # Optional: GPU acceleration (highly recommended!)
 pip install accelerate  # For better GPU performance
