@@ -15,39 +15,6 @@ import time
 import psutil
 import os
 
-"""
-================================================================================
-✅ SIMPLE FIX APPLIED: Improved LLM Prompt + Deduplication
-================================================================================
-
-WHAT WAS WRONG:
-- Prompt was too complex (chain-of-thought with Analysis + Category)
-- Parsing was too strict (looking for exact "Category:" format)
-- No deduplication (same label could repeat across topics)
-
-WHAT WAS FIXED:
-1. ✅ Simplified prompt (direct, clear format)
-2. ✅ Reduced batch size (10 instead of 20)  
-3. ✅ Better parsing (more forgiving regex)
-4. ✅ Deduplication (prevents repeating labels)
-5. ✅ Lower temperature (0.3 for consistency)
-6. ✅ Repetition penalty (1.3 to avoid same label)
-
-BATCH ARCHITECTURE: Kept as-is (it was working!)
-- Still processes topics in batches
-- Still uses parallel workers
-- Just improved the prompt/parsing/deduplication
-
-Expected Results:
-- Specific labels (not "Help Buy Question Buy")
-- Unique labels (deduplication prevents repeats)
-- Good LLM success rate (90%+)
-- Fast processing (2-3 topics/sec)
-
-Changes made: 2025-10-23
-================================================================================
-"""
-
 
 # =====================================================
 # 🚀 MEMORY OPTIMIZATION PROFILES
