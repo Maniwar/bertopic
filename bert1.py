@@ -1,3 +1,20 @@
+KeyError: "['Human_Label'] not in index"
+Traceback:
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1545, in <module>
+    main()
+    ~~~~^^
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1180, in main
+    display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
+                 ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\frame.py", line 4119, in __getitem__
+    indexer = self.columns._get_indexer_strict(key, "columns")[1]
+              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\indexes\base.py", line 6212, in _get_indexer_strict
+    self._raise_if_missing(keyarr, indexer, axis_name)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\indexes\base.py", line 6264, in _raise_if_missing
+    raise KeyError(f"{not_found} not in index")
+
 import streamlit as st
 import pandas as pd
 import torch
