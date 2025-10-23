@@ -555,61 +555,61 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
                 f"- Unique patterns not in other topics\n"
             )
         
-        # ✅ IMPROVEMENT 4: MUCH STRONGER prompt with better examples and explicit uniqueness requirements
+        # ✅ IMPROVEMENT 4: ULTRA-STRONG prompt with extreme uniqueness emphasis
         batch_prompt = f"""You are an expert at analyzing customer support data and creating HIGHLY SPECIFIC, UNIQUE category names.
 
-TASK: Create a SHORT (3-6 words), SPECIFIC category name for each topic below that captures what makes it UNIQUE from other topics.
+⚠️ CRITICAL: I am analyzing HUNDREDS of topics. Every label must be COMPLETELY UNIQUE and HIGHLY SPECIFIC.
 
-CRITICAL RULES:
-1. **BE ULTRA-SPECIFIC**: Use the actual products, actions, or issues mentioned in the messages
-2. **AVOID GENERIC WORDS**: Never use generic terms like "order", "question", "help", "product", "discount" ALONE
-3. **COMBINE SPECIFICS**: Use format like "[Specific Product/Action] + [Specific Issue/Request]"
-4. **MAKE EVERY LABEL UNIQUE**: If you see patterns repeating, ADD MORE DETAIL to differentiate
-5. **USE KEYWORDS FROM MESSAGES**: Pull specific terms from the actual customer messages
-6. **THINK LIKE A CUSTOMER**: What would someone search for to find this category?
+TASK: Create a SHORT (3-6 words), ULTRA-SPECIFIC category name for each topic below.
 
-EXCELLENT LABELS (specific, actionable, unique):
-✓ "Promo Code Redemption Errors"
-✓ "Galaxy Z Fold Screen Protector Installation"
-✓ "Student Discount Verification Process"
-✓ "Refrigerator Delivery Rescheduling"
-✓ "Trade-In Value Calculation Questions"
-✓ "Wireless Charger Compatibility Check"
-✓ "Order Status Tracking Issues"
-✓ "Military Discount Program Enrollment"
-✓ "Smart TV Remote Control Problems"
-✓ "Washing Machine Installation Service"
+ULTRA-CRITICAL RULES:
+1. **EXTREME SPECIFICITY**: Each label must mention SPECIFIC products/models/issues - NOT generic categories
+2. **ABSOLUTE UNIQUENESS**: Imagine you have 300+ topics. Each label must be SO SPECIFIC that it couldn't apply to any other topic
+3. **NO GENERIC WORDS ALONE**: Never use "Mobile Products" or "New Order" - these are TOO VAGUE
+4. **COMBINE MAXIMUM DETAIL**: Use format: "[Exact Product/Model] + [Specific Action/Issue]"
+5. **READ ALL 50 DOCUMENTS**: Find the SPECIFIC things customers mention, not generic patterns
+6. **THINK**: "If I had 300 topics, would ANY other topic get this same label?" → If YES, ADD MORE DETAIL
 
-TERRIBLE LABELS (too generic, not helpful):
-✗ "Discount Applying Order" ← Which discount? What issue?
-✗ "Product Question" ← Which product? What question?
-✗ "Email About Discount" ← Too vague
+ULTRA-SPECIFIC LABELS (these are good because they're UNIQUE):
+✓ "Galaxy Z Fold 5 Screen Protector Installation"  ← Exact model + specific issue
+✓ "Student Email Discount Verification Process"  ← Specific customer type + action
+✓ "LG Refrigerator Door Ice Maker Problems"  ← Brand + specific part + issue
+✓ "Samsung TV Return Shipping Label Request"  ← Brand + product + specific action
+✓ "Military Personnel Discount Documentation"  ← Specific customer segment + need
+✓ "Washer Dryer Combo Installation Scheduling"  ← Exact product type + action
+
+TERRIBLE LABELS (too generic, could apply to many topics):
+✗ "Mobile Products Accessories" ← Which mobile product? Which accessory? What about them?
+✗ "New Order Home" ← Which product? What kind of order? Too vague!
+✗ "Product Comparison" ← Which products? For what purpose?
+✗ "Discount Question" ← What kind of discount? Who for?
 ✗ "Order Help" ← Help with what exactly?
-✗ "Customer Support" ← Too broad
-✗ "Question Discounts" ← What kind of question?
 
-REMEMBER: You have 50 FULL DOCUMENTS per topic. Read them carefully to find:
-- What SPECIFIC product/service is mentioned most?
-- What SPECIFIC action/issue is the customer having?
-- What makes THIS topic different from others?
+YOU HAVE 50 FULL DOCUMENTS PER TOPIC. Use them! Look for:
+- EXACT product names/models (Galaxy S24, not "mobile phone")
+- SPECIFIC customer types (student, military, business)
+- SPECIFIC issues (screen protector, ice maker, shipping label)
+- SPECIFIC actions (verification, installation, scheduling)
 
 {chr(10).join(topics_text)}
 
 {'='*70}
 
-Now create HIGHLY SPECIFIC, UNIQUE labels. Ask yourself for each:
-1. "Would two different topics ever get this same label?" → If YES, add more detail
-2. "Does this tell me the exact customer need?" → If NO, be more specific
-3. "Could I route this to the right support team?" → If NO, add product/issue details
+Now create ULTRA-SPECIFIC, ABSOLUTELY UNIQUE labels. For EACH label ask yourself:
+1. ❓ "Could ANY of the other {len(batch_data)} topics in this batch get this same label?" → If YES, add more specifics!
+2. ❓ "Does this mention the EXACT product/model or customer type?" → If NO, read the documents again!
+3. ❓ "Could I route this to the exact right specialist based on this label?" → If NO, add more detail!
+4. ❓ "Is this label so specific that it couldn't apply to 100 other topics?" → If NO, be MORE specific!
 
-CRITICAL: Each label must be COMPLETELY DIFFERENT from all others. If topics seem similar, find what makes each unique.
+REMEMBER: Generic labels like "Mobile Products Accessories" or "New Order Home" are COMPLETELY UNACCEPTABLE.
+Every label must be a UNIQUE fingerprint for that specific topic!
 
 Format EXACTLY (one label per line):
-Topic 1: [Highly Specific Label]
-Topic 2: [Completely Different Specific Label]
-Topic 3: [Another Unique Specific Label]
+Topic 1: [Ultra-Specific Unique Label With Exact Details]
+Topic 2: [Completely Different Ultra-Specific Label]
+Topic 3: [Another Totally Unique Specific Label]
 
-Your labels:"""
+Your ultra-specific labels:"""
         
         # ✅ IMPROVEMENT 5: Dynamic max_length based on model's context window
         inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length)
@@ -620,12 +620,12 @@ Your labels:"""
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=300,  # More space for detailed labels
-                temperature=0.2,     # LOWER: More focused, less random
+                temperature=0.1,     # ✅ EVEN LOWER: Maximum focus (was 0.2)
                 do_sample=True,
                 top_p=0.85,          # Slightly higher for some diversity
-                top_k=40,            # Add top_k to prevent too much randomness
-                repetition_penalty=2.2,  # ✅ MUCH HIGHER: Strongly discourage repetition
-                no_repeat_ngram_size=3,  # ✅ NEW: Prevent repeating 3-word phrases
+                top_k=40,            # Limit vocabulary diversity
+                repetition_penalty=2.5,  # ✅ EVEN HIGHER: Maximum repetition avoidance (was 2.2)
+                no_repeat_ngram_size=3,  # Prevent repeating 3-word phrases
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -660,9 +660,13 @@ Your labels:"""
             # Common but too vague combinations
             'order help', 'product question', 'discount question',
             'email question', 'help with', 'question about',
-            # Repetitive patterns from your screenshot
+            # Repetitive patterns from screenshots
             'discount applying', 'applying order', 'discounts email',
-            'question discounts', 'question buy', 'buy help'
+            'question discounts', 'question buy', 'buy help',
+            # NEW: Patterns from latest screenshot
+            'mobile products', 'products accessories', 'mobile accessories',
+            'new order', 'order home', 'order tv', 'order buy',
+            'need product', 'product comparison'
         ]
         
         # Track seen labels AND their word sets to avoid near-duplicates
@@ -702,12 +706,13 @@ Your labels:"""
             # Count "generic" vs "specific" words
             generic_words = {'order', 'question', 'help', 'product', 'discount', 
                            'email', 'issue', 'problem', 'request', 'about', 
-                           'inquiry', 'support', 'customer', 'service'}
+                           'inquiry', 'support', 'customer', 'service', 'new', 
+                           'mobile', 'products', 'accessories', 'home', 'buy', 'need'}
             
             specific_count = sum(1 for w in words if w not in generic_words and len(w) > 2)
             
-            # Need at least 2 specific words
-            return specific_count >= 2
+            # ✅ INCREASED: Need at least 3 specific words (was 2)
+            return specific_count >= 3
         
         for line in lines:
             line = line.strip()
@@ -735,8 +740,8 @@ Your labels:"""
                     # ✅ VALIDATION 4: Check word count
                     word_count = len(label.split())
                     
-                    # ✅ VALIDATION 5: Check for near-duplicates (new!)
-                    is_near_duplicate = is_too_similar_to_existing(label, seen_word_sets, threshold=0.6)
+                    # ✅ VALIDATION 5: Check for near-duplicates (stricter threshold)
+                    is_near_duplicate = is_too_similar_to_existing(label, seen_word_sets, threshold=0.5)  # Was 0.6
                     
                     # ✅ VALIDATION 6: Check specificity (new!)
                     is_specific_enough = has_sufficient_specificity(label)
@@ -969,7 +974,55 @@ class AdaptiveParallelLLMLabeler:
                 f"Rate: {total_topics/elapsed:.1f} topics/sec"
             )
         
+        # ✅ CRITICAL FIX: Global cross-batch duplicate detection and resolution
+        all_labels = self._resolve_cross_batch_duplicates(all_labels, topic_items, fallback_func, show_progress)
+        
         return all_labels
+    
+    def _resolve_cross_batch_duplicates(self, labels_dict, topic_items, fallback_func, show_progress):
+        """
+        CRITICAL: Detect and resolve duplicates that occurred across different batches.
+        This fixes the bug where validation only worked within batches.
+        """
+        if show_progress:
+            st.info("🔍 Checking for cross-batch duplicate labels...")
+        
+        # Track all labels globally
+        label_to_topics = {}  # Map label -> list of topic_ids
+        for topic_id, label in labels_dict.items():
+            label_lower = label.lower()
+            if label_lower not in label_to_topics:
+                label_to_topics[label_lower] = []
+            label_to_topics[label_lower].append(topic_id)
+        
+        # Find duplicates
+        duplicates_found = 0
+        for label_lower, topic_ids in label_to_topics.items():
+            if len(topic_ids) > 1:
+                duplicates_found += len(topic_ids) - 1
+                # Keep first occurrence, regenerate others using fallback
+                for topic_id in topic_ids[1:]:  # Skip first, fix others
+                    # Find the topic data
+                    topic_data = None
+                    for item in topic_items:
+                        if item['topic_id'] == topic_id:
+                            topic_data = item
+                            break
+                    
+                    if topic_data:
+                        # Use fallback with enhanced specificity
+                        new_label = fallback_func(topic_data['docs'], topic_data['keywords'])
+                        # Add topic ID to make it unique if needed
+                        if new_label.lower() in label_to_topics:
+                            new_label = f"{new_label} (Topic {topic_id})"
+                        labels_dict[topic_id] = new_label
+        
+        if show_progress and duplicates_found > 0:
+            st.warning(f"⚠️ Found and fixed {duplicates_found} cross-batch duplicate labels!")
+        elif show_progress:
+            st.success("✅ No cross-batch duplicates found")
+        
+        return labels_dict
     
     def _sequential_fallback(self, topic_items, fallback_func, show_progress):
         """Sequential processing without LLM"""
