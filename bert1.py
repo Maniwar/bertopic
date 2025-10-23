@@ -1,20 +1,3 @@
-KeyError: "['Human_Label'] not in index"
-Traceback:
-File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1545, in <module>
-    main()
-    ~~~~^^
-File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1180, in main
-    display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
-                 ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\frame.py", line 4119, in __getitem__
-    indexer = self.columns._get_indexer_strict(key, "columns")[1]
-              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
-File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\indexes\base.py", line 6212, in _get_indexer_strict
-    self._raise_if_missing(keyarr, indexer, axis_name)
-    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\pandas\core\indexes\base.py", line 6264, in _raise_if_missing
-    raise KeyError(f"{not_found} not in index")
-
 import streamlit as st
 import pandas as pd
 import torch
@@ -685,6 +668,56 @@ class FastReclusterer:
         return pd.DataFrame(topic_info_list)
 
 # -----------------------------------------------------
+# GUARANTEE COLUMNS EXIST ON topic_info
+# -----------------------------------------------------
+def normalize_topic_info(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure topic_info has Human_Label, Keywords, and Count columns."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["Topic", "Human_Label", "Keywords", "Count"])
+    df = df.copy()
+
+    # Keywords
+    if "Keywords" not in df.columns:
+        if "Representation" in df.columns:
+            df["Keywords"] = df["Representation"].apply(
+                lambda x: ", ".join(x[:5]) if isinstance(x, list) else (str(x) if pd.notna(x) else "")
+            )
+        else:
+            df["Keywords"] = ""
+
+    # Human_Label
+    if "Human_Label" not in df.columns or df["Human_Label"].isna().any():
+        if "Human_Label" not in df.columns:
+            df["Human_Label"] = ""
+        def _build_label(row):
+            if isinstance(row.get("Human_Label"), str) and row["Human_Label"].strip():
+                return row["Human_Label"]
+            if isinstance(row.get("Name"), str) and row["Name"].strip():
+                return row["Name"]
+            kw = row.get("Keywords", "")
+            # fall back to keywords-only label (documents unavailable here)
+            return make_human_label([], kw)
+        df["Human_Label"] = df.apply(_build_label, axis=1)
+
+    # Count
+    if "Count" not in df.columns:
+        if "Document Count" in df.columns:
+            df["Count"] = df["Document Count"]
+        else:
+            # compute from current topics if available
+            if st.session_state.get("current_topics") is not None:
+                counts = Counter(st.session_state.current_topics.tolist())
+                df["Count"] = df["Topic"].map(counts).fillna(0).astype(int)
+            else:
+                df["Count"] = 0
+
+    # Ensure Topic exists
+    if "Topic" not in df.columns and "topic" in df.columns:
+        df["Topic"] = df["topic"]
+
+    return df
+
+# -----------------------------------------------------
 # MAIN APPLICATION FUNCTIONS
 # -----------------------------------------------------
 def check_gpu_capabilities():
@@ -887,7 +920,6 @@ def main():
 
             # Topic Size Control
             st.subheader("📏 Topic Size Control")
-            # Ensure default value is >= min_value to avoid Streamlit errors on small data
             default_min_topic_size = max(2, min(10, len(df) // 50))
             min_topic_size = st.slider(
                 "Minimum Topic Size",
@@ -973,7 +1005,6 @@ def main():
                 # Step 2: Load model and compute embeddings (SAFE)
                 with st.spinner("Computing embeddings (this is the slow part, done only once)..."):
                     try:
-                        # ensure base model is cached (keeps behavior identical for downstream code)
                         _ = load_embedding_model(embedding_model)
 
                         safe_model = SafeEmbeddingModel(
@@ -1005,7 +1036,7 @@ def main():
                     cleaned_docs, embeddings, umap_embeddings
                 )
 
-                # Step 5: Parse seed words if provided (kept for parity)
+                # Step 5: (optional) Seed words parsed
                 seed_topic_list = []
                 if seed_words_input:
                     for line in seed_words_input.strip().split('\n'):
@@ -1016,7 +1047,6 @@ def main():
 
                 # Step 6: Perform initial clustering
                 with st.spinner("Performing initial clustering..."):
-                    # Determine clustering method
                     if "Aggressive" in outlier_strategy:
                         method = 'kmeans'
                         initial_n_topics = nr_topics
@@ -1035,15 +1065,18 @@ def main():
                         st.error("Initial clustering failed!")
                         st.stop()
 
+                    # ALWAYS normalize topic_info to guarantee Human_Label etc.
+                    topic_info = normalize_topic_info(topic_info)
+
                     st.session_state.current_topics = topics
                     st.session_state.current_topic_info = topic_info
-                    st.session_state.topic_info = topic_info  # Also store as topic_info
+                    st.session_state.topic_info = topic_info
                     st.session_state.min_topic_size = min_topic_size
                     st.session_state.min_topic_size_used = min_topic_size
                     st.session_state.embeddings_computed = True
                     st.session_state.clustering_method = "K-means" if method == 'kmeans' else "HDBSCAN"
                     st.session_state.gpu_used = gpu_capabilities['cuda_available']
-                    st.session_state.model = None  # Not using traditional BERTopic model in this version
+                    st.session_state.model = None
 
                     st.success("✅ Embeddings computed! You can now adjust topics dynamically with the slider below.")
                     st.balloons()
@@ -1058,7 +1091,6 @@ def main():
         col1, col2, col3 = st.columns([2, 1, 1])
 
         with col1:
-            # Guard so slider has a valid range on small datasets
             denom = max(2, st.session_state.min_topic_size)
             max_topics = max(2, min(100, len(st.session_state.documents) // denom))
 
@@ -1097,9 +1129,10 @@ def main():
                 )
 
                 if topics is not None:
+                    topic_info = normalize_topic_info(topic_info)
                     st.session_state.current_topics = topics
                     st.session_state.current_topic_info = topic_info
-                    st.session_state.topic_info = topic_info  # Keep both in sync
+                    st.session_state.topic_info = topic_info
                     st.success(f"✅ Reclustered into {len(topic_info[topic_info['Topic'] != -1])} topics!")
                 else:
                     st.error("Reclustering failed. Try different parameters.")
@@ -1107,7 +1140,7 @@ def main():
         # Display results
         if st.session_state.current_topics is not None:
             topics = st.session_state.current_topics
-            topic_info = st.session_state.current_topic_info  # Use current_topic_info
+            topic_info = normalize_topic_info(st.session_state.current_topic_info)
 
             # Calculate metrics
             total_docs = len(topics)
@@ -1126,7 +1159,7 @@ def main():
             topic_human = {}
             for _, row in topic_info.iterrows():
                 topic_keywords[row['Topic']] = row['Keywords']
-                topic_human[row['Topic']] = row['Human_Label'] if 'Human_Label' in row else (row['Name'] if 'Name' in row else f"Topic {row['Topic']}")
+                topic_human[row['Topic']] = row['Human_Label'] if 'Human_Label' in row else (row.get('Name') or f"Topic {row['Topic']}")
             processed_df['keywords'] = processed_df['topic'].map(topic_keywords)
 
             # Store in session state for export and other tabs
@@ -1190,13 +1223,13 @@ def main():
             with tabs[0]:  # Topics Overview
                 st.subheader("Topic Information")
 
-                display_df = topic_info.copy()
+                display_df = normalize_topic_info(topic_info)
                 if -1 in display_df['Topic'].values:
                     display_df = display_df[display_df['Topic'] != -1]
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
                 display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
 
-                # Use Streamlit default dataframe (dark-mode friendly)
+                # Streamlit default dataframe (dark-mode friendly)
                 st.dataframe(display_df, use_container_width=True)
                 st.caption("Tip: Use the column header menus to sort/filter. Dark-mode friendly.")
 
@@ -1270,7 +1303,7 @@ def main():
 
                         if len(docs_to_split) >= max(10, sub_n_topics * 2):
                             with st.spinner(f"Analyzing {len(docs_to_split):,} documents..."):
-                                # Use K-means for splitting
+                                # Use K-means for splitting via BERTopic's API (for convenience)
                                 sub_model = BERTopic(
                                     hdbscan_model=GPUKMeans(n_clusters=sub_n_topics) if gpu_capabilities['cuda_available']
                                     else KMeans(n_clusters=sub_n_topics, random_state=42),
@@ -1445,8 +1478,8 @@ def main():
             with tabs[5]:  # Export
                 st.subheader("💾 Export Results")
 
-                # Prepare full export dataframe (reuse the browser_df we already built)
                 export_df = st.session_state.browser_df.copy()
+                safe_topic_info = normalize_topic_info(topic_info)
 
                 col1, col2, col3 = st.columns(3)
 
@@ -1462,7 +1495,7 @@ def main():
                 with col2:
                     st.download_button(
                         label="📥 Download Topic Info (CSV)",
-                        data=convert_df_to_csv(topic_info[['Topic','Human_Label','Keywords','Count']]),
+                        data=convert_df_to_csv(safe_topic_info[['Topic','Human_Label','Keywords','Count']]),
                         file_name=f"topic_info_{st.session_state.uploaded_file_name}_{n_topics_slider}topics.csv",
                         mime="text/csv",
                         help="Topic descriptions and statistics (with human labels)"
