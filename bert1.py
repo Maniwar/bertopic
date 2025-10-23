@@ -1234,7 +1234,21 @@ def main():
                     st.session_state.current_topics = topics
                     st.session_state.current_topic_info = topic_info
                     st.session_state.topic_info = topic_info
+                    st.session_state.clustering_method = "K-means" if method == 'kmeans' else "HDBSCAN"
+                    
+                    # Clear cached data to force rebuild
+                    if 'browser_df' in st.session_state:
+                        del st.session_state.browser_df
+                    if 'topic_human' in st.session_state:
+                        del st.session_state.topic_human
+                    if 'processed_df' in st.session_state:
+                        del st.session_state.processed_df
+                    
+                    # Reset browser page
+                    st.session_state.browser_page = 0
+                    
                     st.success(f"✅ Reclustered into {len(topic_info[topic_info['Topic'] != -1])} topics!")
+                    st.rerun()  # CRITICAL: Force full page refresh
                 else:
                     st.error("Reclustering failed. Try different parameters.")
 
@@ -1549,16 +1563,21 @@ def main():
                     except Exception:
                         pass
 
-                # Apply topic filter (using query for speed)
+                # OPTIMIZED: Use numpy boolean indexing for speed
+                topic_array = browser_df['Topic'].values
+                
                 if selected_ids or show_outliers:
+                    # Build mask efficiently with numpy
                     if selected_ids and show_outliers:
-                        filter_mask = (browser_df['Topic'].isin(list(selected_ids))) | (browser_df['Topic'] == -1)
+                        mask = np.isin(topic_array, list(selected_ids)) | (topic_array == -1)
                     elif selected_ids:
-                        filter_mask = browser_df['Topic'].isin(list(selected_ids))
+                        mask = np.isin(topic_array, list(selected_ids))
                     else:
-                        filter_mask = browser_df['Topic'] == -1
+                        mask = topic_array == -1
                     
-                    view_df = browser_df[filter_mask]
+                    # Get indices and use iloc (faster than boolean indexing on pandas)
+                    matching_indices = np.where(mask)[0]
+                    view_df = browser_df.iloc[matching_indices]
                 else:
                     view_df = browser_df
 
@@ -1593,22 +1612,28 @@ def main():
                         st.session_state.browser_page = min(total_pages - 1, st.session_state.browser_page + 1)
                         st.rerun()
 
-                # Get current page data
+                # Get current page data (don't copy yet)
                 start_idx = st.session_state.browser_page * page_size
                 end_idx = min(start_idx + page_size, total_rows)
-                page_df = view_df.iloc[start_idx:end_idx].copy()
+                page_df = view_df.iloc[start_idx:end_idx]
 
-                # Optionally truncate text for skimming speed
+                # Optionally truncate text for skimming speed (copy only for display)
                 if text_col and truncate and text_col in page_df.columns:
-                    page_df[text_col] = page_df[text_col].astype(str).str.slice(0, 300) + "..."
+                    display_df = page_df.copy()  # Only copy the small page
+                    display_df[text_col] = display_df[text_col].astype(str).str.slice(0, 300) + "..."
+                else:
+                    display_df = page_df
 
                 # Put topic metadata columns up front
                 meta_cols = ['Topic', 'Topic_Label', 'Topic_Human_Label', 'Topic_Keywords', 'Valid_Document']
-                ordered_cols = [c for c in meta_cols if c in page_df.columns] + [c for c in page_df.columns if c not in meta_cols]
-                page_df = page_df[ordered_cols]
+                ordered_cols = [c for c in meta_cols if c in display_df.columns] + [c for c in display_df.columns if c not in meta_cols]
+                display_df = display_df[ordered_cols]
 
                 st.caption("Tip: Use the column header menus to sort/filter; everything is dark-mode friendly.")
-                st.dataframe(page_df, use_container_width=True)
+                st.dataframe(display_df, use_container_width=True, height=600)
+                
+                # Performance info
+                st.caption(f"⚡ Displaying {len(display_df)} of {total_rows:,} filtered rows (from {len(browser_df):,} total docs)")
 
                 # Download full filtered view (not just current page)
                 st.download_button(
@@ -1743,4 +1768,4 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                             st.write(f"{icon} {key.replace('_available', '').title()}")
 
 if __name__ == "__main__":
-    main(
+    main()
