@@ -1,3 +1,13 @@
+AttributeError: st.session_state has no attribute "topic_info". Did you forget to initialize it? More info: https://docs.streamlit.io/develop/concepts/architecture/session-state#initialization
+Traceback:
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1393, in <module>
+    main()
+    ~~~~^^
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 980, in main
+    topic_info = st.session_state.topic_info
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "C:\Users\m.berenji\AppData\Local\Programs\Python\Python313\Lib\site-packages\streamlit\runtime\state\session_state_proxy.py", line 132, in __getattr__
+    raise AttributeError(_missing_attr_error_message(key))
 import streamlit as st
 import pandas as pd
 import torch
