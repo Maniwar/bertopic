@@ -526,26 +526,32 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
                 f"{docs_preview}\n"
             )
         
-        # ✅ SIMPLIFIED PROMPT - Clear, focused, not overwhelming
-        batch_prompt = f"""You are analyzing customer topics. Create a SHORT, SPECIFIC label (3-6 words) for each topic.
+        # ✅ IMPROVED PROMPT - Forces longer, more specific labels
+        batch_prompt = f"""You are analyzing customer support topics. Create a DESCRIPTIVE label (5-7 words) for each topic that captures EXACTLY what makes it unique.
 
-RULES:
-1. Be specific - use actual terms from the documents
-2. Combine product/action with issue/request
-3. Make each label unique and descriptive
-4. Use 3-6 words maximum
+CRITICAL RULES:
+1. **5-7 WORDS MINIMUM** - Shorter labels are too generic
+2. **BE ULTRA-SPECIFIC** - Include actual product names, actions, or issues from documents
+3. **EVERY LABEL MUST BE UNIQUE** - If you write "Help Order Placed", you've failed
+4. **FORMAT: [Specific Product/Service] + [Specific Action/Issue]**
 
-GOOD EXAMPLES:
-✓ "Promo Code Application Issues"
-✓ "Galaxy Phone Screen Protector"
-✓ "Student Discount Verification"
-✓ "Refrigerator Delivery Scheduling"
-✓ "Military Discount Enrollment"
+EXCELLENT EXAMPLES (specific, detailed, unique):
+✓ "Samsung Galaxy Z Fold Trade-In Process"
+✓ "Washer Dryer Delivery Door Width Issue"
+✓ "Student Discount Verification Code Problems"
+✓ "Refrigerator Installation Service Scheduling Request"
+✓ "Unlocked Phone Purchase Before Contract Ends"
+✓ "Order Status Tracking Number Not Working"
+✓ "Existing Order Product Addition Request"
 
-BAD EXAMPLES:
-✗ "Discount Issues" (too vague)
-✗ "Product Question" (not specific)
-✗ "Customer Support" (too generic)
+TERRIBLE EXAMPLES (too generic - NEVER do this):
+✗ "Help Order Placed" (which order? what help?)
+✗ "Help Product" (which product? what issue?)
+✗ "Order Help" (too vague)
+✗ "Help Buy" (buy what? what problem?)
+✗ "Product Question" (what product? what question?)
+
+**IF TWO TOPICS SEEM SIMILAR**: Find the ONE thing that makes each different and PUT IT IN THE LABEL
 
 {chr(10).join(topics_text)}
 
@@ -568,11 +574,11 @@ Your labels:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=200,  # Enough for labels
-                temperature=0.3,     # More focused
+                max_new_tokens=300,  # More space for detailed labels
+                temperature=0.4,     # Slightly higher for creativity
                 do_sample=True,
                 top_p=0.90,
-                repetition_penalty=1.8,  # Discourage repetition
+                repetition_penalty=2.0,  # Strongly discourage repetition
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -604,9 +610,10 @@ Your labels:"""
                     label = parts[1].strip().strip('"\'.,;')
                     
                     # Basic validation only
+                    word_count = len(label.split())
                     if (1 <= topic_num <= len(batch_data) and
-                        10 <= len(label) <= 80 and  # Reasonable length
-                        2 <= len(label.split()) <= 8 and  # Word count
+                        20 <= len(label) <= 100 and  # Longer labels (was 10-80)
+                        5 <= word_count <= 9 and  # Require 5-9 words (was 2-8)
                         label.lower() not in seen_labels and  # No exact duplicates
                         not any(bad in label.lower() for bad in ['[', ']', 'label', 'your', 'topic name'])):  # No placeholder text
                         
@@ -617,7 +624,31 @@ Your labels:"""
             except (ValueError, IndexError):
                 continue
         
-        return labels_dict
+        # ✅ POST-PROCESSING: Reject overly generic patterns and duplicates
+        generic_starters = ['help order', 'help product', 'help buy', 'order help', 'product help', 'help']
+        cleaned_labels = {}
+        label_usage_count = {}
+        
+        for topic_id, label in labels_dict.items():
+            label_lower = label.lower()
+            
+            # Track how many times each label is used
+            label_usage_count[label_lower] = label_usage_count.get(label_lower, 0) + 1
+            
+            # Check if label starts with generic pattern
+            is_generic = any(label_lower.startswith(pattern) for pattern in generic_starters)
+            
+            if not is_generic:
+                cleaned_labels[topic_id] = label
+        
+        # ✅ CRITICAL: If any label is used more than twice, reject ALL of them (LLM is confused)
+        max_usage = max(label_usage_count.values()) if label_usage_count else 0
+        if max_usage > 2:
+            # LLM is producing repetitive labels - better to use fallback
+            return {}
+        
+        # If we rejected labels, they'll be handled by fallback in the caller
+        return cleaned_labels
         
     except Exception as e:
         # Silent fail - fallback will handle it
