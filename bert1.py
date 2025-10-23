@@ -384,6 +384,8 @@ def main():
         st.session_state.processed_df = None
     if 'embeddings' not in st.session_state:
         st.session_state.embeddings = None
+    if 'min_topic_size_used' not in st.session_state:
+        st.session_state.min_topic_size_used = 10  # Default value
     
     # Check GPU capabilities
     gpu_capabilities = check_gpu_capabilities()
@@ -724,13 +726,13 @@ def main():
             with col4:
                 st.metric("Coverage", f"{coverage:.1f}%")
             with col5:
-                st.metric("Min Topic Size", st.session_state.min_topic_size_used)
+                st.metric("Min Topic Size", st.session_state.get('min_topic_size_used', 'N/A'))
             
             # Run parameters used
             ran_params = {
-                'Clustering': st.session_state.clustering_method,
-                'GPU Used': st.session_state.gpu_used,
-                'Min Topic Size': st.session_state.min_topic_size_used
+                'Clustering': st.session_state.get('clustering_method', 'Unknown'),
+                'GPU Used': st.session_state.get('gpu_used', False),
+                'Min Topic Size': st.session_state.get('min_topic_size_used', 'N/A')
             }
             
             with st.expander("🔍 Parameters Used"):
@@ -951,7 +953,7 @@ Documents: {len(processed_df)}
 Topics Found: {unique_topics}
 Outliers: {outlier_count} ({100-coverage:.1f}%)
 Coverage: {coverage:.1f}%
-Min Topic Size: {st.session_state.min_topic_size_used}
+Min Topic Size: {st.session_state.get('min_topic_size_used', 'N/A')}
 GPU Used: {ran_params.get('GPU Used', False)}
 Clustering Method: {ran_params.get('Clustering', 'Unknown')}
 Balance Status: {'Balanced' if balance_analysis['balanced'] else 'Needs Attention'}
