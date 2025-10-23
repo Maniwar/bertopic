@@ -119,6 +119,48 @@ class MemoryProfileConfig:
         return 'conservative'
 
 
+# =====================================================
+# 🚀 LLM MODEL CONTEXT WINDOW CONFIGURATION
+# =====================================================
+LLM_MODEL_CONFIG = {
+    "microsoft/Phi-3-mini-4k-instruct": {
+        "context_window": 4096,
+        "description": "3.8GB - Fast, good quality",
+        "recommended_docs": 8  # 4k tokens allows ~8 docs with 500 chars each
+    },
+    "microsoft/Phi-3-mini-128k-instruct": {
+        "context_window": 131072,  # 128k tokens
+        "description": "3.8GB - Fast, massive context",
+        "recommended_docs": 50  # 128k tokens allows ~50+ docs with full context
+    },
+    "mistralai/Mistral-7B-Instruct-v0.2": {
+        "context_window": 8192,  # 8k tokens
+        "description": "14GB - Better quality",
+        "recommended_docs": 15  # 8k tokens allows ~15 docs
+    },
+    "HuggingFaceH4/zephyr-7b-beta": {
+        "context_window": 8192,  # 8k tokens
+        "description": "14GB - Good quality",
+        "recommended_docs": 15  # 8k tokens allows ~15 docs
+    },
+}
+
+def get_max_docs_for_model(model_name):
+    """Calculate optimal number of documents to use based on model's context window"""
+    if model_name not in LLM_MODEL_CONFIG:
+        return 8  # Default fallback
+    
+    config = LLM_MODEL_CONFIG[model_name]
+    return config["recommended_docs"]
+
+def get_max_tokens_for_model(model_name):
+    """Get the maximum token limit for a model"""
+    if model_name not in LLM_MODEL_CONFIG:
+        return 4096  # Default fallback
+    
+    config = LLM_MODEL_CONFIG[model_name]
+    return config["context_window"]
+
 # Set Streamlit to wide mode for better layout
 st.set_page_config(layout="wide", page_title="Complete BERTopic with All Features", page_icon="🚀")
 
@@ -416,22 +458,35 @@ def clean_documents_for_llm(docs, max_docs=50):
     return cleaned
 
 
-def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20):
+def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20, model_name=None):
     """
     Generate labels for multiple topics in a single LLM call
     
     IMPROVEMENTS:
-    - Shows 8 documents instead of 3 (more context)
-    - Shows 500 chars per document instead of 150 (full context)
-    - Samples diverse documents from beginning, middle, end (not just first 3)
+    - Dynamically adjusts document count based on model's context window
+    - Shows 500-600 chars per document for full context
+    - Samples diverse documents from beginning, middle, end
     - Better prompt emphasizing document CONTENT over keywords
     - Duplicate detection to ensure unique labels
+    
+    Args:
+        batch_data: List of topic data dicts
+        llm_model: Tuple of (model, tokenizer)
+        max_docs_per_topic: Max documents to analyze (calculated dynamically from context window)
+        max_topics_per_batch: Max topics per batch
+        model_name: Name of the LLM model (used for context window calculation)
     """
     if not batch_data or llm_model is None:
         return {}
     
     try:
         model, tokenizer = llm_model
+        
+        # ✅ Dynamically determine max_length based on model's context window
+        if model_name:
+            max_prompt_length = int(get_max_tokens_for_model(model_name) * 0.85)  # Use 85% for prompt, leave 15% for response
+        else:
+            max_prompt_length = 4096  # Default fallback
         
         topics_text = []
         for i, item in enumerate(batch_data[:max_topics_per_topic], 1):
@@ -529,8 +584,8 @@ Topic 3: [Specific customer need/issue]
 
 Your labels:"""
         
-        # ✅ IMPROVEMENT 5: More space for longer document context
-        inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=4096)
+        # ✅ IMPROVEMENT 5: Dynamic max_length based on model's context window
+        inputs = tokenizer(batch_prompt, return_tensors="pt", truncation=True, max_length=max_prompt_length)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
@@ -628,10 +683,18 @@ Your labels:"""
 class AdaptiveParallelLLMLabeler:
     """Production-ready parallel LLM labeler with adaptive batch sizing and detailed progress"""
     
-    def __init__(self, llm_model, system_params=None, max_docs_per_topic=8):
+    def __init__(self, llm_model, model_name=None, system_params=None, max_docs_per_topic=None):
         self.llm_model = llm_model
-        # ✅ Use at least 8 documents for better label quality
-        self.max_docs_per_topic = max(max_docs_per_topic, 8)
+        self.model_name = model_name
+        
+        # ✅ Calculate max_docs dynamically based on model's context window
+        if max_docs_per_topic is None and model_name:
+            self.max_docs_per_topic = get_max_docs_for_model(model_name)
+        elif max_docs_per_topic is None:
+            self.max_docs_per_topic = 8  # Default fallback
+        else:
+            # Use at least 8 documents for better label quality
+            self.max_docs_per_topic = max(max_docs_per_topic, 8)
         
         if system_params is None:
             system_params = SystemPerformanceDetector.detect_optimal_parameters()
@@ -723,7 +786,7 @@ class AdaptiveParallelLLMLabeler:
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_batch = {
-                executor.submit(generate_batch_labels_with_llm, batch, self.llm_model, self.max_docs_per_topic, self.batch_size): (batch_idx, batch)
+                executor.submit(generate_batch_labels_with_llm, batch, self.llm_model, self.max_docs_per_topic, self.batch_size, self.model_name): (batch_idx, batch)
                 for batch_idx, batch in enumerate(batches)
             }
             
@@ -1476,9 +1539,10 @@ def load_local_llm(model_name, force_cpu=False):
     3. Use appropriate precision for each device
     
     Recommended models:
-    - "microsoft/Phi-3-mini-4k-instruct" (3.8GB, fast, good for 16GB GPU)
-    - "mistralai/Mistral-7B-Instruct-v0.2" (14GB, better quality, needs 24GB+ GPU)
-    - "HuggingFaceH4/zephyr-7b-beta" (14GB, good quality, needs 20GB+ GPU)
+    - "microsoft/Phi-3-mini-4k-instruct" (3.8GB, fast, good for 16GB GPU, 8 docs)
+    - "microsoft/Phi-3-mini-128k-instruct" (3.8GB, fast, massive context, 50+ docs)
+    - "mistralai/Mistral-7B-Instruct-v0.2" (14GB, better quality, needs 24GB+ GPU, 15 docs)
+    - "HuggingFaceH4/zephyr-7b-beta" (14GB, good quality, needs 20GB+ GPU, 15 docs)
     """
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1535,7 +1599,7 @@ def load_local_llm(model_name, force_cpu=False):
             # Check if we have enough system RAM (need ~8GB minimum for 7B model)
             if system_ram_gb < 12:
                 st.error(f"❌ Insufficient system RAM ({system_ram_gb:.1f}GB). Need at least 12GB for CPU inference.")
-                st.info("💡 Consider using a smaller model like 'microsoft/Phi-3-mini-4k-instruct' (needs ~6GB)")
+                st.info("💡 Consider using Phi-3-mini-4k-instruct or Phi-3-mini-128k-instruct (needs ~6GB)")
                 return None
             
             try:
@@ -1586,7 +1650,7 @@ def load_local_llm(model_name, force_cpu=False):
         if "out of memory" in str(e).lower():
             st.error("💥 Out of memory error. Try one of these solutions:")
             st.markdown("""
-            1. **Use a smaller model**: Try 'microsoft/Phi-3-mini-4k-instruct' (only 3.8GB)
+            1. **Use a smaller model or Phi-128k**: Try 'microsoft/Phi-3-mini-4k-instruct' or 'microsoft/Phi-3-mini-128k-instruct' (only 3.8GB)
             2. **Force CPU mode**: Check 'Force CPU for LLM' in advanced settings
             3. **Free up memory**: Close other applications
             4. **Use Conservative profile**: Reduces memory usage
@@ -1628,12 +1692,13 @@ def make_human_label(topic_docs, fallback_keywords, max_len=70):
 class FastReclusterer:
     """Fast reclustering using pre-computed embeddings"""
 
-    def __init__(self, documents, embeddings, umap_embeddings=None):
+    def __init__(self, documents, embeddings, umap_embeddings=None, llm_model_name=None):
         self.documents = documents
         self.embeddings = embeddings
         self.umap_embeddings = umap_embeddings
         self.use_gpu = torch.cuda.is_available() and cuml_available
         self.llm_model = None  # Will be set if LLM labeling is enabled
+        self.llm_model_name = llm_model_name  # Store model name for dynamic doc count
 
     def recluster(self, n_topics, min_topic_size=10, use_reduced=True, method='kmeans'):
         """Quickly recluster documents into new topics"""
@@ -1757,11 +1822,20 @@ class FastReclusterer:
             
             # Create adaptive parallel labeler with memory profile
             system_params = SystemPerformanceDetector.detect_optimal_parameters(memory_profile)
+            
+            # ✅ Calculate optimal max_docs based on model's context window
+            max_docs = get_max_docs_for_model(self.llm_model_name) if self.llm_model_name else 8
+            
             labeler = AdaptiveParallelLLMLabeler(
                 llm_model=self.llm_model,
+                model_name=self.llm_model_name,
                 system_params=system_params,
-                max_docs_per_topic=8  # Increased for better quality
+                max_docs_per_topic=max_docs
             )
+            
+            # Show info about document selection
+            if self.llm_model_name and self.llm_model_name in LLM_MODEL_CONFIG:
+                st.info(f"📊 Using {max_docs} documents per topic (optimized for {self.llm_model_name.split('/')[-1]} context window)")
             
             # Generate all labels in parallel batches with adaptive sizing
             labels_dict = labeler.label_all_topics(
@@ -2182,14 +2256,18 @@ def main():
                 llm_model_name = None
                 force_llm_cpu = False
                 if use_llm_labeling:
+                    # Build model selection with context window info
+                    model_options = list(LLM_MODEL_CONFIG.keys())
+                    model_display_names = {
+                        name: f"{name.split('/')[-1]} - {config['description']} ({config['recommended_docs']} docs)"
+                        for name, config in LLM_MODEL_CONFIG.items()
+                    }
+                    
                     llm_model_name = st.selectbox(
                         "LLM Model",
-                        [
-                            "microsoft/Phi-3-mini-4k-instruct",  # 3.8GB - Fast, good quality
-                            "mistralai/Mistral-7B-Instruct-v0.2",  # 14GB - Better quality
-                            "HuggingFaceH4/zephyr-7b-beta",  # 14GB - Good quality
-                        ],
-                        help="Smaller models are faster. First load takes time to download."
+                        options=model_options,
+                        format_func=lambda x: model_display_names[x],
+                        help="Phi-128 can analyze 50+ documents per topic for maximum accuracy. First load takes time to download."
                     )
                     
                     # ✅ NEW: Force CPU option
@@ -2207,7 +2285,7 @@ def main():
                             st.warning(f"⚠️ Only {gpu_free:.1f}GB GPU memory free. Consider forcing CPU mode.")
                     
                     st.caption("⚠️ First-time download may be large (3-14GB). Model is cached after first use.")
-                    st.caption("💡 Phi-3 recommended for speed, Mistral for quality.")
+                    st.caption("💡 Phi-3-mini-4k: Recommended for speed (8 docs). Phi-3-mini-128k: Maximum accuracy (50+ docs).")
                     if force_llm_cpu:
                         st.caption("🔧 CPU mode: Needs ~12GB system RAM. Slower but doesn't use GPU memory.")
 
@@ -2294,12 +2372,14 @@ def main():
 
                 # Step 4: Create reclusterer
                 st.session_state.reclusterer = FastReclusterer(
-                    cleaned_docs, embeddings, umap_embeddings
+                    cleaned_docs, embeddings, umap_embeddings, 
+                    llm_model_name=llm_model_name if use_llm_labeling else None
                 )
                 
                 # Set LLM model if loaded
                 if llm_model:
                     st.session_state.reclusterer.llm_model = llm_model
+                    st.session_state.reclusterer.llm_model_name = llm_model_name
 
                 # Step 5: (optional) Seed words parsed
                 seed_topic_list = []
@@ -3031,8 +3111,14 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
         **🎯 Improved Human-Readable Labels**: Topic labels are now actual category names like "Customer Support" or "Marketing & Advertising" 
         instead of just keyword lists!
         
-        **⚡ Enhanced LLM Label Quality**: LLM now analyzes 8 full documents (500 chars each) from diverse positions in each topic, 
-        not just 3 truncated docs. This produces much more accurate, specific labels that reflect actual document content instead of just keywords.
+        **🚀 Phi-3-mini-128k Support**: Added support for Phi-3-mini-128k with massive 128k context window! This model can analyze 
+        50+ full documents per topic for maximum accuracy, while still being fast and efficient (only 3.8GB).
+        
+        **⚡ Dynamic Document Selection**: The system now automatically uses the optimal number of documents based on each model's 
+        context window. Phi-128k analyzes 50+ docs, while smaller context models use 8-15 docs.
+        
+        **⚡ Enhanced LLM Label Quality**: LLM analyzes diverse documents from beginning, middle, and end of each topic, 
+        not just the first few. This produces much more accurate, specific labels that reflect actual document content.
         
         **🚀 Memory Optimization Profiles**: Choose your speed vs. memory tradeoff! Select from Conservative (8GB RAM), Balanced (16GB), 
         Aggressive (32GB+), or Extreme (64GB+) profiles. Higher profiles load more into memory for dramatically faster processing.
