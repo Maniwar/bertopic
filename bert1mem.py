@@ -499,88 +499,115 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
             if not all_docs:
                 continue
             
-            # ✅ IMPROVEMENT 1: Sample DIVERSE documents (not just first 3)
-            # Take from beginning, middle, and end to get variety
+            # ✅ IMPROVEMENT 1: Sample DIVERSE documents with better strategy
+            # Take from beginning, middle, and end to get variety, plus ensure length diversity
             sample_docs = []
             if len(all_docs) <= max_docs_per_topic:
                 sample_docs = all_docs
             else:
-                # Sample diverse positions to capture topic breadth
+                # Sample diverse positions AND diverse lengths to capture topic breadth
                 import random
+                
+                # Always include some key positions
                 indices = [
-                    0,  # First doc
+                    0,  # First doc - often representative
                     len(all_docs) // 4,  # 25% through
                     len(all_docs) // 2,  # Middle
                     3 * len(all_docs) // 4,  # 75% through
                     len(all_docs) - 1,  # Last doc
                 ]
-                # Add more random ones if needed
+                
+                # Add more random ones with preference for varied lengths
                 remaining = max_docs_per_topic - len(indices)
                 if remaining > 0:
                     available = [idx for idx in range(len(all_docs)) if idx not in indices]
                     if available:
-                        indices.extend(random.sample(available, min(remaining, len(available))))
+                        # Sort by document length to get variety
+                        available_with_lens = [(idx, len(all_docs[idx])) for idx in available]
+                        available_with_lens.sort(key=lambda x: x[1])  # Sort by length
+                        
+                        # Sample from different length ranges for diversity
+                        step = max(1, len(available_with_lens) // remaining)
+                        selected = [available_with_lens[i*step][0] for i in range(min(remaining, len(available_with_lens)))]
+                        indices.extend(selected[:remaining])
                 
                 sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
             
-            # ✅ IMPROVEMENT 2: Show MORE content (600 chars, not 500!)
-            # This gives LLM actual context to understand the topic themes
+            # ✅ IMPROVEMENT 2: Show MORE content (600 chars) with document numbers
             docs_preview = "\n".join([
-                f"  Message {j+1}: {doc[:600]}{'...' if len(doc) > 600 else ''}" 
+                f"  Document {j+1}/{len(sample_docs)}: {doc[:600]}{'...' if len(doc) > 600 else ''}" 
                 for j, doc in enumerate(sample_docs)
             ])
             
-            # ✅ IMPROVEMENT 3: Structure that emphasizes actual content
+            # ✅ IMPROVEMENT 3: Better structure that emphasizes uniqueness
             topics_text.append(
                 f"\n{'='*70}\n"
-                f"TOPIC {i} (ID: {topic_id})\n"
+                f"TOPIC {i} (ID: {topic_id}) - {len(all_docs)} total documents in this topic\n"
                 f"{'='*70}\n"
-                f"Reference keywords: {keywords}\n"
+                f"Keywords (for reference): {keywords}\n"
                 f"\n"
-                f"ACTUAL USER MESSAGES:\n"
+                f"SAMPLE CUSTOMER MESSAGES (read carefully to identify SPECIFIC patterns):\n"
                 f"{docs_preview}\n"
+                f"\n"
+                f"What makes THIS topic unique? Look for:\n"
+                f"- Specific product/service names\n"
+                f"- Specific problems or requests\n" 
+                f"- Unique patterns not in other topics\n"
             )
         
-        # ✅ IMPROVEMENT 4: MUCH STRONGER prompt for anonymized customer support data
-        batch_prompt = f"""You are analyzing customer support messages. These messages have been anonymized for privacy (some words are removed). Your job is to create a SPECIFIC category name for each topic that describes what customers are actually asking about or trying to do.
+        # ✅ IMPROVEMENT 4: MUCH STRONGER prompt with better examples and explicit uniqueness requirements
+        batch_prompt = f"""You are an expert at analyzing customer support data and creating HIGHLY SPECIFIC, UNIQUE category names.
+
+TASK: Create a SHORT (3-6 words), SPECIFIC category name for each topic below that captures what makes it UNIQUE from other topics.
 
 CRITICAL RULES:
-1. READ THE MESSAGES CAREFULLY - understand the customer's actual intent/need
-2. IGNORE these generic words that appear everywhere: "editing", "order", "help", "question", "product", "entity_type"
-3. Focus on the SPECIFIC REQUEST, ISSUE, or PRODUCT mentioned in the messages
-4. Each label must be 3-6 words and describe the ACTUAL customer need
-5. Make labels VERY DISTINCT - avoid any repetitive patterns
-6. Be SPECIFIC about what product, service, or action is involved
+1. **BE ULTRA-SPECIFIC**: Use the actual products, actions, or issues mentioned in the messages
+2. **AVOID GENERIC WORDS**: Never use generic terms like "order", "question", "help", "product", "discount" ALONE
+3. **COMBINE SPECIFICS**: Use format like "[Specific Product/Action] + [Specific Issue/Request]"
+4. **MAKE EVERY LABEL UNIQUE**: If you see patterns repeating, ADD MORE DETAIL to differentiate
+5. **USE KEYWORDS FROM MESSAGES**: Pull specific terms from the actual customer messages
+6. **THINK LIKE A CUSTOMER**: What would someone search for to find this category?
 
-GOOD LABELS (specific, clear customer need):
-✓ "Student Discount Program Inquiries"
-✓ "Galaxy Phone Wireless Charging Issues"
-✓ "Refrigerator Return Policy Questions"
-✓ "Samsung Account Login Problems"
-✓ "Model Number Identification Help"
-✓ "Promotional Code Redemption Errors"
+EXCELLENT LABELS (specific, actionable, unique):
+✓ "Promo Code Redemption Errors"
+✓ "Galaxy Z Fold Screen Protector Installation"
+✓ "Student Discount Verification Process"
+✓ "Refrigerator Delivery Rescheduling"
+✓ "Trade-In Value Calculation Questions"
+✓ "Wireless Charger Compatibility Check"
+✓ "Order Status Tracking Issues"
+✓ "Military Discount Program Enrollment"
+✓ "Smart TV Remote Control Problems"
+✓ "Washing Machine Installation Service"
 
-BAD LABELS (too generic, repetitive):
-✗ "Editing Order Product" ← What product? What's the issue?
-✗ "Question Discounts Entity_type" ← Not specific enough
-✗ "Order Help" ← Help with what?
+TERRIBLE LABELS (too generic, not helpful):
+✗ "Discount Applying Order" ← Which discount? What issue?
 ✗ "Product Question" ← Which product? What question?
+✗ "Email About Discount" ← Too vague
+✗ "Order Help" ← Help with what exactly?
+✗ "Customer Support" ← Too broad
+✗ "Question Discounts" ← What kind of question?
 
-REMEMBER: These are REAL customer messages. Look for:
-- What product/service are they asking about?
-- What problem are they having?
-- What are they trying to accomplish?
+REMEMBER: You have 50 FULL DOCUMENTS per topic. Read them carefully to find:
+- What SPECIFIC product/service is mentioned most?
+- What SPECIFIC action/issue is the customer having?
+- What makes THIS topic different from others?
 
 {chr(10).join(topics_text)}
 
 {'='*70}
 
-Now create SPECIFIC category names. Ask yourself: "If I saw this topic name, would I know exactly what customers need help with?"
+Now create HIGHLY SPECIFIC, UNIQUE labels. Ask yourself for each:
+1. "Would two different topics ever get this same label?" → If YES, add more detail
+2. "Does this tell me the exact customer need?" → If NO, be more specific
+3. "Could I route this to the right support team?" → If NO, add product/issue details
 
-Format EXACTLY:
-Topic 1: [Specific customer need/issue]
-Topic 2: [Specific customer need/issue]
-Topic 3: [Specific customer need/issue]
+CRITICAL: Each label must be COMPLETELY DIFFERENT from all others. If topics seem similar, find what makes each unique.
+
+Format EXACTLY (one label per line):
+Topic 1: [Highly Specific Label]
+Topic 2: [Completely Different Specific Label]
+Topic 3: [Another Unique Specific Label]
 
 Your labels:"""
         
@@ -592,11 +619,13 @@ Your labels:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=250,  # More space for quality labels
-                temperature=0.3,     # Lower for more focused, less random output
+                max_new_tokens=300,  # More space for detailed labels
+                temperature=0.2,     # LOWER: More focused, less random
                 do_sample=True,
-                top_p=0.75,          # Narrower for better quality
-                repetition_penalty=1.8,  # ✅ MUCH HIGHER: Strongly discourage repetition
+                top_p=0.85,          # Slightly higher for some diversity
+                top_k=40,            # Add top_k to prevent too much randomness
+                repetition_penalty=2.2,  # ✅ MUCH HIGHER: Strongly discourage repetition
+                no_repeat_ngram_size=3,  # ✅ NEW: Prevent repeating 3-word phrases
                 pad_token_id=tokenizer.eos_token_id
             )
         
@@ -613,24 +642,72 @@ Your labels:"""
         labels_dict = {}
         lines = response.strip().split('\n')
         
-        # ✅ Expanded invalid patterns
+        # ✅ Expanded invalid patterns - be MUCH more aggressive
         invalid_patterns = [
             '[label]', '[your', 'your label', 'descriptive label', 
             'label here', 'topic name', '[insert', 'placeholder',
             'based on', '[', ']',  # Reject anything with brackets
             'entity_type', 'entity type',  # Reject sanitization artifacts
             'customer need', 'customer issue',  # Reject prompt echoes
+            'specific label', 'unique label',  # Reject meta-text
         ]
         
-        # ✅ NEW: Aggressive generic pattern rejection
-        generic_starts = [
-            'editing order', 'question discounts', 'question about', 'help with',
-            'order help', 'order product', 'product question', 'product help',
-            'existing order', 'question ', 'help ', 'order ', 'product '
+        # ✅ MUCH MORE AGGRESSIVE: Reject overly generic patterns
+        generic_patterns = [
+            # Single generic words (reject if label is ONLY these)
+            'question', 'help', 'order', 'product', 'discount', 'email',
+            'issue', 'problem', 'request', 'inquiry', 'support',
+            # Common but too vague combinations
+            'order help', 'product question', 'discount question',
+            'email question', 'help with', 'question about',
+            # Repetitive patterns from your screenshot
+            'discount applying', 'applying order', 'discounts email',
+            'question discounts', 'question buy', 'buy help'
         ]
         
-        # Track seen labels to avoid duplicates
+        # Track seen labels AND their word sets to avoid near-duplicates
         seen_labels = set()
+        seen_word_sets = []
+        rejection_counts = {
+            'placeholder': 0,
+            'generic': 0,
+            'duplicate': 0,
+            'near_duplicate': 0,
+            'not_specific': 0,
+            'accepted': 0
+        }
+        
+        def is_too_similar_to_existing(new_label, seen_word_sets, threshold=0.6):
+            """Check if label is too similar to already-seen labels"""
+            new_words = set(new_label.lower().split())
+            
+            for existing_words in seen_word_sets:
+                # Calculate Jaccard similarity
+                intersection = len(new_words & existing_words)
+                union = len(new_words | existing_words)
+                if union > 0:
+                    similarity = intersection / union
+                    if similarity > threshold:
+                        return True
+            return False
+        
+        def has_sufficient_specificity(label):
+            """Check if label has enough specific/unique content"""
+            words = label.lower().split()
+            
+            # Need at least 3 words for specificity
+            if len(words) < 3:
+                return False
+            
+            # Count "generic" vs "specific" words
+            generic_words = {'order', 'question', 'help', 'product', 'discount', 
+                           'email', 'issue', 'problem', 'request', 'about', 
+                           'inquiry', 'support', 'customer', 'service'}
+            
+            specific_count = sum(1 for w in words if w not in generic_words and len(w) > 2)
+            
+            # Need at least 2 specific words
+            return specific_count >= 2
         
         for line in lines:
             line = line.strip()
@@ -646,32 +723,92 @@ Your labels:"""
                     label = parts[1].strip().strip('"\'.,;')
                     label_lower = label.lower()
                     
-                    # Reject placeholder text
+                    # ✅ VALIDATION 1: Reject placeholder text
                     is_placeholder = any(pattern in label_lower for pattern in invalid_patterns)
                     
-                    # ✅ NEW: Reject generic starts
-                    is_generic = any(label_lower.startswith(start) for start in generic_starts)
+                    # ✅ VALIDATION 2: Reject generic patterns
+                    is_generic = any(pattern in label_lower for pattern in generic_patterns)
                     
-                    # Reject duplicates
+                    # ✅ VALIDATION 3: Reject exact duplicates
                     is_duplicate = label_lower in seen_labels
                     
-                    # ✅ NEW: Require meaningful word count
+                    # ✅ VALIDATION 4: Check word count
                     word_count = len(label.split())
                     
+                    # ✅ VALIDATION 5: Check for near-duplicates (new!)
+                    is_near_duplicate = is_too_similar_to_existing(label, seen_word_sets, threshold=0.6)
+                    
+                    # ✅ VALIDATION 6: Check specificity (new!)
+                    is_specific_enough = has_sufficient_specificity(label)
+                    
                     if 1 <= topic_num <= len(batch_data):
-                        # ✅ STRICTER validation: longer, more words, not generic
-                        if (15 <= len(label) <= 80 and 
-                            3 <= word_count <= 8 and 
-                            not is_placeholder and
-                            not is_duplicate and
-                            not is_generic):
-                            
+                        # ✅ MUCH STRICTER validation with tracking
+                        if is_placeholder:
+                            rejection_counts['placeholder'] += 1
+                        elif is_generic:
+                            rejection_counts['generic'] += 1
+                        elif is_duplicate:
+                            rejection_counts['duplicate'] += 1
+                        elif is_near_duplicate:
+                            rejection_counts['near_duplicate'] += 1
+                        elif not is_specific_enough:
+                            rejection_counts['not_specific'] += 1
+                        elif (15 <= len(label) <= 80 and 3 <= word_count <= 8):
                             actual_topic_id = batch_data[topic_num - 1]['topic_id']
                             labels_dict[actual_topic_id] = label
                             seen_labels.add(label_lower)
+                            seen_word_sets.append(set(label_lower.split()))
+                            rejection_counts['accepted'] += 1
                             
             except (ValueError, IndexError):
                 continue
+        
+        # ✅ POST-PROCESSING: Improve any labels that are still too generic
+        def improve_generic_label(label, keywords):
+            """If label is still generic, try to make it more specific using keywords"""
+            label_lower = label.lower()
+            
+            # Check if label is still too generic
+            generic_words = {'question', 'help', 'order', 'product', 'discount', 
+                           'email', 'issue', 'problem', 'request', 'inquiry'}
+            label_words = set(label_lower.split())
+            
+            # If label is mostly generic words, enhance with keywords
+            generic_count = len(label_words & generic_words)
+            if generic_count >= len(label_words) - 1:  # Almost all generic
+                # Extract most specific keywords
+                kw_words = [kw.strip() for kw in keywords.split(',')[:4]]
+                specific_kws = [kw for kw in kw_words if kw.lower() not in generic_words]
+                
+                if specific_kws:
+                    # Create better label using keywords
+                    improved = ' '.join(specific_kws[:3]).title()
+                    if len(improved) >= 10:
+                        return improved
+            
+            return label
+        
+        # Apply improvements to all labels
+        for topic_id, label in labels_dict.items():
+            # Find keywords for this topic
+            topic_keywords = None
+            for item in batch_data:
+                if item['topic_id'] == topic_id:
+                    topic_keywords = item['keywords']
+                    break
+            
+            if topic_keywords:
+                improved = improve_generic_label(label, topic_keywords)
+                if improved != label:
+                    labels_dict[topic_id] = improved
+        
+        # ✅ DEBUG: Log rejection statistics (commented out for production, uncomment for debugging)
+        # import streamlit as st
+        # if rejection_counts['generic'] > 0 or rejection_counts['near_duplicate'] > 0:
+        #     st.warning(f"⚠️ Label Quality: Rejected {rejection_counts['generic']} generic, "
+        #                f"{rejection_counts['near_duplicate']} near-duplicates, "
+        #                f"{rejection_counts['not_specific']} not-specific. "
+        #                f"Accepted: {rejection_counts['accepted']}")
         
         return labels_dict
         
