@@ -23,7 +23,7 @@ except ImportError:
 from bertopic import BERTopic
 from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance
 from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.cluster import KMeans
 
 # Try to import GPU-accelerated libraries
@@ -475,6 +475,79 @@ class SafeEmbeddingModel:
         return full_embeddings
 
 # -----------------------------------------------------
+# HUMAN-READABLE TOPIC LABELS
+# -----------------------------------------------------
+def _top_phrases(texts, ngram_range=(2,3), top_k=3, max_features=5000):
+    """Return top_k high-signal phrases from texts using TF-IDF (prefers bigrams/trigrams)."""
+    if not texts:
+        return []
+    try:
+        vec = TfidfVectorizer(
+            ngram_range=ngram_range,
+            max_features=max_features,
+            stop_words="english",
+            min_df=2
+        )
+        X = vec.fit_transform(texts)
+        scores = np.asarray(X.sum(axis=0)).ravel()
+        vocab = np.array(vec.get_feature_names_out())
+        order = np.argsort(scores)[::-1]
+        phrases = [vocab[i] for i in order[:top_k]]
+        return phrases
+    except Exception:
+        return []
+
+def _to_title(label):
+    """Title-case but keep common abbreviations uppercased."""
+    keep_upper = {"AI","ML","NLP","API","SQL","GPU","CPU","FAQ","KPI","OKR","CRM"}
+    words = label.replace("_"," ").split()
+    nice = []
+    for w in words:
+        w_clean = re.sub(r"[^A-Za-z0-9\-]+", "", w)
+        if not w_clean:
+            continue
+        if w_clean.upper() in keep_upper:
+            nice.append(w_clean.upper())
+        else:
+            if w_clean.lower() in {"and","or","of","in","on","for","to","a","the","an","with","by","at","from"}:
+                nice.append(w_clean.lower())
+            else:
+                nice.append(w_clean.capitalize())
+    label = " ".join(nice)
+    label = re.sub(r"\s{2,}", " ", label).strip(" -–—")
+    return label
+
+def make_human_label(topic_docs, fallback_keywords, max_len=60):
+    """
+    Build a pleasant, human-readable topic label:
+    1) Prefer bigram/trigram TF-IDF phrases; fallback to unigrams/keywords.
+    2) Title-case & clean punctuation.
+    """
+    phrases = _top_phrases(topic_docs, (2,3), top_k=3)
+    if len(phrases) < 2:
+        phrases += _top_phrases(topic_docs, (1,1), top_k=3)
+
+    # clean and unique
+    seen = set()
+    cleaned = []
+    for p in phrases:
+        p = re.sub(r"\s+", " ", p.strip())
+        if p and p.lower() not in seen:
+            cleaned.append(p)
+            seen.add(p.lower())
+
+    if not cleaned:
+        cleaned = [k.strip() for k in (fallback_keywords.split(",") if isinstance(fallback_keywords, str) else []) if k.strip()][:3]
+        if not cleaned:
+            cleaned = ["General Topic"]
+
+    label = " • ".join(cleaned[:3])
+    label = _to_title(label)
+    if len(label) > max_len:
+        label = label[:max_len].rstrip() + "…"
+    return label
+
+# -----------------------------------------------------
 # FAST RECLUSTERING ENGINE
 # -----------------------------------------------------
 class FastReclusterer:
@@ -541,11 +614,10 @@ class FastReclusterer:
         return topics, topic_info
 
     def _extract_topic_keywords(self, topics, top_n_words=10):
-        """Extract keywords for each topic"""
+        """Extract keywords and generate human-readable labels for each topic."""
         topics_dict = {}
         for idx, topic in enumerate(topics):
-            if topic not in topics_dict:
-                topics_dict[topic] = []
+            topics_dict.setdefault(topic, [])
             if idx < len(self.documents):
                 topics_dict[topic].append(self.documents[idx])
 
@@ -556,42 +628,41 @@ class FastReclusterer:
                     'Topic': -1,
                     'Count': len(topics_dict[-1]),
                     'Keywords': 'Outliers',
+                    'Human_Label': 'Outliers',
                     'Name': 'Outliers'
                 })
                 continue
 
             topic_docs = topics_dict[topic_id]
 
+            # --- keywords (simple, fast) ---
             try:
                 sample_size = min(100, len(topic_docs))
                 topic_text = ' '.join(topic_docs[:sample_size])
 
                 words = topic_text.lower().split()
                 word_counts = Counter(words)
-
-                common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-                                'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-                                'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                                'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'it', 'this',
-                                'that', 'these', 'those', 'i', 'you', 'he', 'she', 'we', 'they'}
-
-                filtered_counts = {w: c for w, c in word_counts.items()
-                                   if w not in common_words and len(w) > 2}
-
-                top_words = sorted(filtered_counts.items(), key=lambda x: x[1], reverse=True)[:top_n_words]
-                keywords = [word for word, _ in top_words]
-
-                if not keywords:
-                    keywords = ['topic', str(topic_id)]
-
+                common_words = {'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','as',
+                                'is','was','are','were','be','have','has','had','do','does','did','will','would','could',
+                                'should','may','might','must','shall','can','need','it','this','that','these','those',
+                                'i','you','he','she','we','they'}
+                filtered = {w: c for w, c in word_counts.items() if w not in common_words and len(w) > 2}
+                top_words = sorted(filtered.items(), key=lambda x: x[1], reverse=True)[:top_n_words]
+                keywords = [w for w, _ in top_words] or ['topic', str(topic_id)]
             except Exception:
                 keywords = [f'topic_{topic_id}']
+
+            keywords_str = ', '.join(keywords[:5])
+
+            # --- human label (pleasant, concise) ---
+            human_label = make_human_label(topic_docs, keywords_str)
 
             topic_info_list.append({
                 'Topic': topic_id,
                 'Count': len(topic_docs),
-                'Keywords': ', '.join(keywords[:5]),
-                'Name': f"Topic {topic_id}: {', '.join(keywords[:3])}"
+                'Keywords': keywords_str,
+                'Human_Label': human_label,
+                'Name': human_label  # keep compatibility with UI
             })
 
         return pd.DataFrame(topic_info_list)
@@ -717,6 +788,10 @@ def main():
         st.session_state.gpu_used = False
     if 'text_col' not in st.session_state:
         st.session_state.text_col = None
+    if 'browser_df' not in st.session_state:
+        st.session_state.browser_df = None
+    if 'topic_human' not in st.session_state:
+        st.session_state.topic_human = {}
 
     # Check GPU capabilities
     gpu_capabilities = check_gpu_capabilities()
@@ -1040,6 +1115,28 @@ def main():
                 include_outliers=False
             )
 
+            # Build browser-ready dataframe aligned to original CSV (full file + metadata)
+            browser_df = st.session_state.df.copy()
+            full_topics = np.full(len(browser_df), -1)
+            for i, valid_idx in enumerate(st.session_state.valid_indices):
+                if i < len(topics):
+                    full_topics[valid_idx] = topics[i]
+            browser_df['Topic'] = full_topics
+            browser_df['Topic_Label'] = np.where(browser_df['Topic'] == -1, "Outlier",
+                                                 "Topic " + browser_df['Topic'].astype(str))
+            # human labels / keywords
+            topic_human = {}
+            for _, row in topic_info.iterrows():
+                topic_human[row['Topic']] = row['Human_Label']
+            topic_keywords_map = {}
+            for _, row in topic_info.iterrows():
+                topic_keywords_map[row['Topic']] = row['Keywords']
+            browser_df['Topic_Human_Label'] = browser_df['Topic'].map(topic_human).fillna(browser_df['Topic_Label'])
+            browser_df['Topic_Keywords'] = browser_df['Topic'].map(topic_keywords_map).fillna('N/A')
+            browser_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(browser_df))]
+            st.session_state.browser_df = browser_df
+            st.session_state.topic_human = topic_human
+
             # Metrics display
             st.header("📊 Results Summary")
 
@@ -1067,7 +1164,7 @@ def main():
                 "📈 Distribution Analysis",
                 "🔍 Split Large Topics",
                 "🗺️ Interactive Visualization",
-                "📄 Document Explorer",
+                "📄 Topic Browser",
                 "💾 Export"
             ])
 
@@ -1075,23 +1172,14 @@ def main():
                 st.subheader("Topic Information")
 
                 display_df = topic_info.copy()
-                display_df = display_df[display_df['Topic'] != -1] if -1 in display_df['Topic'].values else display_df
+                if -1 in display_df['Topic'].values:
+                    display_df = display_df[display_df['Topic'] != -1]
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
+                display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
 
-                def highlight_oversized(row):
-                    if row['Percentage'] > 30:
-                        return ['background-color: #ffcccc'] * len(row)
-                    elif row['Percentage'] > 20:
-                        return ['background-color: #fff4cc'] * len(row)
-                    elif row['Percentage'] < 2:
-                        return ['background-color: #ccf4ff'] * len(row)
-                    else:
-                        return [''] * len(row)
-
-                styled_df = display_df.style.apply(highlight_oversized, axis=1)
-                st.dataframe(styled_df, use_container_width=True)
-
-                st.caption("🔴 Red: >30% (Too Large) | 🟡 Yellow: >20% (Large) | 🔵 Blue: <2% (Small)")
+                # Use Streamlit default dataframe (dark-mode friendly)
+                st.dataframe(display_df, use_container_width=True)
+                st.caption("Tip: Use the column header menus to sort/filter. Dark-mode friendly.")
 
             with tabs[1]:  # Distribution Analysis
                 st.subheader("📈 Topic Distribution Analysis")
@@ -1099,7 +1187,9 @@ def main():
                 # Prepare data for visualization
                 viz_df = pd.DataFrame(Counter([t for t in topics if t != -1]).items(), columns=['Topic', 'Count'])
                 viz_df = viz_df.sort_values('Count', ascending=False)
-                viz_df['Topic_Label'] = viz_df['Topic'].apply(lambda x: f"Topic {x}")
+                viz_df['Topic_Label'] = viz_df['Topic'].apply(
+                    lambda x: st.session_state.topic_human.get(x, f"Topic {x}")
+                )
 
                 # Bar chart
                 fig = px.bar(viz_df, x='Topic_Label', y='Count',
@@ -1223,9 +1313,10 @@ def main():
                         viz_df['X'] = coords[:, 0]
                         viz_df['Y'] = coords[:, 1]
 
-                    viz_df['Topic_Label'] = viz_df['Topic'].apply(
-                        lambda x: f"Topic {x}" if x != -1 else "Outliers"
-                    )
+                    viz_df['Topic_Label'] = [
+                        st.session_state.topic_human.get(t, f"Topic {t}") if t != -1 else "Outliers"
+                        for t in viz_df['Topic']
+                    ]
 
                     # Sample for performance if too many points
                     if len(viz_df) > 5000:
@@ -1246,47 +1337,97 @@ def main():
                 else:
                     st.info("Need at least 2 topics for visualization")
 
-            with tabs[4]:  # Document Explorer
-                st.subheader("📄 Document Explorer")
+            with tabs[4]:  # Topic Browser
+                st.subheader("📄 Topic Browser (Fast Skimming)")
 
-                topic_options = [f"Topic {t}" for t in sorted(set(topics)) if t != -1]
-                if -1 in topics:
-                    topic_options.append("Outliers")
+                browser_df = st.session_state.browser_df.copy()
+                text_col = st.session_state.text_col or (st.session_state.df.columns[0] if len(st.session_state.df.columns) else None)
 
-                selected_topic_str = st.selectbox("Select topic to explore", topic_options)
+                # Controls row
+                c1, c2, c3 = st.columns([2, 2, 1])
 
-                if selected_topic_str == "Outliers":
-                    selected_topic = -1
+                # Topic multi-select (human labels)
+                topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_values(ascending=False)
+                topic_choices = [
+                    f"{tid} — {st.session_state.topic_human.get(tid, f'Topic {tid}')} ({topic_counts.get(tid, 0)} docs)"
+                    for tid in topic_counts.index.tolist()
+                ]
+                with c1:
+                    selected_topics = st.multiselect(
+                        "Choose topics",
+                        options=topic_choices + (["Outliers (noise)"] if -1 in topics else []),
+                        default=topic_choices[:5] if len(topic_choices) > 0 else (["Outliers (noise)"] if -1 in topics else []),
+                        help="Select one or more topics to view"
+                    )
+
+                # Text filter
+                with c2:
+                    text_query = st.text_input(
+                        f"Filter by text ({text_col})",
+                        value="",
+                        placeholder="Type to filter rows by substring (case-insensitive)"
+                    )
+
+                # Truncate toggle
+                with c3:
+                    truncate = st.checkbox("Truncate text", value=True)
+
+                # Resolve selected topic IDs
+                selected_ids = set()
+                show_outliers = False
+                for s in selected_topics:
+                    if s == "Outliers (noise)":
+                        show_outliers = True
+                        continue
+                    try:
+                        tid = int(s.split(" — ")[0])
+                        selected_ids.add(tid)
+                    except Exception:
+                        pass
+
+                # Apply topic filter
+                if selected_ids or show_outliers:
+                    mask = False
+                    if selected_ids:
+                        mask = browser_df['Topic'].isin(list(selected_ids))
+                    if show_outliers:
+                        mask = mask | (browser_df['Topic'] == -1) if isinstance(mask, pd.Series) else (browser_df['Topic'] == -1)
+                    view_df = browser_df[mask].copy()
                 else:
-                    selected_topic = int(selected_topic_str.replace("Topic ", ""))
+                    view_df = browser_df.copy()
 
-                topic_docs = [doc for doc, t in zip(st.session_state.documents, topics) if t == selected_topic]
+                # Apply text filter on the chosen text column (if available)
+                if text_col and text_query.strip():
+                    view_df = view_df[view_df[text_col].astype(str).str.contains(text_query, case=False, na=False)].copy()
 
-                st.write(f"**Showing documents from {selected_topic_str} (Total: {len(topic_docs)})**")
+                # Optionally truncate text for skimming speed
+                if text_col and truncate:
+                    view_df[text_col] = view_df[text_col].astype(str).str.slice(0, 500)
 
-                # Display sample documents
-                for i, doc in enumerate(topic_docs[:10]):
-                    with st.expander(f"Document {i+1}"):
-                        st.write(doc[:500] + "..." if len(doc) > 500 else doc)
+                # Put topic metadata columns up front
+                meta_cols = ['Topic', 'Topic_Label', 'Topic_Human_Label', 'Topic_Keywords', 'Valid_Document']
+                ordered_cols = [c for c in meta_cols if c in view_df.columns] + [c for c in view_df.columns if c not in meta_cols]
+                view_df = view_df[ordered_cols]
+
+                st.caption("Tip: Use the column header menus to sort/filter; everything is dark-mode friendly.")
+                st.dataframe(view_df, use_container_width=True)
+
+                # Small summary line
+                st.write(f"Showing **{len(view_df):,}** rows")
+
+                # Download filtered view
+                st.download_button(
+                    label="📥 Download filtered view (CSV)",
+                    data=view_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"topic_browser_filtered_{st.session_state.uploaded_file_name}.csv",
+                    mime="text/csv"
+                )
 
             with tabs[5]:  # Export
                 st.subheader("💾 Export Results")
 
-                # Prepare full export dataframe
-                export_df = st.session_state.df.copy()
-
-                # Map topics back to original indices
-                full_topics = np.full(len(export_df), -1)
-                for i, valid_idx in enumerate(st.session_state.valid_indices):
-                    if i < len(topics):
-                        full_topics[valid_idx] = topics[i]
-
-                export_df['Topic'] = full_topics
-                export_df['Topic_Label'] = [f"Topic {t}" if t != -1 else "Outlier" for t in full_topics]
-                export_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(export_df))]
-
-                # Add keywords
-                export_df['Topic_Keywords'] = export_df['Topic'].map(topic_keywords).fillna('N/A')
+                # Prepare full export dataframe (reuse the browser_df we already built)
+                export_df = st.session_state.browser_df.copy()
 
                 col1, col2, col3 = st.columns(3)
 
@@ -1296,16 +1437,16 @@ def main():
                         data=convert_df_to_csv(export_df),
                         file_name=f"bertopic_results_{st.session_state.uploaded_file_name}_{n_topics_slider}topics.csv",
                         mime="text/csv",
-                        help="Full dataset with topic assignments"
+                        help="Full dataset with topic assignments and human labels"
                     )
 
                 with col2:
                     st.download_button(
                         label="📥 Download Topic Info (CSV)",
-                        data=convert_df_to_csv(topic_info),
+                        data=convert_df_to_csv(topic_info[['Topic','Human_Label','Keywords','Count']]),
                         file_name=f"topic_info_{st.session_state.uploaded_file_name}_{n_topics_slider}topics.csv",
                         mime="text/csv",
-                        help="Topic descriptions and statistics"
+                        help="Topic descriptions and statistics (with human labels)"
                     )
 
                 with col3:
@@ -1319,13 +1460,14 @@ Outliers: {outlier_count} ({100-coverage:.1f}%)
 Coverage: {coverage:.1f}%
 Min Topic Size: {st.session_state.get('min_topic_size_used', 'N/A')}
 GPU Used: {gpu_capabilities['cuda_available']}
-Clustering Method: {clustering_method}
+Clustering Method: {st.session_state.clustering_method}
+Human Labels: Auto-generated using TF-IDF phrase scoring
 Balance Status: {'Balanced' if balance_analysis['balanced'] else 'Needs Attention'}
 Oversized Categories: {len(balance_analysis['oversized_topics'])}
 """
                     st.download_button(
                         label="📥 Download Report (TXT)",
-                        data=summary,
+                        data=summary.encode("utf-8"),
                         file_name=f"report_{st.session_state.uploaded_file_name}_{n_topics_slider}topics.txt",
                         mime="text/plain",
                         help="Summary report"
