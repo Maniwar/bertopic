@@ -1,3 +1,24 @@
+NameError: name 'make_human_label' is not defined
+Traceback:
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1804, in <module>
+    main()
+    ~~~~^^
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1258, in main
+    topics, topic_info = st.session_state.reclusterer.recluster(
+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        n_topics=n_topics_slider,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        method=method
+        ^^^^^^^^^^^^^
+    )
+    ^
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 717, in recluster
+    else:
+File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 763, in _extract_topic_keywords
+    'Human_Label': 'Outliers',
+          ^^^^^^^^^^^^^^^^
+
 import streamlit as st
 import pandas as pd
 import torch
