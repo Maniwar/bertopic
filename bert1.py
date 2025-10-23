@@ -1,9 +1,3 @@
-Script execution error
-File "C:\Users\m.berenji\Desktop\To Move\git\NLP Scripts\bert1.py", line 1378
-                          f"Topic {t['topic']}: {st.session_state.topic_human.get(t['topic'], f\"Topic {t['topic']}\")} - {t['count']} docs ({t['ratio']*100:.1f}%)"
-                                                                                                ^
-SyntaxError: unexpected character after line continuation character
-
 import streamlit as st
 import pandas as pd
 import torch
@@ -1381,7 +1375,7 @@ def main():
                     st.warning(f"Found {len(balance_analysis['oversized_topics'])} oversized topic(s)")
 
                     oversized_options = [
-                        f"Topic {t['topic']}: {st.session_state.topic_human.get(t['topic'], f\"Topic {t['topic']}\")} - {t['count']} docs ({t['ratio']*100:.1f}%)"
+                        f"Topic {t['topic']}: {st.session_state.topic_human.get(t['topic'], 'Topic ' + str(t['topic']))} - {t['count']} docs ({t['ratio']*100:.1f}%)"
                         for t in balance_analysis['oversized_topics']
                     ]
 
