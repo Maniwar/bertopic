@@ -1743,4 +1743,4 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                             st.write(f"{icon} {key.replace('_available', '').title()}")
 
 if __name__ == "__main__":
-    main()
+    main(
