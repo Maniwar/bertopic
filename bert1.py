@@ -474,16 +474,10 @@ class SafeEmbeddingModel:
 
         return full_embeddings
 
+
 # -----------------------------------------------------
 # IMPROVED HUMAN-READABLE TOPIC LABELS
 # -----------------------------------------------------
-# IMPROVED HUMAN-READABLE LABEL GENERATION
-# This replaces the old _infer_category_name and make_human_label functions
-
-import re
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-
 def _top_phrases(texts, ngram_range=(2,3), top_k=5, max_features=5000):
     """Return top_k high-signal phrases from texts using TF-IDF (prefers bigrams/trigrams)."""
     if not texts:
@@ -651,6 +645,39 @@ def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
     # Fallback: Single best available
     if clean_phrases_23:
         return _to_title_case(clean_phrases_23[0][:max_len])
+    if clean_phrases_1:
+        return _to_title_case(' '.join(clean_phrases_1[:3])[:max_len])
+    if keyword_list:
+        return _to_title_case(' '.join(keyword_list[:3])[:max_len])
+    
+    return "Miscellaneous Topic"
+
+def make_human_label(topic_docs, fallback_keywords, max_len=70):
+    """
+    Build a unique, descriptive topic label based on the actual content.
+    
+    Examples of output:
+    - "Product Launch Strategy & Marketing"
+    - "Customer Service Response Times"
+    - "Technical Documentation Updates"
+    - "Sales Pipeline Management"
+    - "Employee Onboarding Process"
+    
+    NOT generic categories like "Customer Support" or "Marketing"
+    """
+    # Extract phrases using TF-IDF with different n-gram ranges
+    phrases_23 = _top_phrases(topic_docs, (2, 3), top_k=5)  # Bigrams and trigrams
+    phrases_1 = _top_phrases(topic_docs, (1, 1), top_k=10)   # Unigrams
+    
+    # Create the descriptive label
+    label = _create_descriptive_label(phrases_23, phrases_1, fallback_keywords, max_len)
+    
+    # Final cleanup
+    label = re.sub(r'\s+', ' ', label).strip()
+    if len(label) > max_len:
+        label = label[:max_len].rstrip() + "…"
+    
+    return label
 
 # -----------------------------------------------------
 # FAST RECLUSTERING ENGINE
