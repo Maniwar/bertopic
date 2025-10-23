@@ -972,9 +972,13 @@ def main():
         st.session_state.browser_df = None
     if 'topic_human' not in st.session_state:
         st.session_state.topic_human = {}
+    if 'last_topics_hash' not in st.session_state:
+        st.session_state.last_topics_hash = None
 
-    # Check GPU capabilities
-    gpu_capabilities = check_gpu_capabilities()
+    # Check GPU capabilities (cached in session state to avoid repeated checks)
+    if 'gpu_capabilities' not in st.session_state:
+        st.session_state.gpu_capabilities = check_gpu_capabilities()
+    gpu_capabilities = st.session_state.gpu_capabilities
 
     # Sidebar Configuration
     with st.sidebar:
@@ -1313,22 +1317,42 @@ def main():
                 include_outliers=False
             )
 
-            # Build browser-ready dataframe aligned to original CSV (full file + metadata)
-            browser_df = st.session_state.df.copy()
-            full_topics = np.full(len(browser_df), -1)
-            for i, valid_idx in enumerate(st.session_state.valid_indices):
-                if i < len(topics):
-                    full_topics[valid_idx] = topics[i]
-            browser_df['Topic'] = full_topics
-            browser_df['Topic_Label'] = np.where(browser_df['Topic'] == -1, "Outlier",
-                                                 "Topic " + browser_df['Topic'].astype(str))
-            # human labels / keywords
-            st.session_state.topic_human = topic_human
-            topic_keywords_map = topic_keywords
-            browser_df['Topic_Human_Label'] = browser_df['Topic'].map(st.session_state.topic_human).fillna(browser_df['Topic_Label'])
-            browser_df['Topic_Keywords'] = browser_df['Topic'].map(topic_keywords_map).fillna('N/A')
-            browser_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(browser_df))]
-            st.session_state.browser_df = browser_df
+            # Build browser-ready dataframe ONLY ONCE (not on every rerun!)
+            # Check if we need to rebuild (topics changed or browser_df doesn't exist)
+            rebuild_browser = False
+            if 'browser_df' not in st.session_state or st.session_state.browser_df is None:
+                rebuild_browser = True
+            elif 'last_topics_hash' not in st.session_state:
+                rebuild_browser = True
+            else:
+                # Check if topics changed by comparing hash
+                current_hash = hash(tuple(topics))
+                if st.session_state.last_topics_hash != current_hash:
+                    rebuild_browser = True
+            
+            if rebuild_browser:
+                # Only rebuild when necessary
+                browser_df = st.session_state.df.copy()
+                full_topics = np.full(len(browser_df), -1)
+                for i, valid_idx in enumerate(st.session_state.valid_indices):
+                    if i < len(topics):
+                        full_topics[valid_idx] = topics[i]
+                browser_df['Topic'] = full_topics
+                browser_df['Topic_Label'] = np.where(browser_df['Topic'] == -1, "Outlier",
+                                                     "Topic " + browser_df['Topic'].astype(str))
+                # human labels / keywords
+                st.session_state.topic_human = topic_human
+                topic_keywords_map = topic_keywords
+                browser_df['Topic_Human_Label'] = browser_df['Topic'].map(st.session_state.topic_human).fillna(browser_df['Topic_Label'])
+                browser_df['Topic_Keywords'] = browser_df['Topic'].map(topic_keywords_map).fillna('N/A')
+                browser_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(browser_df))]
+                
+                # Cache in session state
+                st.session_state.browser_df = browser_df
+                st.session_state.last_topics_hash = hash(tuple(topics))
+            else:
+                # Use cached version - no expensive operations!
+                st.session_state.topic_human = topic_human  # Update labels (cheap)
 
             # Metrics display
             st.header("📊 Results Summary")
@@ -1536,21 +1560,30 @@ def main():
                 browser_df = st.session_state.browser_df
                 text_col = st.session_state.text_col or (st.session_state.df.columns[0] if len(st.session_state.df.columns) else None)
 
-                # Simple dropdown for topic selection
-                topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_index()
-                
-                # Build topic options with human labels
-                topic_options = {}
-                topic_options["All Topics"] = "all"
-                
-                for tid in sorted(topic_counts.index):
-                    count = topic_counts.get(tid, 0)
-                    human_label = st.session_state.topic_human.get(tid, f"Topic {tid}")
-                    topic_options[f"Topic {tid}: {human_label} ({count} docs)"] = tid
-                
-                if -1 in topics:
-                    outlier_count = sum(1 for t in topics if t == -1)
-                    topic_options[f"Outliers ({outlier_count} docs)"] = -1
+                # Build topic options ONCE and cache in session state
+                if 'topic_options_cache' not in st.session_state or st.session_state.get('topic_options_hash') != hash(tuple(topics)):
+                    # Simple dropdown for topic selection
+                    topic_counts = pd.Series([t for t in topics if t != -1]).value_counts().sort_index()
+                    
+                    # Build topic options with human labels
+                    topic_options = {}
+                    topic_options["All Topics"] = "all"
+                    
+                    for tid in sorted(topic_counts.index):
+                        count = topic_counts.get(tid, 0)
+                        human_label = st.session_state.topic_human.get(tid, f"Topic {tid}")
+                        topic_options[f"Topic {tid}: {human_label} ({count} docs)"] = tid
+                    
+                    if -1 in topics:
+                        outlier_count = sum(1 for t in topics if t == -1)
+                        topic_options[f"Outliers ({outlier_count} docs)"] = -1
+                    
+                    # Cache it
+                    st.session_state.topic_options_cache = topic_options
+                    st.session_state.topic_options_hash = hash(tuple(topics))
+                else:
+                    # Use cached version - instant!
+                    topic_options = st.session_state.topic_options_cache
 
                 # Single dropdown selector
                 col1, col2 = st.columns([3, 1])
@@ -1559,6 +1592,7 @@ def main():
                         "Select a topic to view documents:",
                         options=list(topic_options.keys()),
                         index=0,
+                        key="topic_browser_selector",
                         help="Choose one topic at a time for fast rendering"
                     )
                 
@@ -1569,6 +1603,7 @@ def main():
                         max_value=10000,
                         value=1000,
                         step=100,
+                        key="topic_browser_max_rows",
                         help="Limit rows for faster display"
                     )
 
