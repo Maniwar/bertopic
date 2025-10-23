@@ -633,16 +633,8 @@ def load_embedding_model(model_name):
         model.encode = torch.compile(model.encode) if hasattr(torch, 'compile') else model.encode
     else:
         model = SentenceTransformer(model_name, device='cpu')
+        model.max_seq_length = 512
     return model
-
-@st.cache_data
-def compute_embeddings(_model, documents, batch_size=32):
-    """Compute and cache embeddings"""
-    # Create a SafeEmbeddingModel instance with the model
-    safe_model = SafeEmbeddingModel()
-    safe_model.model = _model  # Use the provided model directly
-    safe_model.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    return safe_model.encode_safe(documents, batch_size=batch_size)
 
 @st.cache_data
 def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
@@ -875,8 +867,32 @@ def main():
                 with st.spinner("Computing embeddings (this is the slow part, done only once)..."):
                     try:
                         model = load_embedding_model(embedding_model)
-                        embeddings = compute_embeddings(model, cleaned_docs, batch_size)
-                        st.session_state.embeddings = embeddings
+                        
+                        # Simple direct encoding - no complex wrapper needed
+                        try:
+                            embeddings = model.encode(
+                                cleaned_docs,
+                                batch_size=batch_size,
+                                show_progress_bar=True,
+                                convert_to_numpy=True,
+                                normalize_embeddings=True
+                            )
+                            st.session_state.embeddings = embeddings
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                st.warning("Memory issue detected, using smaller batch size...")
+                                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                                # Try with half batch size
+                                embeddings = model.encode(
+                                    cleaned_docs,
+                                    batch_size=max(1, batch_size//2),
+                                    show_progress_bar=True,
+                                    convert_to_numpy=True,
+                                    normalize_embeddings=True
+                                )
+                                st.session_state.embeddings = embeddings
+                            else:
+                                raise e
                     except Exception as e:
                         st.error(f"Embedding error: {str(e)}")
                         st.info("Try reducing batch size or document length")
