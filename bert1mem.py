@@ -4577,18 +4577,30 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                                                 key=f"download_summary_{selected_topic_id}"
                                             )
 
-                                        # Clear the flag
+                                        # Clear the flag and force browser refresh
                                         st.session_state[f'generate_topic_summary_{selected_topic_id}'] = False
+
+                                        # Force browser_df rebuild to show new summary
+                                        if 'browser_df' in st.session_state:
+                                            del st.session_state.browser_df
+
+                                        st.rerun()  # Refresh to show summary in table
 
                                     except Exception as e:
                                         st.error(f"❌ Failed to generate summary: {str(e)}")
                                         st.exception(e)
+                                        st.session_state[f'generate_topic_summary_{selected_topic_id}'] = False
 
-                    # Reorder columns - put topic metadata first
-                    meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_LLM_Analysis', 'Topic_Keywords']
+                    # Reorder columns - put topic metadata first (including summaries if present)
+                    meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_LLM_Analysis', 'Topic_Summary', 'Topic_Keywords']
                     other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
                     ordered_cols = [c for c in meta_cols if c in display_df.columns] + other_cols
                     display_df = display_df[ordered_cols]
+
+                    # Show summary column status
+                    if 'Topic_Summary' in display_df.columns and display_df['Topic_Summary'].any():
+                        num_with_summaries = display_df['Topic_Summary'].astype(bool).sum()
+                        st.caption(f"📝 {num_with_summaries} document(s) in this view have topic summaries")
 
                     # Simple, fast dataframe display
                     st.dataframe(
