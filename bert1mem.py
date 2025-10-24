@@ -458,54 +458,65 @@ def clean_documents_for_llm(docs, max_docs=50):
     return cleaned
 
 
-def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20, model_name=None):
+def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, max_topics_per_batch=20, model_name=None, labeler=None):
     """
     ✅ REIMAGINED: Trust the LLM with rich context and chain-of-thought reasoning
-    
+
     Let the LLM actually READ and THINK instead of forcing it into a box.
+
+    Now with FAISS-powered document selection for optimal representativeness!
     """
     if not batch_data or llm_model is None:
         return {}
-    
+
     try:
         model, tokenizer = llm_model
-        
+
         # Calculate max prompt length based on model's context window
         if model_name:
             max_prompt_length = int(get_max_tokens_for_model(model_name) * 0.70)  # Use 70% for prompt
         else:
             max_prompt_length = 3000
-        
+
         # Build rich topic descriptions
         topics_text = []
         for i, item in enumerate(batch_data[:max_topics_per_batch], 1):
             topic_id = item['topic_id']
             keywords = item['keywords']
             all_docs = clean_documents_for_llm(item['docs'])
-            
+
             if not all_docs:
                 continue
-            
-            # Sample diverse documents intelligently
-            if len(all_docs) <= max_docs_per_topic:
-                sample_docs = all_docs
+
+            # ✅ FAISS-POWERED DOCUMENT SELECTION (if available)
+            if labeler and labeler.use_faiss_selection:
+                # Get document indices for this topic
+                topic_doc_indices = item.get('doc_indices', list(range(len(all_docs))))
+                sample_docs = labeler.select_representative_documents_with_faiss(
+                    all_docs,
+                    topic_doc_indices,
+                    max_docs_per_topic
+                )
             else:
-                # Strategic sampling: beginning, middle, end, plus random
-                indices = [
-                    0,
-                    len(all_docs) // 4,
-                    len(all_docs) // 2,
-                    3 * len(all_docs) // 4,
-                    len(all_docs) - 1,
-                ]
-                import random
-                remaining = max_docs_per_topic - len(indices)
-                if remaining > 0:
-                    available = [idx for idx in range(len(all_docs)) if idx not in indices]
-                    if available:
-                        indices.extend(random.sample(available, min(remaining, len(available))))
-                
-                sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
+                # Fallback: Strategic sampling (beginning, middle, end, plus random)
+                if len(all_docs) <= max_docs_per_topic:
+                    sample_docs = all_docs
+                else:
+                    indices = [
+                        0,
+                        len(all_docs) // 4,
+                        len(all_docs) // 2,
+                        3 * len(all_docs) // 4,
+                        len(all_docs) - 1,
+                    ]
+                    import random
+                    remaining = max_docs_per_topic - len(indices)
+                    if remaining > 0:
+                        available = [idx for idx in range(len(all_docs)) if idx not in indices]
+                        if available:
+                            indices.extend(random.sample(available, min(remaining, len(available))))
+
+                    sample_docs = [all_docs[idx] for idx in sorted(set(indices[:max_docs_per_topic]))]
             
             # ✅ SMART SCALING: More docs = shorter excerpts to fit in context
             if max_docs_per_topic >= 40:
@@ -531,23 +542,38 @@ def generate_batch_labels_with_llm(batch_data, llm_model, max_docs_per_topic=8, 
                 f"\n{docs_preview}\n"
             )
         
-        # ✅ SIMPLIFIED PROMPT: Direct and clear
-        batch_prompt = f"""Create specific category names for these customer support topics.
+        # ✅ HIERARCHICAL PROMPT: Request deeply structured labels with multiple layers
+        batch_prompt = f"""Create DETAILED hierarchical category names for these customer support topics.
 
 REQUIREMENTS for each category name:
-• 3-8 words long
-• Mention specific products/services (e.g., "Samsung Galaxy", "LG Refrigerator", "Student Discount")
-• Clear and unique from other categories
+• Use format: "Main Category - Specific Details - Additional Context"
+• Add as many layers with "-" as needed to make each label UNIQUE and DESCRIPTIVE
+• Main Category: Broad theme (2-3 words)
+• Specific Details: Concrete specifics (2-4 words)
+• Additional Context: Extra distinguishing details (1-3 words) if needed
+• Mention specific products, services, issues, or contexts
+• Each label must be distinct from all others
 • No generic phrases like "Help" or "Question"
+
+EXAMPLES OF GOOD HIERARCHICAL LABELS:
+• "Product Orders - Samsung Washer - Delivery Scheduling"
+• "Product Orders - LG Refrigerator - Installation Issues"
+• "Customer Service - Response Time - Phone Support"
+• "Customer Service - Response Time - Email Support"
+• "Technical Support - Installation - Dishwasher Setup"
+• "Account Management - Student Discount - Verification Process"
+• "Billing Issues - Payment Failed - Credit Card"
+• "Billing Issues - Payment Failed - Bank Transfer"
 
 {chr(10).join(topics_text)}
 
-Create a unique category name for each topic above.
+Create a UNIQUE, DETAILED hierarchical category name for each topic above.
+Add as many layers with "-" as needed to distinguish it from other topics.
 
 FORMAT (respond EXACTLY like this):
-1: [category name]
-2: [category name]
-3: [category name]
+1: [Main Category - Specific Details - Additional Context]
+2: [Main Category - Specific Details - Additional Context]
+3: [Main Category - Specific Details - Additional Context]
 
 Your response:"""
         
@@ -599,11 +625,18 @@ Your response:"""
                     
                     # Validate and check for duplicates
                     label_lower = label.lower()
-                    if (5 <= len(label) <= 150 and 
-                        2 <= len(label.split()) <= 12 and
+                    if (5 <= len(label) <= 200 and  # ✅ Increased to 200 for multi-level labels
+                        2 <= len(label.split()) <= 20 and  # ✅ Increased to 20 words for detailed labels
                         label_lower not in seen_labels and  # ✅ No duplicates in same batch
                         not any(bad in label_lower for bad in ['help buy', 'question buy', '[', ']'])):  # ✅ Filter obvious bad ones
-                        
+
+                        # ✅ Ensure hierarchical format: Add "-" if not present and has enough words
+                        if ' - ' not in label and len(label.split()) >= 3:
+                            # Split label into two parts for hierarchy
+                            words = label.split()
+                            mid = len(words) // 2
+                            label = f"{' '.join(words[:mid])} - {' '.join(words[mid:])}"
+
                         if 1 <= topic_num <= len(batch_data):
                             actual_topic_id = batch_data[topic_num - 1]['topic_id']
                             labels_dict[actual_topic_id] = label
@@ -622,52 +655,264 @@ Your response:"""
 # =====================================================
 # ✅ GLOBAL DEDUPLICATION
 # =====================================================
-def deduplicate_labels_globally(labels_dict, keywords_dict):
+def generate_batch_llm_analysis(topic_batch, llm_model):
     """
-    Deduplicate labels across ALL topics after processing.
-    If same label appears multiple times, append distinguishing keywords.
+    Generate LLM analysis for multiple topics in a single batch call.
+
+    This is MUCH faster than processing topics one-by-one because:
+    1. Single LLM inference call for multiple topics
+    2. Better GPU utilization
+    3. No thread serialization issues
+
+    Args:
+        topic_batch: List of dicts with keys: topic_id, label, docs
+        llm_model: Tuple of (model, tokenizer)
+
+    Returns:
+        Dict mapping topic_id to analysis string
     """
-    # Count label occurrences
-    label_to_topics = {}
-    for topic_id, label in labels_dict.items():
-        label_lower = label.lower().strip()
-        if label_lower not in label_to_topics:
-            label_to_topics[label_lower] = []
-        label_to_topics[label_lower].append(topic_id)
-    
-    # Fix duplicates by adding keywords
-    for label_lower, topic_ids in label_to_topics.items():
-        if len(topic_ids) > 1:
-            # Multiple topics share this label - make them unique
+    if not topic_batch or llm_model is None:
+        return {}
+
+    try:
+        model, tokenizer = llm_model
+
+        # Build batched prompt
+        prompt_parts = ["Analyze these topics and provide a one-sentence summary for each:\n"]
+
+        for item in topic_batch:
+            topic_id = item['topic_id']
+            label = item['label']
+            docs = item['docs'][:3]  # Use fewer docs per topic for batching
+
+            # Clean docs
+            cleaned = [str(d).strip()[:150] for d in docs if d and str(d).strip()]
+            docs_text = " | ".join(cleaned[:3])
+
+            prompt_parts.append(f"\nTopic {topic_id} ({label}):")
+            prompt_parts.append(f"Documents: {docs_text}")
+            prompt_parts.append(f"Analysis:")
+
+        prompt = "\n".join(prompt_parts)
+
+        # Generate
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2000)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=200,  # More tokens for multiple topics
+                temperature=0.5,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Parse responses for each topic
+        results = {}
+        lines = response.split('\n')
+
+        current_topic_id = None
+        for line in lines:
+            line = line.strip()
+
+            # Look for "Analysis:" followed by text
+            if 'Analysis:' in line:
+                parts = line.split('Analysis:', 1)
+                if len(parts) == 2:
+                    analysis_text = parts[1].strip()
+                    if analysis_text and current_topic_id is not None:
+                        # Clean up
+                        analysis_text = analysis_text.split('\n')[0].strip()
+                        analysis_text = analysis_text.strip('"\'.,;[](){}')
+                        if len(analysis_text) > 150:
+                            analysis_text = analysis_text[:150] + "..."
+                        results[current_topic_id] = analysis_text
+
+            # Track which topic we're parsing
+            if line.startswith('Topic ') and '(' in line:
+                try:
+                    topic_num = int(line.split()[1].split('(')[0])
+                    current_topic_id = topic_num
+                except:
+                    pass
+
+        return results
+
+    except Exception as e:
+        st.caption(f"⚠️ Batch LLM analysis failed: {str(e)[:100]}")
+        return {}
+
+
+def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=150):
+    """
+    Generate a simple one-sentence analysis of what users are saying in this topic.
+
+    Prompt: "Look at topic X and tell me what users are saying in one sentence."
+    """
+    if not sample_docs or llm_model is None:
+        return None
+
+    try:
+        model, tokenizer = llm_model
+
+        # Clean and prepare documents
+        cleaned_docs = [str(doc).strip() for doc in sample_docs if doc and str(doc).strip()]
+        if not cleaned_docs:
+            return None
+
+        # Build simple prompt
+        docs_text = "\n".join([f"- {doc[:200]}" for doc in cleaned_docs[:5]])
+
+        prompt = f"""Topic: {topic_label}
+
+Sample documents:
+{docs_text}
+
+In one clear sentence, what are users saying in this topic? Focus on their main concerns, questions, or feedback.
+
+Answer:"""
+
+        # Generate
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=80,  # Short response
+                temperature=0.5,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract answer
+        if "Answer:" in response:
+            response = response.split("Answer:")[-1].strip()
+
+        # Clean up
+        response = response.split('\n')[0].strip()  # Take first line
+        response = response.strip('"\'.,;[](){}')
+
+        # Truncate if needed
+        if len(response) > max_length:
+            response = response[:max_length].strip() + "..."
+
+        return response if response else None
+
+    except Exception as e:
+        st.caption(f"⚠️ Topic {topic_id} LLM analysis failed: {str(e)[:100]}")
+        return None
+
+
+def deduplicate_labels_globally(labels_dict, keywords_dict, topics_dict=None):
+    """
+    Deduplicate labels across ALL topics by progressively adding layers with '-'.
+    Keeps adding detail levels until every label is unique.
+
+    Examples:
+    - "Customer Service - Response Times" becomes "Customer Service - Response Times - Phone Support"
+    - "Product Orders - Delivery" becomes "Product Orders - Delivery - Samsung Appliances"
+    """
+    MAX_ITERATIONS = 5  # Prevent infinite loops
+    iteration = 0
+
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+
+        # Count label occurrences
+        label_to_topics = {}
+        for topic_id, label in labels_dict.items():
+            label_lower = label.lower().strip()
+            if label_lower not in label_to_topics:
+                label_to_topics[label_lower] = []
+            label_to_topics[label_lower].append(topic_id)
+
+        # Check if we have any duplicates
+        duplicates = {label: topics for label, topics in label_to_topics.items() if len(topics) > 1}
+
+        if not duplicates:
+            # All labels are unique!
+            break
+
+        # Fix duplicates by adding another layer of detail
+        for label_lower, topic_ids in duplicates.items():
             for topic_id in topic_ids:
                 original_label = labels_dict[topic_id]
                 keywords = keywords_dict.get(topic_id, '')
-                
-                # Extract 1-2 distinctive keywords
+
+                # Extract distinctive keywords not already in the label
                 kw_list = [kw.strip() for kw in keywords.split(',') if kw.strip()]
                 distinctive = []
-                for kw in kw_list[:3]:
-                    # Skip common words
-                    if kw.lower() not in ['help', 'buy', 'question', 'new', 'order', 'phone']:
-                        distinctive.append(kw.title())
-                    if len(distinctive) >= 2:
-                        break
-                
+
+                # Filter out keywords already in label and common words
+                common_words = {'help', 'buy', 'question', 'new', 'order', 'phone', 'customer', 'service', 'product', 'support'}
+                label_words = set(original_label.lower().split())
+
+                for kw in kw_list[:10]:  # Look at more keywords
+                    kw_clean = kw.lower().strip()
+                    # Skip if already in label or is common word
+                    if kw_clean not in common_words and kw_clean not in label_words:
+                        # Also check if not substring of any word in label
+                        if not any(kw_clean in word for word in label_words):
+                            distinctive.append(kw.title())
+                            if len(distinctive) >= 2:
+                                break
+
+                # If we have distinctive keywords, add them as a new layer
                 if distinctive:
-                    labels_dict[topic_id] = f"{original_label} - {' '.join(distinctive)}"
+                    new_detail = ' '.join(distinctive[:2])
+                    labels_dict[topic_id] = f"{original_label} - {new_detail}"
                 else:
-                    labels_dict[topic_id] = f"{original_label} (Variant {topic_ids.index(topic_id) + 1})"
-    
+                    # Try to use document content if available
+                    if topics_dict and topic_id in topics_dict:
+                        docs = topics_dict[topic_id]
+                        # Extract unique phrases from documents
+                        extra_phrases = _top_phrases(docs[:50], (1, 2), top_k=10)
+                        extra_clean = []
+                        for phrase in extra_phrases:
+                            phrase_clean = _clean_phrase(phrase)
+                            phrase_words = set(phrase_clean.lower().split())
+                            if not phrase_words.issubset(label_words) and phrase_clean.lower() not in common_words:
+                                extra_clean.append(_to_title_case(phrase_clean))
+                                if len(extra_clean) >= 2:
+                                    break
+
+                        if extra_clean:
+                            new_detail = ' '.join(extra_clean[:2])
+                            labels_dict[topic_id] = f"{original_label} - {new_detail}"
+                        else:
+                            # Last resort: add topic ID
+                            labels_dict[topic_id] = f"{original_label} - Topic {topic_id}"
+                    else:
+                        # No documents available, use index
+                        variant_num = topic_ids.index(topic_id) + 1
+                        labels_dict[topic_id] = f"{original_label} - Variant {variant_num}"
+
     return labels_dict
 
 
 class AdaptiveParallelLLMLabeler:
     """Production-ready parallel LLM labeler with adaptive batch sizing and detailed progress"""
-    
-    def __init__(self, llm_model, model_name=None, system_params=None, max_docs_per_topic=None):
+
+    def __init__(self, llm_model, model_name=None, system_params=None, max_docs_per_topic=None, faiss_index=None, embeddings=None, documents=None):
         self.llm_model = llm_model
         self.model_name = model_name
-        
+
+        # ✅ FAISS-based document selection for better quality
+        self.faiss_index = faiss_index
+        self.embeddings = embeddings
+        self.documents = documents
+        self.use_faiss_selection = faiss_index is not None and embeddings is not None and documents is not None
+
         # ✅ Calculate max_docs dynamically based on model's context window
         if max_docs_per_topic is None and model_name:
             self.max_docs_per_topic = get_max_docs_for_model(model_name)
@@ -676,16 +921,69 @@ class AdaptiveParallelLLMLabeler:
         else:
             # Use at least 8 documents for better label quality
             self.max_docs_per_topic = max(max_docs_per_topic, 8)
-        
+
         if system_params is None:
             system_params = SystemPerformanceDetector.detect_optimal_parameters()
-        
+
         self.system_params = system_params
         self.batch_size = min(system_params['batch_size'], 10)  # ✅ Cap at 10 for better quality
         self.max_workers = system_params['max_workers'] if llm_model else 0
         self.original_batch_size = self.batch_size
         self.oom_count = 0
         self.successful_batches = 0
+
+    def select_representative_documents_with_faiss(self, topic_docs, topic_doc_indices, max_docs):
+        """
+        Use FAISS to intelligently select the most representative documents for a topic.
+
+        Strategy:
+        1. Calculate topic centroid from document embeddings
+        2. Find documents closest to centroid (most representative)
+        3. Also include some diverse documents (farthest from each other)
+        4. Blend for both coverage and representativeness
+        """
+        if not self.use_faiss_selection or len(topic_doc_indices) == 0:
+            return topic_docs[:max_docs]
+
+        try:
+            # Get embeddings for this topic's documents
+            topic_embeddings = self.embeddings[topic_doc_indices]
+
+            # Calculate centroid
+            centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
+
+            # Find closest documents to centroid (most representative)
+            n_representative = max(1, int(max_docs * 0.7))  # 70% representative
+            distances, indices = self.faiss_index.search(centroid, min(len(topic_doc_indices), n_representative * 2))
+
+            # Map back to topic document indices
+            representative_indices = []
+            for idx in indices[0]:
+                if idx in topic_doc_indices:
+                    representative_indices.append(topic_doc_indices.index(idx))
+                    if len(representative_indices) >= n_representative:
+                        break
+
+            # Add some diverse documents (for coverage)
+            n_diverse = max_docs - len(representative_indices)
+            if n_diverse > 0:
+                # Use documents farthest from centroid
+                remaining_indices = [i for i in range(len(topic_docs)) if i not in representative_indices]
+                if remaining_indices:
+                    # Simple diversity: take evenly spaced documents
+                    step = max(1, len(remaining_indices) // n_diverse)
+                    diverse_indices = remaining_indices[::step][:n_diverse]
+                    representative_indices.extend(diverse_indices)
+
+            # Select documents
+            selected_docs = [topic_docs[i] for i in representative_indices[:max_docs]]
+
+            return selected_docs if selected_docs else topic_docs[:max_docs]
+
+        except Exception as e:
+            # Fallback to original approach
+            st.warning(f"⚠️ FAISS selection failed, using fallback sampling: {str(e)}")
+            return topic_docs[:max_docs]
         
     def _adaptive_reduce_batch_size(self):
         """Reduce batch size if OOM errors occur"""
@@ -701,22 +999,26 @@ class AdaptiveParallelLLMLabeler:
             return True
         return False
     
-    def label_all_topics(self, topics_dict, keywords_dict, fallback_func, show_progress=True):
+    def label_all_topics(self, topics_dict, keywords_dict, topic_doc_indices=None, fallback_func=None, show_progress=True):
         """Label all topics using adaptive parallel batching with detailed progress"""
         topic_items = []
         for topic_id, docs in topics_dict.items():
             if topic_id == -1:
                 continue
-            topic_items.append({
+            item = {
                 'topic_id': topic_id,
                 'docs': docs,
                 'keywords': keywords_dict.get(topic_id, '')
-            })
-        
+            }
+            # Add document indices for FAISS-based selection
+            if topic_doc_indices and topic_id in topic_doc_indices:
+                item['doc_indices'] = topic_doc_indices[topic_id]
+            topic_items.append(item)
+
         total_topics = len(topic_items)
         if total_topics == 0:
-            return {}
-        
+            return {}, {'llm_count': 0, 'fallback_count': 0, 'total': 0}
+
         if show_progress:
             sys_info = self.system_params
             st.info(
@@ -725,22 +1027,36 @@ class AdaptiveParallelLLMLabeler:
                 f"**Parallel Workers**: {self.max_workers} | "
                 f"**Total Topics**: {total_topics}"
             )
-            
+
             if sys_info['has_gpu']:
                 st.info(f"🎮 **GPU**: {sys_info.get('gpu_name', 'Unknown')} ({sys_info['gpu_memory_gb']:.1f}GB)")
-        
+
+        # Track statistics
+        self.llm_labeled_count = 0
+        self.fallback_labeled_count = 0
+
         if self.llm_model is None or self.max_workers == 0:
+            if self.llm_model is None:
+                st.warning("⚠️ LLM model is None - falling back to TF-IDF labeling")
+            elif self.max_workers == 0:
+                st.warning(f"⚠️ max_workers is 0 (llm_model={'None' if self.llm_model is None else 'loaded'}) - falling back to TF-IDF labeling")
             result = self._sequential_fallback(topic_items, fallback_func, show_progress)
-            result = deduplicate_labels_globally(result, keywords_dict)
-            return result
-        
+            result = deduplicate_labels_globally(result, keywords_dict, topics_dict)
+            stats = {'llm_count': 0, 'fallback_count': len(result), 'total': len(result)}
+            return result, stats
+
         max_retries = 3
         for retry in range(max_retries):
             try:
                 result = self._process_batches_parallel(topic_items, fallback_func, show_progress)
-                # ✅ FIX 6: Deduplicate labels globally
-                result = deduplicate_labels_globally(result, keywords_dict)
-                return result
+                # ✅ FIX 6: Deduplicate labels globally with progressive detail
+                result = deduplicate_labels_globally(result, keywords_dict, topics_dict)
+                stats = {
+                    'llm_count': self.llm_labeled_count,
+                    'fallback_count': self.fallback_labeled_count,
+                    'total': len(result)
+                }
+                return result, stats
             except RuntimeError as e:
                 if "out of memory" in str(e).lower() or "OOM" in str(e):
                     torch.cuda.empty_cache()
@@ -751,15 +1067,17 @@ class AdaptiveParallelLLMLabeler:
                     else:
                         st.error("❌ Cannot reduce batch size further. Falling back to sequential processing.")
                         result = self._sequential_fallback(topic_items, fallback_func, show_progress)
-                        result = deduplicate_labels_globally(result, keywords_dict)
-                        return result
+                        result = deduplicate_labels_globally(result, keywords_dict, topics_dict)
+                        stats = {'llm_count': 0, 'fallback_count': len(result), 'total': len(result)}
+                        return result, stats
                 else:
                     raise e
-        
+
         st.warning("⚠️ All parallel attempts failed. Using sequential fallback.")
         result = self._sequential_fallback(topic_items, fallback_func, show_progress)
-        result = deduplicate_labels_globally(result, keywords_dict)
-        return result
+        result = deduplicate_labels_globally(result, keywords_dict, topics_dict)
+        stats = {'llm_count': 0, 'fallback_count': len(result), 'total': len(result)}
+        return result, stats
     
     def _process_batches_parallel(self, topic_items, fallback_func, show_progress):
         """Process batches in parallel with detailed progress tracking"""
@@ -776,7 +1094,7 @@ class AdaptiveParallelLLMLabeler:
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_batch = {
-                executor.submit(generate_batch_labels_with_llm, batch, self.llm_model, self.max_docs_per_topic, self.batch_size, self.model_name): (batch_idx, batch)
+                executor.submit(generate_batch_labels_with_llm, batch, self.llm_model, self.max_docs_per_topic, self.batch_size, self.model_name, self): (batch_idx, batch)
                 for batch_idx, batch in enumerate(batches)
             }
             
@@ -787,7 +1105,11 @@ class AdaptiveParallelLLMLabeler:
                     batch_labels = future.result(timeout=120)
                     self.successful_batches += 1
                     all_labels.update(batch_labels)
-                    
+
+                    # Track LLM vs fallback
+                    llm_count_in_batch = len(batch_labels)
+                    self.llm_labeled_count += llm_count_in_batch
+
                     fallback_count = 0
                     for item in batch:
                         topic_id = item['topic_id']
@@ -795,20 +1117,25 @@ class AdaptiveParallelLLMLabeler:
                             fallback_label = fallback_func(item['docs'], item['keywords'])
                             all_labels[topic_id] = fallback_label
                             fallback_count += 1
-                    
+
+                    self.fallback_labeled_count += fallback_count
+
                     completed_topics += len(batch)
                     if show_progress:
                         extra_info = f"Batch {batch_idx+1}/{num_batches}"
                         if fallback_count > 0:
                             extra_info += f" ({fallback_count} fallbacks)"
                         tracker.update(completed_topics, extra_info)
-                    
+
                 except Exception:
+                    # Entire batch failed, use fallback for all
                     for item in batch:
                         topic_id = item['topic_id']
                         fallback_label = fallback_func(item['docs'], item['keywords'])
                         all_labels[topic_id] = fallback_label
-                    
+
+                    self.fallback_labeled_count += len(batch)
+
                     completed_topics += len(batch)
                     if show_progress:
                         tracker.update(completed_topics, f"Batch {batch_idx+1}/{num_batches} (failed, used fallback)")
@@ -1328,109 +1655,126 @@ def _to_title_case(text):
 
 def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
     """
-    Create a unique, descriptive label from phrases and keywords.
-    This generates labels like "Customer Service Response" instead of generic "Customer Support"
+    Create a hierarchical, descriptive label with main category and specific details.
+    Format: "Main Category - Specific Details"
+    Examples:
+    - "Customer Service - Response Times & Issues"
+    - "Product Orders - Samsung Washer Delivery"
+    - "Technical Support - Installation Problems"
     """
     # Clean all phrases
     clean_phrases_23 = [_clean_phrase(p) for p in phrases_23 if p and len(_clean_phrase(p)) > 3]
     clean_phrases_1 = [_clean_phrase(p) for p in phrases_1 if p and len(_clean_phrase(p)) > 2]
-    
+
     # Parse keywords
     if isinstance(keywords, str):
         keyword_list = [k.strip() for k in keywords.split(',') if k.strip()]
     else:
         keyword_list = list(keywords) if keywords else []
-    
-    # PRIORITY 1: Use the longest trigram if available and descriptive (3+ words)
-    for phrase in clean_phrases_23:
-        word_count = len(phrase.split())
-        if word_count >= 3:
-            label = _to_title_case(phrase)
-            if len(label) <= max_len:
-                return label
-    
-    # PRIORITY 2: Combine top 2 bigrams/trigrams if they complement each other
+
+    # Build main category and details
+    main_category = None
+    details = None
+
+    # PRIORITY 1: Use longest trigram as main category, and second as details
     if len(clean_phrases_23) >= 2:
-        first = clean_phrases_23[0]
-        first_words = set(first.lower().split())
-        
-        # Find a second phrase that adds information (at least 1 new word, not a subset)
-        for second in clean_phrases_23[1:3]:
+        # First phrase is main category
+        main_category = _to_title_case(clean_phrases_23[0])
+
+        # Find complementary second phrase for details
+        first_words = set(clean_phrases_23[0].lower().split())
+        for second in clean_phrases_23[1:4]:
             second_words = set(second.lower().split())
-            
-            # Skip if second is completely contained in first
-            if second_words.issubset(first_words):
+
+            # Skip if too similar
+            if second_words.issubset(first_words) or first_words.issubset(second_words):
                 continue
-            
-            # Skip if first is completely contained in second (use second instead)
-            if first_words.issubset(second_words):
-                label = _to_title_case(second)
-                if len(label) <= max_len:
-                    return label
-                continue
-            
-            # Check if they share too many words (>50% overlap)
+
             overlap = len(first_words & second_words)
             total = len(first_words | second_words)
-            if overlap / total < 0.5:  # Less than 50% overlap is good
-                label = f"{first} & {second}"
-                label = _to_title_case(label)
-                if len(label) <= max_len:
-                    return label
-        
-        # If no good pair found, use the first phrase alone
-        label = _to_title_case(first)
-        if len(label) <= max_len:
-            return label
-    
-    # PRIORITY 3: Use single best bigram
-    if len(clean_phrases_23) >= 1:
-        label = _to_title_case(clean_phrases_23[0])
-        if len(label) <= max_len:
-            return label
-    
-    # PRIORITY 4: Combine 2-3 distinctive unigrams
-    if len(clean_phrases_1) >= 2:
-        # Take unique words only
-        seen = set()
-        unique_words = []
-        for word in clean_phrases_1:
-            if word.lower() not in seen:
-                unique_words.append(word)
-                seen.add(word.lower())
-                if len(unique_words) >= 3:
-                    break
-        
-        if len(unique_words) >= 2:
-            label = _to_title_case(' '.join(unique_words))
-            if len(label) <= max_len:
-                return label
-    
-    # PRIORITY 5: Use keywords
-    if len(keyword_list) >= 2:
-        seen = set()
-        unique_keywords = []
-        for kw in keyword_list:
-            if kw.lower() not in seen:
-                unique_keywords.append(kw)
-                seen.add(kw.lower())
-                if len(unique_keywords) >= 3:
-                    break
-        
-        if len(unique_keywords) >= 2:
-            label = _to_title_case(' '.join(unique_keywords))
-            if len(label) <= max_len:
-                return label
-    
-    # Fallback: Single best available
-    if clean_phrases_23:
-        return _to_title_case(clean_phrases_23[0][:max_len])
-    if clean_phrases_1:
-        return _to_title_case(' '.join(clean_phrases_1[:3])[:max_len])
-    if keyword_list:
-        return _to_title_case(' '.join(keyword_list[:3])[:max_len])
-    
-    return "Miscellaneous Topic"
+            if overlap / total < 0.6:  # Less than 60% overlap
+                details = _to_title_case(second)
+                break
+
+        # If no good second phrase, use keywords for details
+        if not details and len(keyword_list) >= 2:
+            kw_detail = ' '.join([_to_title_case(kw) for kw in keyword_list[:2] if kw.lower() not in main_category.lower()])
+            if kw_detail:
+                details = kw_detail
+
+    # PRIORITY 2: Use first trigram as main, combine unigrams for details
+    elif len(clean_phrases_23) >= 1:
+        main_category = _to_title_case(clean_phrases_23[0])
+
+        # Use unigrams that aren't in main category for details
+        main_words = set(main_category.lower().split())
+        detail_words = [w for w in clean_phrases_1[:4] if w.lower() not in main_words]
+        if len(detail_words) >= 2:
+            details = _to_title_case(' '.join(detail_words[:2]))
+        elif len(keyword_list) >= 2:
+            kw_detail = ' '.join([_to_title_case(kw) for kw in keyword_list[:2] if kw.lower() not in main_category.lower()])
+            if kw_detail:
+                details = kw_detail
+
+    # PRIORITY 3: Build from unigrams
+    elif len(clean_phrases_1) >= 3:
+        # First 1-2 words as main category
+        main_category = _to_title_case(' '.join(clean_phrases_1[:2]))
+        # Next 1-2 words as details
+        detail_words = clean_phrases_1[2:4]
+        if detail_words:
+            details = _to_title_case(' '.join(detail_words))
+
+    # PRIORITY 4: Use keywords
+    elif len(keyword_list) >= 3:
+        main_category = _to_title_case(' '.join(keyword_list[:2]))
+        details = _to_title_case(' '.join(keyword_list[2:4]))
+
+    # Fallback to simple labels if hierarchical structure isn't possible
+    if not main_category:
+        if clean_phrases_23:
+            main_category = _to_title_case(clean_phrases_23[0])
+        elif clean_phrases_1:
+            main_category = _to_title_case(' '.join(clean_phrases_1[:2]))
+        elif keyword_list:
+            main_category = _to_title_case(' '.join(keyword_list[:2]))
+        else:
+            main_category = "Miscellaneous Topic"
+
+    # Ensure we have details - use remaining keywords if needed
+    if not details:
+        if len(keyword_list) >= 1:
+            main_words = set(main_category.lower().split())
+            detail_kws = [_to_title_case(kw) for kw in keyword_list[:3] if kw.lower() not in main_words]
+            if detail_kws:
+                details = ' '.join(detail_kws[:2])
+
+        # Last resort: use "Related Topics" or part of main category
+        if not details:
+            if len(clean_phrases_1) > 0:
+                main_words = set(main_category.lower().split())
+                extra_words = [w for w in clean_phrases_1 if w.lower() not in main_words]
+                if extra_words:
+                    details = _to_title_case(extra_words[0])
+                else:
+                    details = "General Topics"
+            else:
+                details = "General Topics"
+
+    # Construct final hierarchical label
+    label = f"{main_category} - {details}"
+
+    # Truncate if too long
+    if len(label) > max_len:
+        # Try to shorten details first
+        max_details_len = max_len - len(main_category) - 3  # 3 for " - "
+        if max_details_len > 10:
+            details = details[:max_details_len].rstrip() + "…"
+            label = f"{main_category} - {details}"
+        else:
+            label = label[:max_len].rstrip() + "…"
+
+    return label
 
 # -----------------------------------------------------
 # LOCAL LLM FOR BETTER TOPIC LABELS
@@ -1746,12 +2090,15 @@ class FastReclusterer:
 
     def _extract_topic_keywords(self, topics, top_n_words=10):
         """⚡ OPTIMIZED: Extract keywords and generate human-readable labels with adaptive parallel batching"""
-        # Group documents by topic
+        # Group documents by topic (with document indices for FAISS)
         topics_dict = {}
+        topic_doc_indices = {}  # Track which embedding indices belong to each topic
         for idx, topic in enumerate(topics):
             topics_dict.setdefault(topic, [])
+            topic_doc_indices.setdefault(topic, [])
             if idx < len(self.documents):
                 topics_dict[topic].append(self.documents[idx])
+                topic_doc_indices[topic].append(idx)
         
         # Handle outliers
         topic_info_list = []
@@ -1793,89 +2140,147 @@ class FastReclusterer:
                 keywords_str = f'topic_{topic_id}'
             
             keywords_dict[topic_id] = keywords_str
-        
-        # PHASE 2: Generate human-readable labels
-        # ⚡ NEW: Use optimized adaptive parallel batched LLM labeling
+
+        # PHASE 2: Generate TF-IDF hierarchical labels (ALWAYS - fast and reliable)
+        st.info("📝 Generating hierarchical labels using TF-IDF...")
+        labels_dict = {}
+
+        if len(topics_dict) > 100:
+            progress_bar = st.progress(0.0)
+
+        for i, (topic_id, docs) in enumerate(topics_dict.items()):
+            if topic_id != -1:
+                labels_dict[topic_id] = make_human_label(docs, keywords_dict[topic_id])
+
+                if len(topics_dict) > 100:
+                    progress_bar.progress((i + 1) / len(topics_dict))
+
+        if len(topics_dict) > 100:
+            progress_bar.empty()
+
+        # Deduplicate TF-IDF labels
+        labels_dict = deduplicate_labels_globally(labels_dict, keywords_dict, topics_dict)
+
+        st.success(f"✅ Generated {len(labels_dict)} unique hierarchical labels using TF-IDF")
+
+        # PHASE 3: Optional LLM Analysis (BATCHED for actual speedup)
+        llm_analysis_dict = {}
+        llm_success_count = 0
+        llm_fallback_count = 0
+
         if self.llm_model is not None:
             num_topics = len(topics_dict) - (1 if -1 in topics_dict else 0)
-            st.info(f"🤖 Using LLM for {num_topics} topic labels (optimized batching enabled)")
-            
-            # ✅ Get memory profile from session state
-            memory_profile = st.session_state.get('memory_profile', 'balanced')
-            
-            # ✅ Create document cache if aggressive caching is enabled
-            doc_cache = AggressiveDocumentCache(memory_profile)
-            if doc_cache.enabled:
-                with st.spinner("🚀 Pre-loading documents into memory..."):
-                    doc_cache.cache_topic_documents(topics_dict)
-                    st.success(f"✅ Cached documents for {len(topics_dict)} topics")
-            
-            # Create adaptive parallel labeler with memory profile
-            system_params = SystemPerformanceDetector.detect_optimal_parameters(memory_profile)
-            
-            # ✅ Calculate optimal max_docs based on model's context window
-            max_docs = get_max_docs_for_model(self.llm_model_name) if self.llm_model_name else 8
-            
-            labeler = AdaptiveParallelLLMLabeler(
-                llm_model=self.llm_model,
-                model_name=self.llm_model_name,
-                system_params=system_params,
-                max_docs_per_topic=max_docs
-            )
-            
-            # Show info about document selection
-            if self.llm_model_name and self.llm_model_name in LLM_MODEL_CONFIG:
-                st.info(f"📊 Using {max_docs} documents per topic (optimized for {self.llm_model_name.split('/')[-1]} context window)")
-            
-            # Generate all labels in parallel batches with adaptive sizing
-            labels_dict = labeler.label_all_topics(
-                topics_dict=topics_dict,
-                keywords_dict=keywords_dict,
-                fallback_func=make_human_label,
-                show_progress=True
-            )
-            
-            # ✅ Show cache statistics if caching was used
-            if doc_cache.enabled:
-                cache_stats = doc_cache.get_stats()
-                if cache_stats['hits'] > 0:
-                    st.success(
-                        f"📊 Cache Performance: {cache_stats['hit_rate']:.1f}% hit rate | "
-                        f"Memory used: {cache_stats['memory_mb']:.1f} MB"
-                    )
-        else:
-            # No LLM - use TF-IDF based fallback for all topics
-            labels_dict = {}
-            
-            if len(topics_dict) > 100:
-                progress_bar = st.progress(0.0)
-                st.info("Generating labels using TF-IDF method...")
-            
-            for i, (topic_id, docs) in enumerate(topics_dict.items()):
-                if topic_id != -1:
-                    labels_dict[topic_id] = make_human_label(docs, keywords_dict[topic_id])
-                    
-                    if len(topics_dict) > 100:
-                        progress_bar.progress((i + 1) / len(topics_dict))
-            
-            if len(topics_dict) > 100:
-                progress_bar.empty()
-        
-        # PHASE 3: Build final topic info dataframe
+
+            # Batch size: process 5 topics at once (optimal for most LLMs)
+            batch_size = 5
+            st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
+
+            # Get FAISS index for document selection
+            faiss_index = st.session_state.get('faiss_index')
+            embeddings_for_analysis = self.embeddings if hasattr(self, 'embeddings') else None
+
+            # Create progress tracking
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            # Prepare all topics with FAISS-selected documents
+            all_topics_prepared = []
+            for topic_id, docs in topics_dict.items():
+                if topic_id == -1:
+                    continue
+
+                doc_indices = topic_doc_indices.get(topic_id, [])
+                label = labels_dict.get(topic_id, f"Topic {topic_id}")
+
+                # Select representative documents using FAISS
+                if faiss_index is not None and embeddings_for_analysis is not None and len(doc_indices) > 0:
+                    try:
+                        topic_embeddings = embeddings_for_analysis[doc_indices]
+                        centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
+                        _, indices = faiss_index.search(centroid, min(5, len(doc_indices)))
+
+                        idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
+                        selected_docs = []
+                        for idx in indices[0]:
+                            if idx in idx_to_pos:
+                                selected_docs.append(docs[idx_to_pos[idx]])
+                                if len(selected_docs) >= 5:
+                                    break
+                    except Exception:
+                        selected_docs = docs[:5]
+                else:
+                    selected_docs = docs[:5]
+
+                all_topics_prepared.append({
+                    'topic_id': topic_id,
+                    'label': label,
+                    'docs': selected_docs
+                })
+
+            # Process in batches
+            num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
+            processed_count = 0
+
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(all_topics_prepared))
+                batch = all_topics_prepared[start_idx:end_idx]
+
+                # Update progress
+                status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics)...")
+
+                # Process batch with LLM
+                batch_results = generate_batch_llm_analysis(batch, self.llm_model)
+
+                # Collect results
+                for topic_item in batch:
+                    topic_id = topic_item['topic_id']
+                    if topic_id in batch_results and batch_results[topic_id]:
+                        llm_analysis_dict[topic_id] = batch_results[topic_id]
+                        llm_success_count += 1
+                    else:
+                        llm_analysis_dict[topic_id] = "No analysis available"
+                        llm_fallback_count += 1
+
+                    processed_count += 1
+
+                # Update progress bar
+                progress = processed_count / num_topics
+                progress_bar.progress(progress)
+                status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
+
+            # Clear progress indicators
+            progress_bar.empty()
+            status_text.empty()
+
+            # Show LLM analysis statistics
+            if llm_success_count > 0:
+                success_pct = (llm_success_count / num_topics) * 100
+                st.success(
+                    f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
+                )
+                if llm_fallback_count > 0:
+                    st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis")
+            else:
+                st.warning("⚠️ LLM analysis failed for all topics")
+
+        # PHASE 4: Build final topic info dataframe
         for topic_id in sorted(topics_dict.keys()):
             if topic_id == -1:
                 continue
-            
+
             human_label = labels_dict.get(topic_id, f"Topic {topic_id}")
-            
+            llm_analysis = llm_analysis_dict.get(topic_id, "")  # Empty if no LLM analysis
+
             topic_info_list.append({
                 'Topic': topic_id,
                 'Count': len(topics_dict[topic_id]),
                 'Keywords': keywords_dict[topic_id],
                 'Human_Label': human_label,
-                'Name': human_label
+                'Name': human_label,
+                'LLM_Analysis': llm_analysis
             })
-        
+
         return pd.DataFrame(topic_info_list)
 
 
@@ -1883,10 +2288,14 @@ class FastReclusterer:
 # GUARANTEE COLUMNS EXIST ON topic_info
 # -----------------------------------------------------
 def normalize_topic_info(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure topic_info has Human_Label, Keywords, and Count columns."""
+    """Ensure topic_info has Human_Label, Keywords, Count, and LLM_Analysis columns."""
     if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["Topic", "Human_Label", "Keywords", "Count"])
+        return pd.DataFrame(columns=["Topic", "Human_Label", "Keywords", "Count", "LLM_Analysis"])
     df = df.copy()
+
+    # LLM_Analysis
+    if 'LLM_Analysis' not in df.columns:
+        df['LLM_Analysis'] = ""
 
     # Keywords
     if "Keywords" not in df.columns:
@@ -1928,6 +2337,142 @@ def normalize_topic_info(df: pd.DataFrame) -> pd.DataFrame:
         df["Topic"] = df["topic"]
 
     return df
+
+
+# -----------------------------------------------------
+# STANDALONE LLM ANALYSIS FOR EXISTING TOPICS
+# -----------------------------------------------------
+def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_model):
+    """
+    Run LLM analysis on already-clustered topics.
+    This allows adding AI insights after clustering without reclustering.
+
+    Args:
+        topics: Array of topic assignments
+        topic_info: DataFrame with topic information
+        documents: List of document texts
+        embeddings: Document embeddings (for FAISS selection)
+        llm_model: Loaded LLM model tuple (model, tokenizer)
+
+    Returns:
+        Updated topic_info DataFrame with LLM_Analysis column
+    """
+    # Group documents by topic
+    topics_dict = {}
+    topic_doc_indices = {}
+    for idx, topic in enumerate(topics):
+        topics_dict.setdefault(topic, [])
+        topic_doc_indices.setdefault(topic, [])
+        if idx < len(documents):
+            topics_dict[topic].append(documents[idx])
+            topic_doc_indices[topic].append(idx)
+
+    # Get labels from topic_info
+    labels_dict = dict(zip(topic_info['Topic'], topic_info['Human_Label']))
+
+    # Run BATCHED LLM analysis for actual speedup
+    llm_analysis_dict = {}
+    llm_success_count = 0
+    llm_fallback_count = 0
+
+    num_topics = len(topics_dict) - (1 if -1 in topics_dict else 0)
+
+    # Batch size: process 5 topics at once
+    batch_size = 5
+    st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
+
+    # Get FAISS index
+    faiss_index = st.session_state.get('faiss_index')
+
+    # Progress tracking
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    # Prepare all topics with FAISS-selected documents
+    all_topics_prepared = []
+    for topic_id, docs in topics_dict.items():
+        if topic_id == -1:
+            continue
+
+        doc_indices = topic_doc_indices.get(topic_id, [])
+        label = labels_dict.get(topic_id, f"Topic {topic_id}")
+
+        # Select docs with FAISS
+        if faiss_index is not None and embeddings is not None and len(doc_indices) > 0:
+            try:
+                topic_embeddings = embeddings[doc_indices]
+                centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
+                _, indices = faiss_index.search(centroid, min(5, len(doc_indices)))
+
+                idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
+                selected_docs = []
+                for idx in indices[0]:
+                    if idx in idx_to_pos:
+                        selected_docs.append(docs[idx_to_pos[idx]])
+                        if len(selected_docs) >= 5:
+                            break
+            except Exception:
+                selected_docs = docs[:5]
+        else:
+            selected_docs = docs[:5]
+
+        all_topics_prepared.append({
+            'topic_id': topic_id,
+            'label': label,
+            'docs': selected_docs
+        })
+
+    # Process in batches
+    num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
+    processed_count = 0
+
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, len(all_topics_prepared))
+        batch = all_topics_prepared[start_idx:end_idx]
+
+        # Update progress
+        status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics)...")
+
+        # Process batch with LLM
+        batch_results = generate_batch_llm_analysis(batch, llm_model)
+
+        # Collect results
+        for topic_item in batch:
+            topic_id = topic_item['topic_id']
+            if topic_id in batch_results and batch_results[topic_id]:
+                llm_analysis_dict[topic_id] = batch_results[topic_id]
+                llm_success_count += 1
+            else:
+                llm_analysis_dict[topic_id] = "No analysis available"
+                llm_fallback_count += 1
+
+            processed_count += 1
+
+        # Update progress bar
+        progress = processed_count / num_topics
+        progress_bar.progress(progress)
+        status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
+
+    # Clear progress
+    progress_bar.empty()
+    status_text.empty()
+
+    # Show stats
+    if llm_success_count > 0:
+        success_pct = (llm_success_count / num_topics) * 100
+        st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
+        if llm_fallback_count > 0:
+            st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis")
+    else:
+        st.warning("⚠️ LLM analysis failed for all topics")
+
+    # Update topic_info with LLM_Analysis
+    topic_info = topic_info.copy()
+    topic_info['LLM_Analysis'] = topic_info['Topic'].map(llm_analysis_dict).fillna("")
+
+    return topic_info
+
 
 # -----------------------------------------------------
 # MAIN APPLICATION FUNCTIONS
@@ -2007,6 +2552,302 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
     umap_embeddings[valid_mask] = reducer.fit_transform(embeddings[valid_mask])
 
     return umap_embeddings
+
+
+# -----------------------------------------------------
+# FAISS INDEXING FOR RAG CHAT
+# -----------------------------------------------------
+def build_faiss_index(embeddings):
+    """Build FAISS index from embeddings for fast similarity search"""
+    if not faiss_available:
+        st.warning("⚠️ FAISS not available. Install with: pip install faiss-cpu or faiss-gpu")
+        return None
+
+    try:
+        dimension = embeddings.shape[1]
+
+        # Use GPU if available
+        if faiss_gpu_available:
+            st.info("🎮 Building FAISS index on GPU...")
+            res = faiss.StandardGpuResources()
+            index = faiss.IndexFlatL2(dimension)
+            gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+            gpu_index.add(embeddings.astype('float32'))
+            return gpu_index
+        else:
+            st.info("💻 Building FAISS index on CPU...")
+            index = faiss.IndexFlatL2(dimension)
+            index.add(embeddings.astype('float32'))
+            return index
+    except Exception as e:
+        st.error(f"❌ Failed to build FAISS index: {str(e)}")
+        return None
+
+
+def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5):
+    """Retrieve top-k most relevant documents using FAISS"""
+    if faiss_index is None:
+        return []
+
+    try:
+        # Encode query
+        query_embedding = safe_model.model.encode(
+            [query],
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )[0].reshape(1, -1).astype('float32')
+
+        # Search FAISS index
+        distances, indices = faiss_index.search(query_embedding, top_k)
+
+        # Get documents
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if 0 <= idx < len(documents):
+                results.append({
+                    'document': documents[idx],
+                    'distance': float(distances[0][i]),
+                    'index': int(idx)
+                })
+
+        return results
+    except Exception as e:
+        st.error(f"❌ Document retrieval error: {str(e)}")
+        return []
+
+
+def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm_model, current_topic_id=None):
+    """Generate response using LLM with retrieved documents as context (RAG)"""
+    if llm_model is None:
+        return "❌ LLM not loaded. Please enable LLM in the sidebar and reload."
+
+    try:
+        model, tokenizer = llm_model
+
+        # Build context from retrieved documents
+        context_parts = []
+        context_parts.append(f"You are analyzing topic modeling results with {len(topics)} topics.")
+
+        if current_topic_id is not None and current_topic_id != -1:
+            topic_row = topic_info_df[topic_info_df['Topic'] == current_topic_id]
+            if len(topic_row) > 0:
+                row = topic_row.iloc[0]
+                context_parts.append(f"\nCurrently viewing Topic {current_topic_id}: {row['Human_Label']}")
+                context_parts.append(f"Keywords: {row['Keywords']}")
+
+        context_parts.append("\nRelevant Documents:")
+        for i, doc_info in enumerate(retrieved_docs[:5], 1):
+            doc_preview = doc_info['document'][:300] + "..." if len(doc_info['document']) > 300 else doc_info['document']
+            context_parts.append(f"\n[Doc {i}]: {doc_preview}")
+
+        context = "\n".join(context_parts)
+
+        # Create prompt
+        prompt = f"""{context}
+
+User Question: {user_query}
+
+Based on the relevant documents and topic information above, provide a clear, helpful answer. Be concise and specific.
+
+Answer:"""
+
+        # Generate response
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=300,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract just the answer part
+        if "Answer:" in response:
+            response = response.split("Answer:")[-1].strip()
+
+        return response
+
+    except Exception as e:
+        st.error(f"❌ LLM generation error: {str(e)}")
+        return f"Error generating response: {str(e)}"
+
+
+def generate_chat_response(user_query, context, topic_info_df, topics, processed_df, current_topic_id=None, use_rag=False, llm_model=None, faiss_index=None, embeddings=None, documents=None, safe_model=None):
+    """
+    Generate a chat response based on user query and topic data.
+    Supports both rule-based and RAG (Retrieval-Augmented Generation) modes.
+
+    Args:
+        current_topic_id: The currently selected topic in the browser (or None if viewing all)
+        use_rag: Whether to use RAG with FAISS + LLM
+        llm_model: Tuple of (model, tokenizer) for RAG
+        faiss_index: FAISS index for document retrieval
+        embeddings: Document embeddings
+        documents: List of all documents
+        safe_model: Embedding model for query encoding
+    """
+    query_lower = user_query.lower()
+
+    # RAG MODE: Use FAISS + LLM for intelligent responses
+    if use_rag and llm_model and faiss_index and documents and safe_model:
+        st.info("🤖 Using RAG mode (FAISS + LLM)...")
+
+        # Retrieve relevant documents
+        retrieved_docs = retrieve_relevant_documents(
+            user_query,
+            faiss_index,
+            embeddings,
+            documents,
+            safe_model,
+            top_k=5
+        )
+
+        if retrieved_docs:
+            st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents")
+
+            # Generate response using LLM with retrieved context
+            response = generate_rag_response(
+                user_query,
+                retrieved_docs,
+                topic_info_df,
+                topics,
+                llm_model,
+                current_topic_id
+            )
+
+            # Add source references
+            response += "\n\n**Sources:**\n"
+            for i, doc in enumerate(retrieved_docs[:3], 1):
+                doc_preview = doc['document'][:100] + "..." if len(doc['document']) > 100 else doc['document']
+                response += f"{i}. {doc_preview}\n"
+
+            return response
+        else:
+            st.warning("⚠️ No relevant documents found, using rule-based fallback")
+
+    # RULE-BASED MODE (fallback or default)
+
+
+    # Handle queries about the current topic
+    if current_topic_id is not None and any(phrase in query_lower for phrase in ['current topic', 'this topic', 'about this']):
+        topic_row = topic_info_df[topic_info_df['Topic'] == current_topic_id]
+        if len(topic_row) > 0:
+            row = topic_row.iloc[0]
+            pct = (row['Count'] / len(processed_df)) * 100
+            response = f"🔍 **Currently Viewing: Topic {current_topic_id}**\n\n"
+            response += f"**Label:** {row['Human_Label']}\n\n"
+            response += f"**Statistics:**\n"
+            response += f"- Documents: {row['Count']:,} ({pct:.1f}% of total)\n"
+            response += f"- Keywords: {row['Keywords']}\n\n"
+            response += "💡 This hierarchical label shows both the main category and specific details separated by ' - '."
+            return response
+
+    # Handle different types of queries
+    if any(word in query_lower for word in ['hello', 'hi', 'hey']):
+        greeting = "👋 Hello! I'm here to help you explore your topic modeling results."
+        if current_topic_id is not None:
+            human_label = topic_info_df[topic_info_df['Topic'] == current_topic_id].iloc[0]['Human_Label'] if len(topic_info_df[topic_info_df['Topic'] == current_topic_id]) > 0 else f"Topic {current_topic_id}"
+            greeting += f"\n\nYou're currently viewing **Topic {current_topic_id}: {human_label}**.\n\nWhat would you like to know?"
+        else:
+            greeting += " What would you like to know?"
+        return greeting
+
+    elif any(word in query_lower for word in ['how many', 'number of', 'count']):
+        if 'topic' in query_lower:
+            num_topics = len([t for t in topics if t != -1])
+            return f"📊 I found **{num_topics} unique topics** in your data. The topics are identified with hierarchical labels showing both the main category and specific details."
+
+        elif 'document' in query_lower or 'doc' in query_lower:
+            if current_topic_id is not None:
+                topic_row = topic_info_df[topic_info_df['Topic'] == current_topic_id]
+                if len(topic_row) > 0:
+                    count = topic_row.iloc[0]['Count']
+                    return f"📄 The current topic has **{count:,} documents**. Your entire dataset contains **{len(processed_df):,} documents** in total."
+            return f"📄 Your dataset contains **{len(processed_df):,} documents** in total."
+
+    elif 'largest' in query_lower or 'biggest' in query_lower or 'most common' in query_lower:
+        top_5 = topic_info_df.nlargest(5, 'Count')[['Topic', 'Human_Label', 'Count']]
+        response = "📈 **Top 5 Largest Topics:**\n\n"
+        for i, (_, row) in enumerate(top_5.iterrows(), 1):
+            pct = (row['Count'] / len(processed_df)) * 100
+            response += f"{i}. **{row['Human_Label']}** (Topic {row['Topic']})\n"
+            response += f"   - {row['Count']:,} documents ({pct:.1f}% of total)\n\n"
+        return response
+
+    elif 'smallest' in query_lower or 'least common' in query_lower:
+        bottom_5 = topic_info_df.nsmallest(5, 'Count')[['Topic', 'Human_Label', 'Count']]
+        response = "📉 **5 Smallest Topics:**\n\n"
+        for i, (_, row) in enumerate(bottom_5.iterrows(), 1):
+            pct = (row['Count'] / len(processed_df)) * 100
+            response += f"{i}. **{row['Human_Label']}** (Topic {row['Topic']})\n"
+            response += f"   - {row['Count']:,} documents ({pct:.1f}% of total)\n\n"
+        return response
+
+    elif re.search(r'topic\s+(\d+)', query_lower):
+        # Extract topic number
+        topic_match = re.search(r'topic\s+(\d+)', query_lower)
+        topic_num = int(topic_match.group(1))
+
+        topic_row = topic_info_df[topic_info_df['Topic'] == topic_num]
+        if len(topic_row) == 0:
+            return f"❌ Sorry, I couldn't find Topic {topic_num}. Please check if this topic number exists in your data."
+
+        row = topic_row.iloc[0]
+        pct = (row['Count'] / len(processed_df)) * 100
+        response = f"🔍 **Topic {topic_num}: {row['Human_Label']}**\n\n"
+        response += f"- **Documents:** {row['Count']:,} ({pct:.1f}% of total)\n"
+        response += f"- **Keywords:** {row['Keywords']}\n\n"
+        response += "💡 This hierarchical label shows the main category and specific details separated by ' - '."
+        return response
+
+    elif any(word in query_lower for word in ['main theme', 'overview', 'summary', 'what are']):
+        num_topics = len([t for t in topics if t != -1])
+        top_3 = topic_info_df.nlargest(3, 'Count')[['Human_Label', 'Count']]
+
+        response = f"📊 **Topic Modeling Overview:**\n\n"
+        response += f"Your data contains **{len(processed_df):,} documents** organized into **{num_topics} topics**.\n\n"
+        response += "**Top 3 Most Common Themes:**\n\n"
+        for i, (_, row) in enumerate(top_3.iterrows(), 1):
+            pct = (row['Count'] / len(processed_df)) * 100
+            response += f"{i}. {row['Human_Label']} - {row['Count']:,} docs ({pct:.1f}%)\n"
+
+        response += f"\n💡 All labels now use a hierarchical format: 'Main Category - Specific Details' for better clarity!"
+        return response
+
+    elif 'hierarchical' in query_lower or 'hierarchy' in query_lower or 'label format' in query_lower:
+        return ("📋 **Hierarchical Label Format:**\n\n"
+                "All topic labels now follow the format: **'Main Category - Specific Details'**\n\n"
+                "**Examples:**\n"
+                "- 'Customer Service - Response Time Issues'\n"
+                "- 'Product Orders - Samsung Washer Delivery'\n"
+                "- 'Technical Support - Installation Problems'\n\n"
+                "This two-tier structure helps you quickly understand both the general theme and the specific focus of each topic!")
+
+    elif 'help' in query_lower or 'what can you' in query_lower:
+        return ("💡 **I can help you with:**\n\n"
+                "- Get overview: 'What are the main themes?'\n"
+                "- Topic details: 'Tell me about topic 5'\n"
+                "- Statistics: 'How many topics are there?'\n"
+                "- Comparisons: 'Which topics are most common?'\n"
+                "- Label format: 'Explain the hierarchical labels'\n\n"
+                "Just ask your question in natural language!")
+
+    else:
+        # Generic response with helpful suggestions
+        return ("🤔 I'm not sure how to answer that specific question. Here are some things you can ask:\n\n"
+                "- 'What are the main themes in my data?'\n"
+                "- 'Tell me about topic 5'\n"
+                "- 'Which topics are most common?'\n"
+                "- 'How many topics are there?'\n"
+                "- 'Explain the hierarchical label format'\n\n"
+                f"**Quick Stats:** {len(processed_df):,} documents across {len([t for t in topics if t != -1])} topics")
 
 def main():
     st.title("🚀 Complete BERTopic with All Features")
@@ -2342,7 +3183,22 @@ def main():
                 with st.spinner("Computing UMAP reduction for fast reclustering..."):
                     umap_embeddings = compute_umap_embeddings(embeddings, n_neighbors, n_components)
                     st.session_state.umap_embeddings = umap_embeddings
-                
+
+                # Step 4: Build FAISS index for RAG and LLM Analysis
+                if use_llm_labeling:
+                    with st.spinner("🔍 Step 4: Building FAISS index for LLM analysis and RAG chat..."):
+                        faiss_index = build_faiss_index(embeddings)
+                        st.session_state.faiss_index = faiss_index
+                        if faiss_index:
+                            st.success("✅ FAISS index ready! Will use for intelligent document selection in LLM analysis.")
+                else:
+                    # Still build for RAG chat even if LLM labeling is disabled
+                    with st.spinner("🔍 Step 4: Building FAISS index for RAG chat..."):
+                        faiss_index = build_faiss_index(embeddings)
+                        st.session_state.faiss_index = faiss_index
+                        if faiss_index:
+                            st.success("✅ FAISS index ready for RAG chat!")
+
                 # ✅ Clear GPU memory before loading LLM
                 if torch.cuda.is_available() and use_llm_labeling:
                     st.info("🧹 Clearing GPU cache before loading LLM...")
@@ -2350,28 +3206,43 @@ def main():
                     gpu_free_after = torch.cuda.mem_get_info()[0] / (1024**3)
                     st.info(f"📊 GPU memory available for LLM: {gpu_free_after:.1f} GB")
 
-                # Step 3.5: Load LLM if enabled
+                # Step 5: Load LLM if enabled
                 llm_model = None
                 if use_llm_labeling and llm_model_name:
                     with st.spinner(f"Loading {llm_model_name} for enhanced labeling..."):
                         llm_model = load_local_llm(llm_model_name, force_cpu=force_llm_cpu)
                         if llm_model:
                             st.success("✅ LLM loaded successfully!")
+                            # Debug: Show model info
+                            model, tokenizer = llm_model
+                            st.info(f"📦 Model loaded: {type(model).__name__} | Tokenizer: {type(tokenizer).__name__}")
                         else:
-                            st.warning("⚠️ LLM failed to load, using TF-IDF labels")
+                            st.error("❌ LLM FAILED TO LOAD!")
+                            st.warning("⚠️ Will use TF-IDF fallback for all labels")
+                            st.info("💡 Common causes:\n"
+                                   "- Insufficient GPU memory (try Force CPU mode)\n"
+                                   "- Insufficient system RAM (need 12GB+ for CPU mode)\n"
+                                   "- Model download failed (check internet connection)\n"
+                                   "- Missing dependencies (install transformers, accelerate)")
+                elif use_llm_labeling and not llm_model_name:
+                    st.error("❌ LLM checkbox is checked but no model selected!")
+                    st.info("Please select an LLM model from the dropdown")
 
-                # Step 4: Create reclusterer
+                # Step 6: Create reclusterer
                 st.session_state.reclusterer = FastReclusterer(
-                    cleaned_docs, embeddings, umap_embeddings, 
+                    cleaned_docs, embeddings, umap_embeddings,
                     llm_model_name=llm_model_name if use_llm_labeling else None
                 )
-                
+
                 # Set LLM model if loaded
                 if llm_model:
                     st.session_state.reclusterer.llm_model = llm_model
                     st.session_state.reclusterer.llm_model_name = llm_model_name
+                    st.success(f"✅ LLM attached to reclusterer: {llm_model_name}")
+                else:
+                    st.warning("⚠️ No LLM model to attach - will use TF-IDF fallback")
 
-                # Step 5: (optional) Seed words parsed
+                # Step 7: (optional) Seed words parsed
                 seed_topic_list = []
                 if seed_words_input:
                     for line in seed_words_input.strip().split('\n'):
@@ -2380,7 +3251,7 @@ def main():
                             if words:
                                 seed_topic_list.append(words)
 
-                # Step 6: Perform initial clustering
+                # Step 8: Perform initial clustering
                 with st.spinner("Performing initial clustering..."):
                     if "Aggressive" in outlier_strategy:
                         method = 'kmeans'
@@ -2483,6 +3354,79 @@ def main():
                 else:
                     st.error("Reclustering failed. Try different parameters.")
 
+        # Add LLM Analysis button (for running LLM analysis post-clustering)
+        st.markdown("---")
+        st.subheader("🤖 Add AI Insights")
+
+        # Check if we already have LLM analysis
+        has_llm_analysis = False
+        if st.session_state.get('current_topic_info') is not None:
+            current_info = st.session_state.current_topic_info
+            if 'LLM_Analysis' in current_info.columns and current_info['LLM_Analysis'].any():
+                has_llm_analysis = True
+                st.info("💡 LLM analysis already exists. Running again will overwrite it.")
+
+        # LLM selection for post-clustering analysis
+        col_llm1, col_llm2 = st.columns([2, 1])
+        with col_llm1:
+            post_llm_model_name = st.selectbox(
+                "Select LLM Model",
+                options=list(LLM_MODEL_CONFIG.keys()),
+                help="Choose an LLM to generate AI-powered insights for your topics",
+                key="post_cluster_llm_selector"
+            )
+
+        with col_llm2:
+            post_llm_force_cpu = st.checkbox(
+                "Force CPU",
+                value=False,
+                help="Use CPU instead of GPU (slower but uses less GPU memory)",
+                key="post_cluster_force_cpu"
+            )
+
+        # Run LLM Analysis button
+        if st.button("🚀 Generate LLM Analysis for Current Topics", type="primary"):
+            # Validate requirements
+            if st.session_state.get('current_topics') is None:
+                st.error("❌ No topics found. Please cluster your data first.")
+            elif st.session_state.get('documents') is None:
+                st.error("❌ No documents found. Please recompute embeddings.")
+            elif st.session_state.get('embeddings') is None:
+                st.error("❌ No embeddings found. Please recompute embeddings.")
+            else:
+                # Load LLM
+                with st.spinner(f"Loading {post_llm_model_name}..."):
+                    post_llm = load_local_llm(post_llm_model_name, force_cpu=post_llm_force_cpu)
+
+                    if post_llm is None:
+                        st.error("❌ Failed to load LLM. Check the error messages above.")
+                    else:
+                        # Run LLM analysis
+                        try:
+                            updated_topic_info = run_llm_analysis_on_topics(
+                                topics=st.session_state.current_topics,
+                                topic_info=st.session_state.current_topic_info,
+                                documents=st.session_state.documents,
+                                embeddings=st.session_state.embeddings,
+                                llm_model=post_llm
+                            )
+
+                            # Update session state with new topic_info
+                            st.session_state.current_topic_info = updated_topic_info
+                            st.session_state.topic_info = updated_topic_info
+
+                            # Clear cached browser_df to force rebuild with new LLM_Analysis
+                            if 'browser_df' in st.session_state:
+                                del st.session_state.browser_df
+
+                            st.success("🎉 LLM analysis added successfully! Refreshing display...")
+                            st.rerun()  # Trigger full refresh to show new column
+
+                        except Exception as e:
+                            st.error(f"❌ Error during LLM analysis: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())
+
         # Display results
         if st.session_state.current_topics is not None:
             topics = st.session_state.current_topics
@@ -2541,13 +3485,21 @@ def main():
                 browser_df['Topic'] = full_topics
                 browser_df['Topic_Label'] = np.where(browser_df['Topic'] == -1, "Outlier",
                                                      "Topic " + browser_df['Topic'].astype(str))
-                # human labels / keywords
+                # human labels / keywords / LLM analysis
                 st.session_state.topic_human = topic_human
                 topic_keywords_map = topic_keywords
                 browser_df['Topic_Human_Label'] = browser_df['Topic'].map(st.session_state.topic_human).fillna(browser_df['Topic_Label'])
                 browser_df['Topic_Keywords'] = browser_df['Topic'].map(topic_keywords_map).fillna('N/A')
+
+                # Add LLM_Analysis column from topic_info
+                if 'LLM_Analysis' in topic_info.columns:
+                    topic_llm_analysis_map = dict(zip(topic_info['Topic'], topic_info['LLM_Analysis']))
+                    browser_df['Topic_LLM_Analysis'] = browser_df['Topic'].map(topic_llm_analysis_map).fillna('')
+                else:
+                    browser_df['Topic_LLM_Analysis'] = ''
+
                 browser_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(browser_df))]
-                
+
                 # Cache in session state
                 st.session_state.browser_df = browser_df
                 st.session_state.last_topics_hash = hash(tuple(topics))
@@ -2593,7 +3545,13 @@ def main():
                 if -1 in display_df['Topic'].values:
                     display_df = display_df[display_df['Topic'] != -1]
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
-                display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
+
+                # Include LLM_Analysis if available
+                if 'LLM_Analysis' in display_df.columns and display_df['LLM_Analysis'].any():
+                    display_df = display_df[['Topic', 'Human_Label', 'LLM_Analysis', 'Keywords', 'Count', 'Percentage']]
+                    st.caption("🤖 **LLM_Analysis** column shows AI-generated insights about each topic")
+                else:
+                    display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
 
                 # Streamlit default dataframe (dark-mode friendly)
                 st.dataframe(display_df, use_container_width=True)
@@ -2980,7 +3938,7 @@ def main():
                             st.info(f"📊 Topic {selected_topic_id}: **{human_label}** — Showing {len(display_df):,} of {len(filtered_df):,} documents")
 
                     # Reorder columns - put topic metadata first
-                    meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_Keywords']
+                    meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_LLM_Analysis', 'Topic_Keywords']
                     other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
                     ordered_cols = [c for c in meta_cols if c in display_df.columns] + other_cols
                     display_df = display_df[ordered_cols]
@@ -3007,6 +3965,147 @@ def main():
                         mime="text/csv"
                     )
 
+                # Chat Interface integrated into Topic Browser
+                st.markdown("---")
+                with st.expander("💬 Ask Questions About Topics (RAG-Powered)", expanded=False):
+                    st.caption("Get AI-powered insights using FAISS retrieval and LLM generation")
+
+                    # RAG Settings
+                    col_rag1, col_rag2 = st.columns(2)
+                    with col_rag1:
+                        use_rag_chat = st.checkbox(
+                            "🤖 Enable RAG Mode (FAISS + LLM)",
+                            value=False,
+                            help="Use Retrieval-Augmented Generation for intelligent responses based on your actual documents"
+                        )
+                    with col_rag2:
+                        if use_rag_chat:
+                            chat_llm_model_name = st.selectbox(
+                                "Chat LLM Model",
+                                options=list(LLM_MODEL_CONFIG.keys()),
+                                help="Select LLM for chat. Can be different from labeling LLM.",
+                                key="chat_llm_selector"
+                            )
+                        else:
+                            chat_llm_model_name = None
+
+                    # Load chat LLM if RAG is enabled
+                    chat_llm = None
+                    if use_rag_chat and chat_llm_model_name:
+                        if st.session_state.get('chat_llm_loaded_model') == chat_llm_model_name:
+                            # Already loaded
+                            chat_llm = st.session_state.get('chat_llm')
+                            st.caption(f"✅ Using cached LLM: {chat_llm_model_name.split('/')[-1]}")
+                        else:
+                            # Need to load
+                            with st.spinner(f"Loading {chat_llm_model_name} for chat..."):
+                                chat_llm = load_local_llm(chat_llm_model_name, force_cpu=False)
+                                if chat_llm:
+                                    st.session_state.chat_llm = chat_llm
+                                    st.session_state.chat_llm_loaded_model = chat_llm_model_name
+                                    st.success(f"✅ Chat LLM loaded: {chat_llm_model_name.split('/')[-1]}")
+                                else:
+                                    st.error("❌ Failed to load chat LLM. Falling back to rule-based mode.")
+                                    use_rag_chat = False
+
+                    # Check if FAISS index is available
+                    has_faiss = st.session_state.get('faiss_index') is not None
+                    if use_rag_chat and not has_faiss:
+                        st.warning("⚠️ FAISS index not available. Please recompute embeddings to enable RAG mode.")
+                        use_rag_chat = False
+
+                    # Initialize chat history in session state
+                    if 'chat_history' not in st.session_state:
+                        st.session_state.chat_history = []
+
+                    # Chat input at the top with clear button
+                    col_input, col_clear = st.columns([4, 1])
+                    with col_clear:
+                        if st.button("🗑️ Clear", key="clear_chat_browser", help="Clear chat history"):
+                            st.session_state.chat_history = []
+                            st.rerun()
+
+                    # Chat input
+                    if prompt := st.chat_input("Ask a question about your topics...", key="topic_browser_chat"):
+                        # Add user message to chat history
+                        st.session_state.chat_history.append({"role": "user", "content": prompt})
+
+                        # Generate response based on topic data and current context
+                        with st.spinner("Thinking..."):
+                            # Get topic information
+                            topic_info_for_chat = normalize_topic_info(topic_info)
+
+                            # Create context from topic data
+                            context_parts = []
+                            context_parts.append(f"Total documents: {len(processed_df):,}")
+                            context_parts.append(f"Number of topics: {unique_topics}")
+                            context_parts.append(f"Outliers: {outlier_count} ({100-coverage:.1f}%)")
+
+                            # Add current topic context
+                            if selected_topic_id != "all":
+                                human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
+                                context_parts.append(f"\nCurrently viewing: Topic {selected_topic_id} - {human_label}")
+                                topic_row = topic_info_for_chat[topic_info_for_chat['Topic'] == selected_topic_id]
+                                if len(topic_row) > 0:
+                                    context_parts.append(f"Keywords: {topic_row.iloc[0]['Keywords']}")
+                                    context_parts.append(f"Document count: {topic_row.iloc[0]['Count']}")
+
+                            context_parts.append("\nTop Topics:")
+
+                            # Add top 10 topics
+                            top_topics = topic_info_for_chat.nlargest(10, 'Count')[['Topic', 'Human_Label', 'Keywords', 'Count']]
+                            for _, row in top_topics.iterrows():
+                                context_parts.append(f"- Topic {row['Topic']}: {row['Human_Label']} ({row['Count']} docs)")
+                                context_parts.append(f"  Keywords: {row['Keywords']}")
+
+                            context = "\n".join(context_parts)
+
+                            # Generate response with RAG or rule-based
+                            response = generate_chat_response(
+                                prompt,
+                                context,
+                                topic_info_for_chat,
+                                topics,
+                                processed_df,
+                                current_topic_id=selected_topic_id if selected_topic_id != "all" else None,
+                                use_rag=use_rag_chat,
+                                llm_model=chat_llm if use_rag_chat else None,
+                                faiss_index=st.session_state.get('faiss_index'),
+                                embeddings=st.session_state.get('embeddings'),
+                                documents=st.session_state.get('documents'),
+                                safe_model=st.session_state.get('safe_model')
+                            )
+
+                            # Add assistant response to chat history
+                            st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+                        # Rerun to display the new messages
+                        st.rerun()
+
+                    # Display welcome message or chat history
+                    st.markdown("---")
+
+                    if len(st.session_state.chat_history) == 0:
+                        if use_rag_chat:
+                            st.info("🤖 **RAG Mode Active!** I'll retrieve relevant documents and use LLM to answer your questions.\n\n"
+                                   "Try asking:\n"
+                                   "- 'What do customers say about delivery?'\n"
+                                   "- 'Find issues related to installation'\n"
+                                   "- 'Summarize the main complaints'\n"
+                                   "- 'What are people saying about Samsung products?'")
+                        else:
+                            st.info("👋 Ask me anything about your topics. For example:\n"
+                                   "- 'What are the main themes in my data?'\n"
+                                   "- 'Tell me about the current topic'\n"
+                                   "- 'Which topics are most common?'\n"
+                                   "- 'Show me insights about customer complaints'\n\n"
+                                   "💡 **Tip:** Enable RAG Mode above for AI-powered responses!")
+                    else:
+                        # Display chat history (newest first)
+                        for message in reversed(st.session_state.chat_history):
+                            with st.chat_message(message["role"]):
+                                st.markdown(message["content"])
+
             with tabs[5]:  # Export
                 st.subheader("💾 Export Results")
 
@@ -3025,12 +4124,18 @@ def main():
                     )
 
                 with col2:
+                    # Include LLM_Analysis if available
+                    if 'LLM_Analysis' in safe_topic_info.columns and safe_topic_info['LLM_Analysis'].any():
+                        export_cols = ['Topic', 'Human_Label', 'LLM_Analysis', 'Keywords', 'Count']
+                    else:
+                        export_cols = ['Topic', 'Human_Label', 'Keywords', 'Count']
+
                     st.download_button(
                         label="📥 Download Topic Info (CSV)",
-                        data=convert_df_to_csv(safe_topic_info[['Topic','Human_Label','Keywords','Count']]),
+                        data=convert_df_to_csv(safe_topic_info[export_cols]),
                         file_name=f"topic_info_{st.session_state.uploaded_file_name}_{n_topics_slider}topics.csv",
                         mime="text/csv",
-                        help="Topic descriptions and statistics (with human labels)"
+                        help="Topic descriptions and statistics (with human labels and LLM analysis if enabled)"
                     )
 
                 with col3:
