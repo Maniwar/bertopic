@@ -548,24 +548,56 @@ Sample documents:
 
 What are users saying? Provide one clear sentence describing their main concerns or feedback."""
 
-        # Generate
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=100,  # Slightly longer for complete sentences
-                temperature=0.5,
-                do_sample=True,
-                top_p=0.9,
-                pad_token_id=tokenizer.eos_token_id
+        # ✅ CARMACK FIX: Use apply_chat_template for Phi-3 and other chat models
+        # This is why LLM analysis dropped from 8/10 to 2/10 - wrong tokenization!
+        try:
+            # Try chat template first (works for Phi-3, Llama, etc.)
+            messages = [{"role": "user", "content": prompt}]
+            inputs = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt"
             )
 
-        # Decode only the new tokens (exclude the prompt)
-        generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
-        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            if torch.cuda.is_available():
+                inputs = inputs.to(model.device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    inputs,
+                    max_new_tokens=100,
+                    temperature=0.5,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            # Decode only the new tokens (exclude the prompt)
+            input_length = inputs.shape[1]
+            generated_ids = outputs[0][input_length:]
+            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        except Exception as e:
+            # Fallback to direct tokenization for non-chat models
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
+
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=100,
+                    temperature=0.5,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            # Decode only the new tokens (exclude the prompt)
+            input_length = inputs['input_ids'].shape[1]
+            generated_ids = outputs[0][input_length:]
+            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
         # Clean up
         response = response.strip()
@@ -1891,8 +1923,20 @@ class FastReclusterer:
         self.llm_model = None  # Will be set if LLM labeling is enabled
         self.llm_model_name = llm_model_name  # Store model name for dynamic doc count
 
-    def recluster(self, n_topics, min_topic_size=10, use_reduced=True, method='kmeans'):
-        """Quickly recluster documents into new topics"""
+    def recluster(self, n_topics, min_topic_size=10, use_reduced=True, method='kmeans', seed_words=None):
+        """
+        Quickly recluster documents into new topics.
+
+        ✅ CARMACK: Added seed_words parameter for guided clustering.
+
+        Args:
+            n_topics: Number of topics to create
+            min_topic_size: Minimum documents per topic
+            use_reduced: Use UMAP embeddings if available
+            method: 'kmeans' or 'hdbscan'
+            seed_words: List of keyword lists for guided clustering
+                       e.g., [["finance", "money"], ["marketing", "ads"]]
+        """
         clustering_embeddings = self.umap_embeddings if (use_reduced and self.umap_embeddings is not None) else self.embeddings
 
         valid_mask = np.any(clustering_embeddings != 0, axis=1)
@@ -1904,14 +1948,67 @@ class FastReclusterer:
 
         try:
             if method == 'kmeans':
+                # ✅ CARMACK: Use seed words to initialize cluster centroids
+                init_centroids = None
+                if seed_words and len(seed_words) > 0:
+                    try:
+                        # Get embedding model from session state
+                        model = st.session_state.get('safe_model')
+                        if model and hasattr(model, 'model'):
+                            # Encode seed word lists (join into phrases)
+                            seed_phrases = [" ".join(words) for words in seed_words[:n_topics]]
+                            seed_embeddings = model.model.encode(seed_phrases, convert_to_numpy=True)
+
+                            # Project to same space if using UMAP
+                            if use_reduced and self.umap_embeddings is not None:
+                                # For UMAP space, we can't directly project
+                                # Instead, find nearest documents in original space and use their UMAP coords
+                                init_centroids_list = []
+                                for seed_emb in seed_embeddings:
+                                    # Find most similar document in original embeddings
+                                    similarities = np.dot(self.embeddings, seed_emb)
+                                    best_idx = np.argmax(similarities)
+                                    # Use its UMAP coordinates
+                                    init_centroids_list.append(self.umap_embeddings[best_idx])
+                                init_centroids = np.array(init_centroids_list)
+                            else:
+                                init_centroids = seed_embeddings
+
+                            # Pad with random centroids if we have fewer seed words than topics
+                            if len(init_centroids) < n_topics:
+                                remaining = n_topics - len(init_centroids)
+                                random_indices = np.random.choice(len(valid_embeddings), remaining, replace=False)
+                                random_centroids = valid_embeddings[random_indices]
+                                init_centroids = np.vstack([init_centroids, random_centroids])
+
+                            init_centroids = init_centroids[:n_topics]  # Trim if too many
+                            st.info(f"🎯 Using {len(seed_words)} seed word sets to guide clustering")
+                    except Exception as e:
+                        st.warning(f"⚠️ Could not use seed words: {str(e)}")
+                        init_centroids = None
+
+                # Cluster with or without seed initialization
                 if self.use_gpu:
                     try:
                         from cuml.cluster import KMeans as cuKMeans
+                        # cuML doesn't support init parameter, so skip seed words for GPU
+                        if init_centroids is not None:
+                            st.info("⚠️ GPU clustering doesn't support seed words, using random init")
                         clusterer = cuKMeans(n_clusters=min(n_topics, len(valid_embeddings)), random_state=42)
                     except:
-                        clusterer = KMeans(n_clusters=min(n_topics, len(valid_embeddings)), random_state=42)
+                        clusterer = KMeans(
+                            n_clusters=min(n_topics, len(valid_embeddings)),
+                            init=init_centroids if init_centroids is not None else 'k-means++',
+                            n_init=1 if init_centroids is not None else 10,
+                            random_state=42
+                        )
                 else:
-                    clusterer = KMeans(n_clusters=min(n_topics, len(valid_embeddings)), random_state=42)
+                    clusterer = KMeans(
+                        n_clusters=min(n_topics, len(valid_embeddings)),
+                        init=init_centroids if init_centroids is not None else 'k-means++',
+                        n_init=1 if init_centroids is not None else 10,
+                        random_state=42
+                    )
 
                 valid_topics = clusterer.fit_predict(valid_embeddings)
             else:
@@ -3195,6 +3292,11 @@ def main():
                             if words:
                                 seed_topic_list.append(words)
 
+                # Store seed words in session state for reclustering
+                st.session_state.seed_words = seed_topic_list if seed_topic_list else None
+                if seed_topic_list:
+                    st.info(f"🎯 Loaded {len(seed_topic_list)} seed word sets for guided clustering")
+
                 # Step 8: Perform initial clustering
                 with st.spinner("Performing initial clustering..."):
                     if "Aggressive" in outlier_strategy:
@@ -3208,7 +3310,8 @@ def main():
                         n_topics=initial_n_topics,
                         min_topic_size=min_topic_size,
                         use_reduced=umap_embeddings is not None,
-                        method=method
+                        method=method,
+                        seed_words=seed_topic_list if seed_topic_list else None
                     )
 
                     if topics is None:
@@ -3264,15 +3367,25 @@ def main():
                 help="Faster reclustering using reduced dimensions"
             )
 
+        # ✅ CARMACK: Show seed words status
+        seed_words_active = st.session_state.get('seed_words', None)
+        if seed_words_active:
+            st.info(f"🎯 **Seed Words Active:** {len(seed_words_active)} keyword sets will guide clustering")
+        else:
+            st.caption("💡 No seed words loaded. Clustering will be unsupervised.")
+
         # Recluster button
         if st.button("🔄 Recluster with New Settings", type="secondary"):
             with st.spinner(f"Reclustering into {n_topics_slider} topics... (This is fast!)"):
                 method = 'kmeans' if "K-means" in clustering_method else 'hdbscan'
+                # ✅ CARMACK: Pass seed words from session state
+                seed_words = st.session_state.get('seed_words', None)
                 topics, topic_info = st.session_state.reclusterer.recluster(
                     n_topics=n_topics_slider,
                     min_topic_size=st.session_state.min_topic_size,
                     use_reduced=use_reduced and st.session_state.umap_embeddings is not None,
-                    method=method
+                    method=method,
+                    seed_words=seed_words
                 )
 
                 if topics is not None:
