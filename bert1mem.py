@@ -786,14 +786,9 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     try:
         model, tokenizer = llm_model
 
-        # Build prompt with STRICT output format - no ambiguity allowed
-        prompt_parts = [
-            "Analyze these customer topics. You MUST respond in EXACTLY this format for each topic:\n",
-            "###TOPIC_START:{topic_id}",
-            "{your 2-3 sentence analysis here}",
-            "###TOPIC_END\n",
-            "Do NOT include any other text, headers, or formatting. Just the analysis between the markers.\n"
-        ]
+        # Build prompt - SIMPLE like RAG (which works!)
+        # Don't fight the LLM's natural output. Just ask clearly and parse flexibly.
+        prompt_parts = ["Analyze each topic in 2-3 sentences. For each topic, describe what users are saying, key patterns, and any issues.\n"]
 
         for item in topic_batch:
             topic_id = item['topic_id']
@@ -808,11 +803,9 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
             docs_text = " | ".join(cleaned)
 
-            prompt_parts.append(f"\n--- TOPIC {topic_id}: {label} ---")
-            prompt_parts.append(f"Sample documents: {docs_text}")
-            prompt_parts.append(f"\n###TOPIC_START:{topic_id}")
-            prompt_parts.append("(Your analysis here - describe what users are saying, key patterns, and any issues)")
-            prompt_parts.append("###TOPIC_END\n")
+            prompt_parts.append(f"\nTopic {topic_id}: {label}")
+            prompt_parts.append(f"Documents: {docs_text}")
+            prompt_parts.append(f"Analysis:")
 
         prompt = "\n".join(prompt_parts)
 
@@ -855,36 +848,56 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
         log_debug(f"Response length: {len(response)} chars", "info")
         log_debug(f"Full response:\n{response}", "info")
 
-        # SIMPLE DETERMINISTIC PARSER - no strategies, no guessing
+        # SIMPLE PARSER - like RAG, just split and extract
         import re
 
-        # Pattern: ###TOPIC_START:123 ... ###TOPIC_END
-        pattern = r'###TOPIC_START:(\d+)\s+(.*?)\s*###TOPIC_END'
-        matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
-
         results = {}
-        for topic_id_str, analysis_text in matches:
-            topic_id = int(topic_id_str)
-            analysis = analysis_text.strip()
 
-            # Remove common LLM artifacts
-            analysis = re.sub(r'^\(.*?\)', '', analysis).strip()  # Remove (Your analysis here)
-            analysis = analysis.strip('"\'.,;')
+        # Split response by "Topic X:" markers
+        topic_sections = re.split(r'Topic\s+(\d+):', response)
 
-            if len(analysis) > 15:  # Minimum viable analysis
-                results[topic_id] = analysis
-                log_debug(f"✅ Topic {topic_id}: {analysis[:100]}", "success")
-            else:
-                log_debug(f"⚠️ Topic {topic_id}: Too short ({len(analysis)} chars): '{analysis}'", "warning")
+        # topic_sections = [before_text, topic_id_1, content_1, topic_id_2, content_2, ...]
+        # We want pairs: (topic_id, content)
+        for i in range(1, len(topic_sections), 2):
+            if i + 1 < len(topic_sections):
+                topic_id = int(topic_sections[i])
+                content = topic_sections[i + 1]
+
+                # Extract everything after "Analysis:" (like RAG does with "Answer:")
+                if "Analysis:" in content:
+                    analysis = content.split("Analysis:", 1)[1].strip()
+
+                    # Clean up - take only until next "Topic" or "Documents:"
+                    # (in case multiple topics are smooshed together)
+                    if "Topic " in analysis:
+                        analysis = analysis.split("Topic ")[0].strip()
+                    if "Documents:" in analysis:
+                        analysis = analysis.split("Documents:")[0].strip()
+
+                    # Remove common artifacts
+                    analysis = analysis.strip('"\'.,;[](){}')
+
+                    # Take first few lines (LLMs ramble)
+                    lines = analysis.split('\n')
+                    substantial = [l.strip() for l in lines if len(l.strip()) > 15]
+                    if substantial:
+                        analysis = ' '.join(substantial[:5])  # Max 5 lines
+
+                    if len(analysis) > 15:
+                        results[topic_id] = analysis
+                        log_debug(f"✅ Topic {topic_id}: {analysis[:100]}", "success")
+                    else:
+                        log_debug(f"⚠️ Topic {topic_id}: Too short ({len(analysis)} chars)", "warning")
+                else:
+                    log_debug(f"⚠️ Topic {topic_id}: No 'Analysis:' marker found", "warning")
 
         # Log what we got
         if results:
-            log_debug(f"✅ Parsed {len(results)}/{len(topic_batch)} topics successfully", "success")
+            log_debug(f"✅ Parsed {len(results)}/{len(topic_batch)} topics", "success")
             st.caption(f"✅ Extracted {len(results)} topic analyses")
         else:
             log_debug(f"❌ PARSING FAILED: 0 results extracted", "error")
-            log_debug(f"Expected format: ###TOPIC_START:123 ... ###TOPIC_END", "error")
-            log_debug(f"LLM likely didn't follow instructions. Check response above.", "error")
+            log_debug(f"Response didn't contain 'Topic X:' and 'Analysis:' patterns", "error")
             st.error(f"❌ Parser found 0 results. Check Debug Log to see what LLM generated.")
 
         return results
