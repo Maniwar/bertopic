@@ -778,17 +778,7 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     """
     Generate LLM analysis for multiple topics in a single batch call.
 
-    This is MUCH faster than processing topics one-by-one because:
-    1. Single LLM inference call for multiple topics
-    2. Better GPU utilization
-    3. No thread serialization issues
-
-    Args:
-        topic_batch: List of dicts with keys: topic_id, label, docs
-        llm_model: Tuple of (model, tokenizer)
-
-    Returns:
-        Dict mapping topic_id to analysis string
+    Carmack's law: Make the output format deterministic, then parsing becomes trivial.
     """
     if not topic_batch or llm_model is None:
         return {}
@@ -796,42 +786,54 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     try:
         model, tokenizer = llm_model
 
-        # Build batched prompt - ✅ ENHANCED for more detailed analysis
-        prompt_parts = ["Analyze these customer topics. For each, provide a detailed 2-3 sentence analysis covering:\n"]
-        prompt_parts.append("1) What users are saying/asking")
-        prompt_parts.append("2) Key patterns or themes")
-        prompt_parts.append("3) Any notable issues or trends\n")
+        # Build prompt with STRICT output format - no ambiguity allowed
+        prompt_parts = [
+            "Analyze these customer topics. You MUST respond in EXACTLY this format for each topic:\n",
+            "###TOPIC_START:{topic_id}",
+            "{your 2-3 sentence analysis here}",
+            "###TOPIC_END\n",
+            "Do NOT include any other text, headers, or formatting. Just the analysis between the markers.\n"
+        ]
 
         for item in topic_batch:
             topic_id = item['topic_id']
             label = item['label']
             docs = item['docs']
 
-            # ✅ CLEAN: Deduplicate and remove repetition
-            cleaned = clean_docs_for_llm(docs, max_docs=5, max_length=200)
+            # Clean docs - remove repetition and noise
+            cleaned = clean_docs_for_llm(docs, max_docs=5, max_length=150)
 
-            # Skip if no valid docs after cleaning
             if not cleaned:
                 continue
 
             docs_text = " | ".join(cleaned)
 
-            prompt_parts.append(f"\nTopic {topic_id} - {label}:")
+            prompt_parts.append(f"\n--- TOPIC {topic_id}: {label} ---")
             prompt_parts.append(f"Sample documents: {docs_text}")
-            prompt_parts.append(f"Detailed Analysis:")
+            prompt_parts.append(f"\n###TOPIC_START:{topic_id}")
+            prompt_parts.append("(Your analysis here - describe what users are saying, key patterns, and any issues)")
+            prompt_parts.append("###TOPIC_END\n")
 
         prompt = "\n".join(prompt_parts)
 
-        # Generate - ✅ MORE TOKENS for detailed analysis
+        # Log the prompt we're sending
+        log_debug(f"=== BATCH LLM ANALYSIS (GPU WORK STARTING) ===", "info")
+        log_debug(f"Processing {len(topic_batch)} topics in one batch", "info")
+        log_debug(f"Prompt length: {len(prompt)} chars", "info")
+
+        # Tokenize
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3000)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
 
+        # GPU inference - this is where we spend 30+ seconds
+        st.caption("⚙️ GPU inference in progress (this takes 20-60 seconds)...")
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=500,  # ✅ INCREASED: More tokens for detailed multi-sentence analysis
-                temperature=0.5,
+                max_new_tokens=500,
+                temperature=0.3,  # Lower temp for more consistent formatting
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id
@@ -839,121 +841,51 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # ✅ LOG to persistent debug
-        log_debug(f"=== BATCH LLM ANALYSIS ===", "info")
-        log_debug(f"Batch size: {len(topic_batch)} topics", "info")
+        st.caption(f"✅ GPU inference complete. Response: {len(response)} chars")
+
+        # FORCE SHOW FIRST RESPONSE - critical debugging
+        if 'first_batch_llm_response' not in st.session_state:
+            st.session_state.first_batch_llm_response = True
+            st.error("🔍 FIRST BATCH LLM RESPONSE (showing once, then parsing):")
+            st.code(response, language="text")
+            st.warning("⬆️ READ THE OUTPUT ABOVE - Does it follow the ###TOPIC_START/END format?")
+            st.info("This debug will not show again. Check the Debug Log expander for future responses.")
+
+        # Log to persistent debug
         log_debug(f"Response length: {len(response)} chars", "info")
         log_debug(f"Full response:\n{response}", "info")
 
-        # Parse responses for each topic - ENHANCED PARSING with multiple strategies
+        # SIMPLE DETERMINISTIC PARSER - no strategies, no guessing
+        import re
+
+        # Pattern: ###TOPIC_START:123 ... ###TOPIC_END
+        pattern = r'###TOPIC_START:(\d+)\s+(.*?)\s*###TOPIC_END'
+        matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+
         results = {}
+        for topic_id_str, analysis_text in matches:
+            topic_id = int(topic_id_str)
+            analysis = analysis_text.strip()
 
-        # Strategy 1: Try the structured parsing first
-        log_debug("Starting Strategy 1: Line-by-line parsing", "info")
-        lines = response.split('\n')
-        current_topic_id = None
-        current_analysis = []
+            # Remove common LLM artifacts
+            analysis = re.sub(r'^\(.*?\)', '', analysis).strip()  # Remove (Your analysis here)
+            analysis = analysis.strip('"\'.,;')
 
-        for idx, line in enumerate(lines):
-            line = line.strip()
-            if not line:
-                continue
-
-            # Track which topic we're parsing - MORE FLEXIBLE matching
-            # Look for "Topic X" anywhere in the line, not just at start
-            if 'Topic ' in line:
-                # Try to extract topic number
-                import re
-                topic_match = re.search(r'Topic\s+(\d+)', line, re.IGNORECASE)
-                if topic_match:
-                    # Save previous topic's analysis if we have one
-                    if current_topic_id is not None and current_analysis:
-                        analysis_text = ' '.join(current_analysis).strip()
-                        # Clean up common prefixes/suffixes
-                        analysis_text = analysis_text.strip('"\'.,;[](){}')
-                        analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
-                        if analysis_text and len(analysis_text) > 10:
-                            results[current_topic_id] = analysis_text
-                            log_debug(f"Topic {current_topic_id}: Extracted {len(analysis_text)} chars: '{analysis_text[:100]}'", "success")
-                        else:
-                            log_debug(f"Topic {current_topic_id}: Analysis too short ({len(analysis_text)} chars): '{analysis_text}'", "warning")
-
-                    # Start new topic
-                    current_topic_id = int(topic_match.group(1))
-                    current_analysis = []
-                    log_debug(f"Line {idx}: Found Topic {current_topic_id}", "info")
-                    continue
-
-            # Skip lines that are clearly not analysis
-            if current_topic_id is None:
-                continue
-
-            skip_patterns = ['Sample documents:', 'Analyze these', 'provide a detailed',
-                           '1) What users', '2) Key patterns', '3) Any notable',
-                           'Topic:', 'Documents:', 'Analysis for']
-            if any(pattern in line for pattern in skip_patterns):
-                continue
-
-            # Look for "Analysis:" markers and capture what follows
-            if 'Analysis:' in line or 'analysis:' in line.lower():
-                parts = line.split(':', 1)
-                if len(parts) == 2 and parts[1].strip():
-                    current_analysis.append(parts[1].strip())
-                continue
-
-            # Capture substantial text (not questions or prompts)
-            if len(line) > 15 and not line.endswith('?') and not line.startswith(('-', '*', '•')):
-                # This looks like analysis content
-                current_analysis.append(line)
-
-        # Don't forget the last topic
-        if current_topic_id is not None and current_analysis:
-            analysis_text = ' '.join(current_analysis).strip()
-            analysis_text = analysis_text.strip('"\'.,;[](){}')
-            import re
-            analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
-            if analysis_text and len(analysis_text) > 10:
-                results[current_topic_id] = analysis_text
-                log_debug(f"Topic {current_topic_id} (last): Extracted {len(analysis_text)} chars: '{analysis_text[:100]}'", "success")
+            if len(analysis) > 15:  # Minimum viable analysis
+                results[topic_id] = analysis
+                log_debug(f"✅ Topic {topic_id}: {analysis[:100]}", "success")
             else:
-                log_debug(f"Topic {current_topic_id} (last): Too short ({len(analysis_text)} chars): '{analysis_text}'", "warning")
+                log_debug(f"⚠️ Topic {topic_id}: Too short ({len(analysis)} chars): '{analysis}'", "warning")
 
-        # Strategy 2: If structured parsing failed, try splitting by "Topic X" markers
-        if not results:
-            log_debug("Strategy 1 got 0 results. Trying Strategy 2: Regex split", "warning")
-            import re
-            topic_sections = re.split(r'Topic\s+(\d+)', response, flags=re.IGNORECASE)
-            log_debug(f"Split into {len(topic_sections)} sections", "info")
-            # topic_sections will be: [before, id1, content1, id2, content2, ...]
-            for i in range(1, len(topic_sections), 2):
-                if i + 1 < len(topic_sections):
-                    topic_id = int(topic_sections[i])
-                    content = topic_sections[i + 1]
-
-                    # Extract meaningful text (skip prompt/labels)
-                    lines = [l.strip() for l in content.split('\n') if l.strip()]
-                    analysis_lines = []
-                    for line in lines:
-                        # Skip metadata lines
-                        if any(skip in line for skip in ['Sample documents:', '-', 'Analysis:', 'Detailed Analysis:']):
-                            continue
-                        # Keep substantial sentences
-                        if len(line) > 20 and not line.endswith(':'):
-                            analysis_lines.append(line)
-
-                    if analysis_lines:
-                        analysis = ' '.join(analysis_lines[:5])  # Take up to 5 lines
-                        if len(analysis) > 20:
-                            results[topic_id] = analysis
-                            log_debug(f"Topic {topic_id}: Strategy 2 extracted {len(analysis)} chars", "success")
-
-        # ✅ FINAL SUMMARY
+        # Log what we got
         if results:
-            log_debug(f"Successfully parsed {len(results)}/{len(topic_batch)} topics from batch", "success")
-            for topic_id, analysis in results.items():
-                log_debug(f"Topic {topic_id}: {analysis[:150]}", "info")
+            log_debug(f"✅ Parsed {len(results)}/{len(topic_batch)} topics successfully", "success")
+            st.caption(f"✅ Extracted {len(results)} topic analyses")
         else:
-            log_debug(f"BATCH PARSING FAILED: 0 results from {len(response)} char response", "error")
+            log_debug(f"❌ PARSING FAILED: 0 results extracted", "error")
+            log_debug(f"Expected format: ###TOPIC_START:123 ... ###TOPIC_END", "error")
+            log_debug(f"LLM likely didn't follow instructions. Check response above.", "error")
+            st.error(f"❌ Parser found 0 results. Check Debug Log to see what LLM generated.")
 
         return results
 
@@ -966,9 +898,7 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
 def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=500):
     """
-    Generate detailed analysis of what users are saying in this topic.
-
-    ✅ ENHANCED: Now generates 2-3 sentence detailed analysis instead of one sentence.
+    Individual topic analysis - simpler than batch, but still needs strict formatting.
     """
     if not sample_docs or llm_model is None:
         return None
@@ -976,27 +906,24 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
     try:
         model, tokenizer = llm_model
 
-        # ✅ CLEAN: Deduplicate and remove repetition
-        cleaned_docs = clean_docs_for_llm(sample_docs, max_docs=8, max_length=200)
+        # Clean docs
+        cleaned_docs = clean_docs_for_llm(sample_docs, max_docs=8, max_length=150)
         if not cleaned_docs:
             return None
 
-        # Build detailed prompt with cleaned docs
         docs_text = "\n".join([f"- {doc}" for doc in cleaned_docs])
 
+        # STRICT OUTPUT FORMAT
         prompt = f"""Topic: {topic_label}
 
 Sample documents:
 {docs_text}
 
-Analyze this topic in 2-3 sentences covering:
-1) What users are saying/asking
-2) Key patterns or themes
-3) Any notable issues or trends
+Write a 2-3 sentence analysis covering what users are saying, key patterns, and any issues.
 
-Detailed Analysis:"""
+ANALYSIS:"""
 
-        # Generate - ✅ MORE TOKENS
+        # Inference
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
@@ -1004,8 +931,8 @@ Detailed Analysis:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=250,  # ✅ INCREASED for detailed analysis
-                temperature=0.5,
+                max_new_tokens=200,
+                temperature=0.3,  # Lower for consistency
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id
@@ -1013,74 +940,36 @@ Detailed Analysis:"""
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # ✅ DEBUG: Show full response for individual analysis
-        st.caption(f"🔍 Individual analysis for Topic {topic_id}: Response length {len(response)} chars")
-        st.caption(f"📝 Full individual response:\n```\n{response}\n```")
-
-        # Extract answer - ✅ IMPROVED: Try multiple extraction methods
-        extracted = None
-
-        # Method 1: Look for "Detailed Analysis:"
-        if "Detailed Analysis:" in response:
-            extracted = response.split("Detailed Analysis:")[-1].strip()
-            st.caption(f"✅ Method 1: Extracted after 'Detailed Analysis:' ({len(extracted)} chars)")
-        # Method 2: Look for "Analysis:"
-        elif "Analysis:" in response:
-            extracted = response.split("Analysis:")[-1].strip()
-            st.caption(f"✅ Method 2: Extracted after 'Analysis:' ({len(extracted)} chars)")
-        # Method 3: Look for content after the prompt
-        elif "Sample documents:" in response:
-            # Take everything after the last "Sample documents:" section
-            parts = response.split("Sample documents:")
-            if len(parts) > 1:
-                # Get text after sample docs, skip the docs themselves
-                remaining = parts[-1]
-                # Find where the actual analysis starts (after docs list)
-                lines = remaining.split('\n')
-                analysis_lines = [l for l in lines if len(l.strip()) > 20 and not l.strip().startswith('-')]
-                if analysis_lines:
-                    extracted = ' '.join(analysis_lines[:3])  # First 3 substantial lines
-                    st.caption(f"✅ Method 3: Extracted from after sample docs ({len(extracted)} chars)")
-
-        # Method 4: If all else fails, take the end of the response
-        if not extracted or len(extracted.strip()) < 15:
-            st.caption(f"⚠️ Methods 1-3 failed or too short ({len(extracted) if extracted else 0} chars), trying Method 4...")
-            # Take last substantial part of response
+        # SIMPLE EXTRACTION
+        if "ANALYSIS:" in response:
+            analysis = response.split("ANALYSIS:")[-1].strip()
+        else:
+            # Fallback: take everything after the last document line
             lines = response.split('\n')
-            substantial = [l.strip() for l in lines if len(l.strip()) > 20]
-            if substantial:
-                extracted = ' '.join(substantial[-3:])  # Last 3 substantial lines
-                st.caption(f"✅ Method 4: Extracted last substantial lines ({len(extracted)} chars)")
+            # Find substantial lines that aren't part of the prompt
+            analysis_lines = [l.strip() for l in lines
+                            if len(l.strip()) > 20
+                            and not l.strip().startswith('-')
+                            and 'Sample documents' not in l
+                            and 'Topic:' not in l]
+            if analysis_lines:
+                analysis = ' '.join(analysis_lines[-3:])  # Last 3 substantial lines
             else:
-                st.warning(f"❌ Method 4: No substantial lines found")
+                return None
 
-        if not extracted:
-            st.error(f"❌ Topic {topic_id}: All extraction methods failed!")
+        # Clean
+        analysis = analysis.strip('"\'.,;[](){}')
+        analysis = analysis[:max_length] if len(analysis) > max_length else analysis
+
+        if len(analysis) > 15:
+            log_debug(f"✅ Individual topic {topic_id}: {analysis[:100]}", "success")
+            return analysis
+        else:
+            log_debug(f"⚠️ Topic {topic_id}: Analysis too short ({len(analysis)} chars)", "warning")
             return None
 
-        # Clean up - ✅ KEEP MULTIPLE SENTENCES
-        response = extracted.strip()
-        response = response.strip('"\'.,;[](){}')
-
-        # Remove any remaining prompt fragments
-        for prompt_fragment in ['Topic:', 'Sample documents:', 'Analyze this topic', '1)', '2)', '3)']:
-            if response.startswith(prompt_fragment):
-                response = response.split('\n', 1)[-1].strip()
-
-        # ✅ HIGHER LENGTH LIMIT for detailed analysis
-        if len(response) > max_length:
-            response = response[:max_length].strip() + "..."
-
-        final_result = response if len(response) > 15 else None
-        if final_result:
-            st.success(f"✅ Topic {topic_id}: Final extracted analysis ({len(final_result)} chars): '{final_result[:100]}...'")
-        else:
-            st.error(f"❌ Topic {topic_id}: Final result too short ({len(response)} chars): '{response}'")
-
-        return final_result
-
     except Exception as e:
-        st.caption(f"⚠️ Topic {topic_id} LLM analysis failed: {str(e)[:100]}")
+        log_debug(f"❌ Topic {topic_id} individual analysis failed: {str(e)}", "error")
         return None
 
 
