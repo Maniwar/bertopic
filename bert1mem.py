@@ -545,6 +545,15 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
         # Clean and prepare documents
         cleaned_docs = [str(doc).strip() for doc in sample_docs if doc and str(doc).strip()]
         if not cleaned_docs:
+            import logging
+            logging.warning(f"Topic {topic_id} REJECTED - no valid documents after cleaning")
+            return None
+
+        # Check if documents have enough content (not just whitespace/noise)
+        total_content_length = sum(len(doc) for doc in cleaned_docs)
+        if total_content_length < 50:  # Need at least 50 chars total across all docs
+            import logging
+            logging.warning(f"Topic {topic_id} REJECTED - insufficient document content ({total_content_length} chars)")
             return None
 
         # Build simple prompt
@@ -591,8 +600,15 @@ What are users saying? Provide one clear sentence describing their main concerns
             generated_ids = outputs[0][input_length:]
             response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
+            # Debug logging for raw response
+            import logging
+            logging.debug(f"Topic {topic_id} raw response (chat template): {response[:200]}")
+
         except Exception as e:
             # Fallback to direct tokenization for non-chat models
+            import logging
+            logging.debug(f"Topic {topic_id} chat template failed, using fallback: {str(e)[:100]}")
+
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
 
             if torch.cuda.is_available():
@@ -614,8 +630,13 @@ What are users saying? Provide one clear sentence describing their main concerns
             generated_ids = outputs[0][input_length:]
             response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
+            # Debug logging for raw response
+            import logging
+            logging.debug(f"Topic {topic_id} raw response (fallback): {response[:200]}")
+
         # Clean up
         response = response.strip()
+        raw_response_preview = response[:100]  # Save for debugging
 
         # Remove common LLM artifacts and prompt repetitions
         artifacts = [
@@ -638,14 +659,26 @@ What are users saying? Provide one clear sentence describing their main concerns
         # Final cleanup
         response = response.strip('"\'[](){}')
 
-        # Validate: Must be substantial (>20 chars) and contain meaningful words
-        if len(response) < 20:
+        # Log cleaning results
+        import logging
+        if response != raw_response_preview[:len(response)]:
+            logging.debug(f"Topic {topic_id} cleaned: '{raw_response_preview}' → '{response}'")
+
+        # Validate: Must be substantial enough to be meaningful
+        # Relaxed from 20 chars to 12 chars (e.g., "Users report bugs" = 16 chars)
+        if len(response) < 12:
+            logging.warning(f"Topic {topic_id} REJECTED - too short ({len(response)} chars): '{response}'")
             return None
 
-        # Reject if it's just fragments like "on analysis", "of the", etc.
+        # Require at least 3 words for a meaningful sentence
+        # (Was 4, but "Users report bugs" is valid with just 3 words)
         words = response.lower().split()
-        if len(words) < 4:  # Require at least 4 words for a meaningful sentence
+        if len(words) < 3:
+            logging.warning(f"Topic {topic_id} REJECTED - too few words ({len(words)}): '{response}'")
             return None
+
+        # Log successful analysis
+        logging.debug(f"Topic {topic_id} SUCCESS: '{response}' ({len(response)} chars, {len(words)} words)")
 
         # Truncate if needed
         if len(response) > max_length:
@@ -654,7 +687,12 @@ What are users saying? Provide one clear sentence describing their main concerns
         return response if response else None
 
     except Exception as e:
-        st.caption(f"⚠️ Topic {topic_id} LLM analysis failed: {str(e)[:100]}")
+        # Log the actual error for debugging
+        import logging
+        logging.warning(f"Topic {topic_id} LLM generation exception: {str(e)}")
+        # Only show in UI if it's a critical error (not during batch processing)
+        if hasattr(st, 'caption'):
+            st.caption(f"⚠️ Topic {topic_id} analysis failed: {str(e)[:100]}")
         return None
 
 
@@ -2307,7 +2345,11 @@ class FastReclusterer:
                     f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
                 )
                 if llm_fallback_count > 0:
-                    st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis")
+                    # Find which topics failed
+                    failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
+                                       if "No analysis available" in analysis]
+                    st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis: {failed_topic_ids}")
+                    st.caption("💡 Failed topics may have insufficient or low-quality document content. Enable debug mode to see details.")
             else:
                 st.warning("⚠️ LLM analysis failed for all topics")
 
@@ -2526,7 +2568,11 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         success_pct = (llm_success_count / num_topics) * 100
         st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
         if llm_fallback_count > 0:
-            st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis")
+            # Find which topics failed
+            failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
+                               if "No analysis available" in analysis]
+            st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis: {failed_topic_ids}")
+            st.caption("💡 Failed topics may have insufficient or low-quality document content. Enable debug mode to see details.")
     else:
         st.warning("⚠️ LLM analysis failed for all topics")
 
@@ -3541,6 +3587,23 @@ def main():
                 help="Use CPU instead of GPU (slower but uses less GPU memory)",
                 key="post_cluster_force_cpu"
             )
+
+        # Debug mode toggle
+        enable_debug = st.checkbox(
+            "🔍 Enable debug logging (shows why topics fail)",
+            value=False,
+            key="llm_debug_mode",
+            help="Logs detailed information about LLM analysis process to help diagnose failures"
+        )
+
+        # Configure logging based on debug mode
+        if enable_debug:
+            import logging
+            logging.basicConfig(level=logging.DEBUG, force=True)
+            st.info("🔍 Debug mode enabled - check terminal/logs for detailed analysis output")
+        else:
+            import logging
+            logging.basicConfig(level=logging.WARNING, force=True)
 
         # Run LLM Analysis button
         if st.button("🚀 Generate LLM Analysis for Current Topics", type="primary"):
