@@ -835,21 +835,53 @@ Detailed Analysis:"""
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Extract answer
+        # Extract answer - ✅ IMPROVED: Try multiple extraction methods
+        extracted = None
+
+        # Method 1: Look for "Detailed Analysis:"
         if "Detailed Analysis:" in response:
-            response = response.split("Detailed Analysis:")[-1].strip()
+            extracted = response.split("Detailed Analysis:")[-1].strip()
+        # Method 2: Look for "Analysis:"
         elif "Analysis:" in response:
-            response = response.split("Analysis:")[-1].strip()
+            extracted = response.split("Analysis:")[-1].strip()
+        # Method 3: Look for content after the prompt
+        elif "Sample documents:" in response:
+            # Take everything after the last "Sample documents:" section
+            parts = response.split("Sample documents:")
+            if len(parts) > 1:
+                # Get text after sample docs, skip the docs themselves
+                remaining = parts[-1]
+                # Find where the actual analysis starts (after docs list)
+                lines = remaining.split('\n')
+                analysis_lines = [l for l in lines if len(l.strip()) > 20 and not l.strip().startswith('-')]
+                if analysis_lines:
+                    extracted = ' '.join(analysis_lines[:3])  # First 3 substantial lines
+
+        # Method 4: If all else fails, take the end of the response
+        if not extracted or len(extracted.strip()) < 15:
+            # Take last substantial part of response
+            lines = response.split('\n')
+            substantial = [l.strip() for l in lines if len(l.strip()) > 20]
+            if substantial:
+                extracted = ' '.join(substantial[-3:])  # Last 3 substantial lines
+
+        if not extracted:
+            return None
 
         # Clean up - ✅ KEEP MULTIPLE SENTENCES
-        response = response.strip()
+        response = extracted.strip()
         response = response.strip('"\'.,;[](){}')
+
+        # Remove any remaining prompt fragments
+        for prompt_fragment in ['Topic:', 'Sample documents:', 'Analyze this topic', '1)', '2)', '3)']:
+            if response.startswith(prompt_fragment):
+                response = response.split('\n', 1)[-1].strip()
 
         # ✅ HIGHER LENGTH LIMIT for detailed analysis
         if len(response) > max_length:
             response = response[:max_length].strip() + "..."
 
-        return response if response else None
+        return response if len(response) > 15 else None
 
     except Exception as e:
         st.caption(f"⚠️ Topic {topic_id} LLM analysis failed: {str(e)[:100]}")
@@ -2286,18 +2318,24 @@ class FastReclusterer:
                         try:
                             individual_result = generate_simple_llm_analysis(
                                 topic_id,
-                                topic_item['docs'][:5],
+                                topic_item['docs'][:8],  # ✅ More docs for better context
                                 topic_item['label'],
                                 self.llm_model,
-                                max_length=150
+                                max_length=500  # ✅ FIX: Was 150, now 500 to match function default
                             )
                             if individual_result and len(individual_result.strip()) > 10:
                                 llm_analysis_dict[topic_id] = individual_result
                                 llm_success_count += 1
                             else:
+                                # ✅ DEBUG: Show why analysis failed
+                                if individual_result is None:
+                                    st.caption(f"⚠️ Topic {topic_id}: LLM returned None")
+                                else:
+                                    st.caption(f"⚠️ Topic {topic_id}: Response too short ({len(individual_result)} chars)")
                                 llm_analysis_dict[topic_id] = "No analysis available"
                                 llm_fallback_count += 1
-                        except:
+                        except Exception as e:
+                            st.caption(f"⚠️ Topic {topic_id} individual analysis exception: {str(e)[:100]}")
                             llm_analysis_dict[topic_id] = "No analysis available"
                             llm_fallback_count += 1
 
@@ -2643,8 +2681,16 @@ def build_faiss_index(embeddings):
         return None
 
 
-def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5):
-    """Retrieve top-k most relevant documents using FAISS"""
+def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5, topic_filter=None, all_topics=None):
+    """
+    Retrieve top-k most relevant documents using FAISS
+
+    ✅ ENHANCED: Now supports topic-aware retrieval for focused results
+
+    Args:
+        topic_filter: If provided, only return docs from this topic
+        all_topics: Array mapping doc index to topic ID
+    """
     if faiss_index is None:
         return []
 
@@ -2656,18 +2702,45 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
             normalize_embeddings=True
         )[0].reshape(1, -1).astype('float32')
 
+        # ✅ TOPIC-AWARE: Search more candidates if filtering by topic
+        search_k = top_k * 10 if topic_filter is not None else top_k
+
         # Search FAISS index
-        distances, indices = faiss_index.search(query_embedding, top_k)
+        distances, indices = faiss_index.search(query_embedding, search_k)
 
         # Get documents
         results = []
         for i, idx in enumerate(indices[0]):
             if 0 <= idx < len(documents):
+                # ✅ TOPIC-AWARE: Filter by topic if specified
+                if topic_filter is not None and all_topics is not None:
+                    if idx < len(all_topics) and all_topics[idx] != topic_filter:
+                        continue  # Skip docs not in the target topic
+
                 results.append({
                     'document': documents[idx],
                     'distance': float(distances[0][i]),
                     'index': int(idx)
                 })
+
+                # Stop once we have enough results
+                if len(results) >= top_k:
+                    break
+
+        if topic_filter is not None:
+            if len(results) > 0:
+                st.caption(f"🎯 Retrieved {len(results)} docs from Topic {topic_filter} (topic-aware search)")
+            else:
+                st.warning(f"⚠️ No docs found in Topic {topic_filter}, falling back to global search")
+                # Fallback: retrieve from all topics
+                results = []
+                for i, idx in enumerate(indices[0][:top_k]):
+                    if 0 <= idx < len(documents):
+                        results.append({
+                            'document': documents[idx],
+                            'distance': float(distances[0][i]),
+                            'index': int(idx)
+                        })
 
         return results
     except Exception as e:
@@ -2756,16 +2829,22 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
 
     # RAG MODE: Use FAISS + LLM for intelligent responses
     if use_rag and llm_model and faiss_index and documents and safe_model:
-        st.info("🤖 Using RAG mode (FAISS + LLM)...")
+        # ✅ TOPIC-AWARE: Show which mode we're using
+        if current_topic_id is not None and current_topic_id != -1:
+            st.info(f"🎯 Using topic-aware RAG mode (Topic {current_topic_id})...")
+        else:
+            st.info("🤖 Using RAG mode (FAISS + LLM)...")
 
-        # Retrieve relevant documents
+        # ✅ TOPIC-AWARE: Retrieve relevant documents from current topic if viewing one
         retrieved_docs = retrieve_relevant_documents(
             user_query,
             faiss_index,
             embeddings,
             documents,
             safe_model,
-            top_k=5
+            top_k=5,
+            topic_filter=current_topic_id if (current_topic_id is not None and current_topic_id != -1) else None,
+            all_topics=topics
         )
 
         if retrieved_docs:
