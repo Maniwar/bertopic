@@ -3686,16 +3686,27 @@ def main():
                 llm_model = None
                 llm_tokenizer = None
 
-                # Reuse existing LLM
+                # Reuse existing LLM (with safe unpacking)
                 if 'llm_model' in st.session_state and st.session_state.llm_model is not None:
-                    llm_model, llm_tokenizer = st.session_state.llm_model
+                    try:
+                        llm_model, llm_tokenizer = st.session_state.llm_model
+                    except (TypeError, ValueError):
+                        pass  # llm_model wasn't a valid tuple
                 elif (hasattr(st.session_state, 'reclusterer') and
                       st.session_state.reclusterer is not None and
-                      hasattr(st.session_state.reclusterer, 'llm_model')):
-                    llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
+                      hasattr(st.session_state.reclusterer, 'llm_model') and
+                      st.session_state.reclusterer.llm_model is not None):
+                    try:
+                        llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
+                    except (TypeError, ValueError):
+                        pass  # llm_model wasn't a valid tuple
 
                 if llm_model is None:
-                    st.error("❌ No LLM loaded. Please run LLM analysis or enable LLM during clustering first.")
+                    st.error("❌ No LLM loaded. Cannot generate summaries without an LLM.")
+                    st.info("💡 **To fix this, do ONE of the following:**\n"
+                           "1. Go back and run clustering with **LLM-enhanced labeling** enabled\n"
+                           "2. OR run **'Generate LLM Analysis for Current Topics'** button above\n"
+                           "3. Then come back and click 'Generate All Topic Summaries'")
                 else:
                     # Get topics to summarize
                     topic_info = st.session_state.current_topic_info
@@ -4410,19 +4421,28 @@ Provide a clear, actionable summary:"""
                                         # Check multiple possible LLM sources (prioritize most recently loaded)
                                         if 'llm_model' in st.session_state and st.session_state.llm_model is not None:
                                             # Topic summary LLM (if already loaded earlier)
-                                            llm_model, llm_tokenizer = st.session_state.llm_model
-                                            st.toast("✅ Using cached topic summary LLM", icon="⚡")
+                                            try:
+                                                llm_model, llm_tokenizer = st.session_state.llm_model
+                                                st.toast("✅ Using cached topic summary LLM", icon="⚡")
+                                            except (TypeError, ValueError):
+                                                pass  # Invalid tuple
                                         elif 'chat_llm' in st.session_state and st.session_state.chat_llm is not None:
                                             # Chat LLM (from RAG feature)
-                                            llm_model, llm_tokenizer = st.session_state.chat_llm
-                                            st.toast("✅ Reusing chat LLM for summary", icon="♻️")
+                                            try:
+                                                llm_model, llm_tokenizer = st.session_state.chat_llm
+                                                st.toast("✅ Reusing chat LLM for summary", icon="♻️")
+                                            except (TypeError, ValueError):
+                                                pass  # Invalid tuple
                                         elif (hasattr(st.session_state, 'reclusterer') and
                                               st.session_state.reclusterer is not None and
                                               hasattr(st.session_state.reclusterer, 'llm_model') and
                                               st.session_state.reclusterer.llm_model is not None):
                                             # Main clustering LLM (stored in reclusterer)
-                                            llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
-                                            st.toast("✅ Reusing clustering LLM for summary", icon="♻️")
+                                            try:
+                                                llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
+                                                st.toast("✅ Reusing clustering LLM for summary", icon="♻️")
+                                            except (TypeError, ValueError):
+                                                pass  # Invalid tuple
 
                                         # If no LLM found, load a new one
                                         if llm_model is None:
