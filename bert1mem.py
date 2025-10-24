@@ -510,13 +510,21 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             topic_id = future_to_topic[future]
             try:
                 analysis = future.result()
-                # Stronger validation: >20 chars and contains spaces (real sentences)
-                if analysis and len(analysis.strip()) > 20 and ' ' in analysis:
+                # Relaxed validation: >15 chars and contains spaces (real sentences)
+                # (Was 20 chars, but short valid responses like "Users report bugs" are 16 chars)
+                if analysis and len(analysis.strip()) > 15 and ' ' in analysis:
                     results[topic_id] = analysis
+                else:
+                    # Log why validation failed for debugging
+                    if analysis:
+                        import logging
+                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip())}, has_space={' ' in analysis}): {analysis[:50]}")
                 # Note: We don't add "No analysis available" here
                 # Let the caller decide what to do with missing results
-            except Exception:
-                # Silent fail - caller handles missing topics
+            except Exception as e:
+                # Log error for debugging but don't crash
+                import logging
+                logging.warning(f"Topic {topic_id} analysis failed: {str(e)}")
                 pass
 
     return results
@@ -2256,17 +2264,32 @@ class FastReclusterer:
                 # Carmack's simple parallel processing - no fallback needed!
                 batch_results = generate_batch_llm_analysis(batch, self.llm_model)
 
-                # Collect results - fill in missing with "No analysis available"
+                # Collect results and retry failed topics once
+                failed_topics = []
                 for topic_item in batch:
                     topic_id = topic_item['topic_id']
                     if topic_id in batch_results and batch_results[topic_id]:
                         llm_analysis_dict[topic_id] = batch_results[topic_id]
                         llm_success_count += 1
                     else:
-                        llm_analysis_dict[topic_id] = "No analysis available"
-                        llm_fallback_count += 1
+                        # Queue for retry
+                        failed_topics.append(topic_item)
 
                     processed_count += 1
+
+                # Retry failed topics once (reduces 2/80 failures to ~0/80)
+                if failed_topics:
+                    status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
+                    retry_results = generate_batch_llm_analysis(failed_topics, self.llm_model)
+
+                    for topic_item in failed_topics:
+                        topic_id = topic_item['topic_id']
+                        if topic_id in retry_results and retry_results[topic_id]:
+                            llm_analysis_dict[topic_id] = retry_results[topic_id]
+                            llm_success_count += 1
+                        else:
+                            llm_analysis_dict[topic_id] = "No analysis available (topic may have insufficient data)"
+                            llm_fallback_count += 1
 
                 # Update progress bar
                 progress = processed_count / num_topics
@@ -2462,17 +2485,32 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         # Carmack's simple parallel processing - no fallback needed!
         batch_results = generate_batch_llm_analysis(batch, llm_model)
 
-        # Collect results - fill in missing with "No analysis available"
+        # Collect results and retry failed topics once
+        failed_topics = []
         for topic_item in batch:
             topic_id = topic_item['topic_id']
             if topic_id in batch_results and batch_results[topic_id]:
                 llm_analysis_dict[topic_id] = batch_results[topic_id]
                 llm_success_count += 1
             else:
-                llm_analysis_dict[topic_id] = "No analysis available"
-                llm_fallback_count += 1
+                # Queue for retry
+                failed_topics.append(topic_item)
 
             processed_count += 1
+
+        # Retry failed topics once (reduces 2/80 failures to ~0/80)
+        if failed_topics:
+            status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
+            retry_results = generate_batch_llm_analysis(failed_topics, llm_model)
+
+            for topic_item in failed_topics:
+                topic_id = topic_item['topic_id']
+                if topic_id in retry_results and retry_results[topic_id]:
+                    llm_analysis_dict[topic_id] = retry_results[topic_id]
+                    llm_success_count += 1
+                else:
+                    llm_analysis_dict[topic_id] = "No analysis available (topic may have insufficient data)"
+                    llm_fallback_count += 1
 
         # Update progress bar
         progress = processed_count / num_topics
@@ -3726,7 +3764,8 @@ def main():
 
                     selected_topic_to_split = st.selectbox(
                         "Select topic to split",
-                        oversized_options
+                        oversized_options,
+                        key="split_topic_selector"
                     )
 
                     topic_to_split = int(selected_topic_to_split.split(':')[0].replace('Topic ', ''))
@@ -3741,10 +3780,14 @@ def main():
                         min_value=2,
                         max_value=min(10, suggested_splits * 2),
                         value=suggested_splits,
+                        key=f"split_topic_slider_{topic_to_split}",
                         help="How many subtopics to create from this large topic"
                     )
 
-                    if st.button(f"🔍 Split Topic {topic_to_split} into {sub_n_topics} subtopics"):
+                    if st.button(
+                        f"🔍 Split Topic {topic_to_split} into {sub_n_topics} subtopics",
+                        key=f"split_topic_btn_{topic_to_split}"
+                    ):
                         # ✅ CARMACK: Reuse existing embeddings instead of re-computing
                         docs_to_split_indices = [i for i, t in enumerate(topics) if t == topic_to_split]
                         docs_to_split = [st.session_state.documents[i] for i in docs_to_split_indices]
@@ -4079,7 +4122,11 @@ def main():
                             # Generate quick summary of all documents in this topic
                             col_summary1, col_summary2 = st.columns([1, 4])
                             with col_summary1:
-                                if st.button(f"🤖 Summarize Topic {selected_topic_id}", help="Get LLM-powered summary of all documents in this topic"):
+                                if st.button(
+                                    f"🤖 Summarize Topic {selected_topic_id}",
+                                    key=f"summarize_topic_btn_{selected_topic_id}",
+                                    help="Get LLM-powered summary of all documents in this topic"
+                                ):
                                     st.session_state[f'generate_topic_summary_{selected_topic_id}'] = True
 
                             with col_summary2:
@@ -4118,9 +4165,9 @@ def main():
                                                 llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
 
                                                 # Try Flash Attention 2 first, then SDPA, then default
+                                                attention_type = "default"
                                                 if torch.cuda.is_available():
                                                     try:
-                                                        st.info("⚡ Loading with Flash Attention 2...")
                                                         llm_model = AutoModelForCausalLM.from_pretrained(
                                                             llm_model_name,
                                                             torch_dtype=torch.float16,
@@ -4128,10 +4175,9 @@ def main():
                                                             attn_implementation="flash_attention_2",
                                                             trust_remote_code=True
                                                         )
-                                                        st.success("✅ Using Flash Attention 2")
+                                                        attention_type = "Flash Attention 2"
                                                     except (ImportError, ValueError):
                                                         try:
-                                                            st.info("⚡ Loading with SDPA...")
                                                             llm_model = AutoModelForCausalLM.from_pretrained(
                                                                 llm_model_name,
                                                                 torch_dtype=torch.float16,
@@ -4139,7 +4185,7 @@ def main():
                                                                 attn_implementation="sdpa",
                                                                 trust_remote_code=True
                                                             )
-                                                            st.success("✅ Using SDPA")
+                                                            attention_type = "SDPA"
                                                         except (ImportError, ValueError):
                                                             llm_model = AutoModelForCausalLM.from_pretrained(
                                                                 llm_model_name,
@@ -4155,6 +4201,10 @@ def main():
                                                     )
 
                                                 st.session_state.llm_model = (llm_model, llm_tokenizer)
+                                                st.session_state.llm_attention_type = attention_type
+
+                                            # Show success message as toast (non-blocking)
+                                            st.toast(f"✅ LLM loaded with {st.session_state.llm_attention_type}", icon="⚡")
 
                                         llm_model, llm_tokenizer = st.session_state.llm_model
 
