@@ -17,109 +17,6 @@ import os
 
 
 # =====================================================
-# 🚀 MEMORY OPTIMIZATION PROFILES
-# =====================================================
-class MemoryProfileConfig:
-    """
-    Configure memory usage vs performance tradeoff
-    Higher memory usage = faster processing
-    """
-    
-    PROFILES = {
-        'conservative': {
-            'name': '💾 Conservative',
-            'description': 'Low memory usage, slower (safe for 8GB RAM)',
-            'llm_batch_size_multiplier': 0.5,
-            'max_workers_multiplier': 0.5,
-            'cache_embeddings': True,
-            'cache_topic_docs': False,
-            'precompute_metadata': False,
-            'aggressive_caching': False,
-            'tokenizer_cache_size': 1000,
-            'max_docs_in_memory': 5000,
-        },
-        'balanced': {
-            'name': '⚖️ Balanced',
-            'description': 'Moderate memory, good speed (16GB RAM)',
-            'llm_batch_size_multiplier': 1.0,
-            'max_workers_multiplier': 1.0,
-            'cache_embeddings': True,
-            'cache_topic_docs': True,
-            'precompute_metadata': True,
-            'aggressive_caching': False,
-            'tokenizer_cache_size': 5000,
-            'max_docs_in_memory': 20000,
-        },
-        'aggressive': {
-            'name': '🚀 Aggressive',
-            'description': 'High memory, maximum speed (32GB+ RAM)',
-            'llm_batch_size_multiplier': 2.0,
-            'max_workers_multiplier': 1.5,
-            'cache_embeddings': True,
-            'cache_topic_docs': True,
-            'precompute_metadata': True,
-            'aggressive_caching': True,
-            'tokenizer_cache_size': 20000,
-            'max_docs_in_memory': 100000,
-        },
-        'extreme': {
-            'name': '⚡ Extreme',
-            'description': 'Maximum memory, extreme speed (64GB+ RAM)',
-            'llm_batch_size_multiplier': 3.0,
-            'max_workers_multiplier': 2.0,
-            'cache_embeddings': True,
-            'cache_topic_docs': True,
-            'precompute_metadata': True,
-            'aggressive_caching': True,
-            'tokenizer_cache_size': 50000,
-            'max_docs_in_memory': 500000,
-        }
-    }
-    
-    @staticmethod
-    def get_profile(profile_name='balanced'):
-        """Get a memory profile configuration"""
-        return MemoryProfileConfig.PROFILES.get(profile_name, MemoryProfileConfig.PROFILES['balanced'])
-    
-    @staticmethod
-    def estimate_memory_usage(profile_name, num_docs, embedding_dim=384):
-        """Estimate memory usage in GB for a given profile"""
-        profile = MemoryProfileConfig.get_profile(profile_name)
-        
-        # Base memory estimates
-        embeddings_gb = (num_docs * embedding_dim * 4) / (1024**3)  # float32
-        docs_gb = (num_docs * 500) / (1024**3)  # ~500 chars per doc
-        
-        # Additional memory based on profile
-        cache_multiplier = 2.0 if profile['aggressive_caching'] else 1.2
-        
-        if profile['cache_topic_docs']:
-            total_gb = (embeddings_gb + docs_gb) * cache_multiplier
-        else:
-            total_gb = embeddings_gb * cache_multiplier
-        
-        return total_gb
-    
-    @staticmethod
-    def get_recommended_profile(available_ram_gb, num_docs):
-        """Recommend a profile based on available RAM and document count"""
-        estimates = {}
-        for profile_name in MemoryProfileConfig.PROFILES.keys():
-            est_usage = MemoryProfileConfig.estimate_memory_usage(profile_name, num_docs)
-            estimates[profile_name] = est_usage
-        
-        # Leave 20% RAM free for system
-        usable_ram = available_ram_gb * 0.8
-        
-        # Find best profile that fits
-        for profile_name in ['extreme', 'aggressive', 'balanced', 'conservative']:
-            if estimates[profile_name] <= usable_ram:
-                return profile_name
-        
-        return 'conservative'
-
-
-# =====================================================
 # 🚀 LLM MODEL CONTEXT WINDOW CONFIGURATION
 # =====================================================
 LLM_MODEL_CONFIG = {
@@ -226,11 +123,8 @@ class SystemPerformanceDetector:
     """Auto-detect system capabilities and recommend optimal parameters"""
     
     @staticmethod
-    def detect_optimal_parameters(memory_profile='balanced'):
+    def detect_optimal_parameters():
         """Detect system capabilities and return optimal parameters for LLM labeling"""
-        # Get memory profile config
-        profile = MemoryProfileConfig.get_profile(memory_profile)
-        
         params = {
             'has_gpu': False,
             'gpu_memory_gb': 0,
@@ -238,137 +132,50 @@ class SystemPerformanceDetector:
             'ram_gb': psutil.virtual_memory().total / (1024**3),
             'batch_size': 10,
             'max_workers': 1,
-            'recommended_docs_per_topic': 5,
-            'memory_profile': memory_profile,
-            'profile_config': profile
+            'recommended_docs_per_topic': 5
         }
-        
+
         if torch.cuda.is_available():
             params['has_gpu'] = True
             try:
                 gpu_props = torch.cuda.get_device_properties(0)
                 params['gpu_memory_gb'] = gpu_props.total_memory / (1024**3)
                 params['gpu_name'] = gpu_props.name
-                
-                # Apply memory profile multipliers
-                base_batch_size = 0
+
+                # Set batch size and workers based on GPU memory
                 if params['gpu_memory_gb'] >= 20:
-                    base_batch_size = 40
-                    base_workers = 4
+                    params['batch_size'] = 40
+                    params['max_workers'] = 4
                     params['tier'] = 'High-end GPU'
                 elif params['gpu_memory_gb'] >= 14:
-                    base_batch_size = 25
-                    base_workers = 3
+                    params['batch_size'] = 25
+                    params['max_workers'] = 3
                     params['tier'] = 'Mid-range GPU'
                 elif params['gpu_memory_gb'] >= 10:
-                    base_batch_size = 20
-                    base_workers = 3
+                    params['batch_size'] = 20
+                    params['max_workers'] = 3
                     params['tier'] = 'Standard GPU'
                 elif params['gpu_memory_gb'] >= 6:
-                    base_batch_size = 12
-                    base_workers = 2
+                    params['batch_size'] = 12
+                    params['max_workers'] = 2
                     params['tier'] = 'Entry-level GPU'
                 else:
-                    base_batch_size = 8
-                    base_workers = 1
+                    params['batch_size'] = 8
+                    params['max_workers'] = 1
                     params['tier'] = 'Low-memory GPU'
-                
-                # ✅ Apply memory profile multipliers
-                params['batch_size'] = int(base_batch_size * profile['llm_batch_size_multiplier'])
-                params['max_workers'] = max(1, int(base_workers * profile['max_workers_multiplier']))
-                
+
             except Exception:
-                params['batch_size'] = int(15 * profile['llm_batch_size_multiplier'])
-                params['max_workers'] = max(1, int(2 * profile['max_workers_multiplier']))
+                params['batch_size'] = 15
+                params['max_workers'] = 2
                 params['tier'] = 'Unknown GPU'
         else:
             params['tier'] = 'CPU'
-            params['batch_size'] = int(10 * profile['llm_batch_size_multiplier'])
+            params['batch_size'] = 10
             params['max_workers'] = 1
             if params['cpu_cores'] >= 16:
-                params['max_workers'] = max(1, int(2 * profile['max_workers_multiplier']))
-        
+                params['max_workers'] = 2
+
         return params
-
-
-# =====================================================
-# 🚀 AGGRESSIVE MEMORY CACHING SYSTEM
-# =====================================================
-class AggressiveDocumentCache:
-    """Cache documents and metadata in memory for ultra-fast access"""
-    
-    def __init__(self, memory_profile='balanced'):
-        self.profile = MemoryProfileConfig.get_profile(memory_profile)
-        self.enabled = self.profile['aggressive_caching']
-        
-        # Caches
-        self.topic_docs_cache = {}
-        self.topic_metadata_cache = {}
-        self.tokenized_docs_cache = {}
-        self.embedding_cache = None
-        
-        # Stats
-        self.cache_hits = 0
-        self.cache_misses = 0
-    
-    def cache_topic_documents(self, topics_dict):
-        """Pre-load all topic documents into memory"""
-        if not self.profile['cache_topic_docs']:
-            return
-        
-        self.topic_docs_cache = {}
-        for topic_id, docs in topics_dict.items():
-            # Limit based on profile
-            max_docs = self.profile['max_docs_in_memory']
-            self.topic_docs_cache[topic_id] = docs[:max_docs]
-    
-    def cache_topic_metadata(self, topic_info_df):
-        """Pre-compute and cache topic metadata"""
-        if not self.profile['precompute_metadata']:
-            return
-        
-        self.topic_metadata_cache = {}
-        for _, row in topic_info_df.iterrows():
-            topic_id = row['Topic']
-            self.topic_metadata_cache[topic_id] = {
-                'count': row['Count'],
-                'keywords': row.get('Keywords', ''),
-                'human_label': row.get('Human_Label', ''),
-                'representative_docs': row.get('Representative_Docs', [])
-            }
-    
-    def cache_embeddings(self, embeddings):
-        """Cache embeddings array"""
-        if not self.profile['cache_embeddings']:
-            return
-        
-        self.embedding_cache = embeddings.copy() if hasattr(embeddings, 'copy') else embeddings
-    
-    def get_topic_docs(self, topic_id):
-        """Get documents for a topic from cache"""
-        if topic_id in self.topic_docs_cache:
-            self.cache_hits += 1
-            return self.topic_docs_cache[topic_id]
-        self.cache_misses += 1
-        return None
-    
-    def get_stats(self):
-        """Get cache statistics"""
-        total = self.cache_hits + self.cache_misses
-        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
-        
-        memory_used = 0
-        if self.topic_docs_cache:
-            memory_used += sum(len(str(docs)) for docs in self.topic_docs_cache.values()) / (1024**2)
-        if self.embedding_cache is not None:
-            memory_used += self.embedding_cache.nbytes / (1024**2) if hasattr(self.embedding_cache, 'nbytes') else 0
-        
-        return {
-            'hits': self.cache_hits,
-            'misses': self.cache_misses,
-            'hit_rate': hit_rate,
-            'memory_mb': memory_used
-        }
 
 
 class AdaptiveProgressTracker:
@@ -780,14 +587,72 @@ Answer:"""
 
 def deduplicate_labels_globally(labels_dict, keywords_dict, topics_dict=None):
     """
-    Deduplicate labels across ALL topics by progressively adding layers with '-'.
-    Keeps adding detail levels until every label is unique.
+    Ensure all labels have minimum 3 levels and are unique.
+
+    Process:
+    1. First pass: Ensure all labels have minimum 3 levels
+    2. Second pass: Add more levels (4+) if duplicates still exist
 
     Examples:
-    - "Customer Service - Response Times" becomes "Customer Service - Response Times - Phone Support"
-    - "Product Orders - Delivery" becomes "Product Orders - Delivery - Samsung Appliances"
+    - "Customer Service" → "Customer Service - Response Times - Phone Support"
+    - "Product Orders - Delivery" → "Product Orders - Delivery - Samsung Appliances"
     """
-    MAX_ITERATIONS = 5  # Prevent infinite loops
+    # STEP 1: Ensure all labels have minimum 3 levels
+    MIN_LEVELS = 3
+    for topic_id, label in labels_dict.items():
+        current_levels = label.count(' - ') + 1
+
+        while current_levels < MIN_LEVELS:
+            # Need to add another level
+            keywords = keywords_dict.get(topic_id, '')
+            kw_list = [kw.strip() for kw in keywords.split(',') if kw.strip()]
+
+            # Extract distinctive keywords not already in the label
+            common_words = {'help', 'buy', 'question', 'new', 'order', 'phone', 'customer', 'service', 'product', 'support'}
+            label_words = set(label.lower().split())
+            distinctive = []
+
+            for kw in kw_list[:10]:
+                kw_clean = kw.lower().strip()
+                if kw_clean not in common_words and kw_clean not in label_words:
+                    if not any(kw_clean in word for word in label_words):
+                        distinctive.append(kw.title())
+                        if len(distinctive) >= 2:
+                            break
+
+            if distinctive:
+                # Add new level from keywords
+                new_detail = ' '.join(distinctive[:2])
+                label = f"{label} - {new_detail}"
+            elif topics_dict and topic_id in topics_dict:
+                # Try to extract from documents
+                docs = topics_dict[topic_id]
+                extra_phrases = _top_phrases(docs[:50], (1, 2), top_k=10)
+                extra_clean = []
+                for phrase in extra_phrases:
+                    phrase_clean = _clean_phrase(phrase)
+                    phrase_words = set(phrase_clean.lower().split())
+                    if not phrase_words.issubset(label_words) and phrase_clean.lower() not in common_words:
+                        extra_clean.append(_to_title_case(phrase_clean))
+                        if len(extra_clean) >= 2:
+                            break
+
+                if extra_clean:
+                    new_detail = ' '.join(extra_clean[:2])
+                    label = f"{label} - {new_detail}"
+                else:
+                    # Use generic detail
+                    label = f"{label} - Details"
+            else:
+                # No keywords or docs, use generic detail
+                label = f"{label} - Details"
+
+            # Update the label and count
+            labels_dict[topic_id] = label
+            current_levels = label.count(' - ') + 1
+
+    # STEP 2: Deduplicate by adding more levels (4+) if needed
+    MAX_ITERATIONS = 5
     iteration = 0
 
     while iteration < MAX_ITERATIONS:
@@ -822,11 +687,9 @@ def deduplicate_labels_globally(labels_dict, keywords_dict, topics_dict=None):
                 common_words = {'help', 'buy', 'question', 'new', 'order', 'phone', 'customer', 'service', 'product', 'support'}
                 label_words = set(original_label.lower().split())
 
-                for kw in kw_list[:10]:  # Look at more keywords
+                for kw in kw_list[:10]:
                     kw_clean = kw.lower().strip()
-                    # Skip if already in label or is common word
                     if kw_clean not in common_words and kw_clean not in label_words:
-                        # Also check if not substring of any word in label
                         if not any(kw_clean in word for word in label_words):
                             distinctive.append(kw.title())
                             if len(distinctive) >= 2:
@@ -2246,7 +2109,8 @@ class FastReclusterer:
                 'LLM_Analysis': llm_analysis
             })
 
-        return pd.DataFrame(topic_info_list)
+        # Normalize once at source - guaranteed clean data
+        return normalize_topic_info(pd.DataFrame(topic_info_list))
 
 
 # -----------------------------------------------------
@@ -2912,56 +2776,6 @@ def main():
             # Analysis Settings
             st.header("🎯 Analysis Settings")
             
-            # ✅ MEMORY OPTIMIZATION PROFILE
-            st.subheader("⚡ Performance & Memory")
-            
-            # Get system RAM
-            system_ram = psutil.virtual_memory().total / (1024**3)
-            num_docs = len(df)
-            recommended_profile = MemoryProfileConfig.get_recommended_profile(system_ram, num_docs)
-            
-            # Profile selector
-            profile_options = {
-                'conservative': MemoryProfileConfig.PROFILES['conservative']['name'] + ' - ' + 
-                               MemoryProfileConfig.PROFILES['conservative']['description'],
-                'balanced': MemoryProfileConfig.PROFILES['balanced']['name'] + ' - ' + 
-                           MemoryProfileConfig.PROFILES['balanced']['description'],
-                'aggressive': MemoryProfileConfig.PROFILES['aggressive']['name'] + ' - ' + 
-                             MemoryProfileConfig.PROFILES['aggressive']['description'],
-                'extreme': MemoryProfileConfig.PROFILES['extreme']['name'] + ' - ' + 
-                          MemoryProfileConfig.PROFILES['extreme']['description'],
-            }
-            
-            selected_profile = st.selectbox(
-                "Memory Profile",
-                options=list(profile_options.keys()),
-                format_func=lambda x: profile_options[x],
-                index=list(profile_options.keys()).index(recommended_profile),
-                help=f"Higher profiles use more RAM for faster processing. System RAM: {system_ram:.1f}GB | Recommended: {recommended_profile.title()}"
-            )
-            
-            # Show estimated memory usage
-            estimated_memory = MemoryProfileConfig.estimate_memory_usage(selected_profile, num_docs)
-            profile_config = MemoryProfileConfig.get_profile(selected_profile)
-            
-            mem_col1, mem_col2 = st.columns(2)
-            with mem_col1:
-                st.metric("System RAM", f"{system_ram:.1f} GB")
-            with mem_col2:
-                color = "🟢" if estimated_memory < system_ram * 0.6 else "🟡" if estimated_memory < system_ram * 0.8 else "🔴"
-                st.metric("Est. Usage", f"{color} {estimated_memory:.1f} GB")
-            
-            # Show what's enabled
-            if profile_config['aggressive_caching']:
-                st.info("✅ Aggressive caching enabled - Maximum speed!")
-            
-            # Store in session state
-            if 'memory_profile' not in st.session_state or st.session_state.get('memory_profile') != selected_profile:
-                st.session_state.memory_profile = selected_profile
-                st.session_state.profile_config = profile_config
-            
-            st.divider()
-
             # Embedding model selection
             embedding_model = st.selectbox(
                 "Embedding Model",
@@ -3235,9 +3049,6 @@ def main():
                         st.error("Initial clustering failed!")
                         st.stop()
 
-                    # ALWAYS normalize topic_info to guarantee Human_Label etc.
-                    topic_info = normalize_topic_info(topic_info)
-
                     st.session_state.current_topics = topics
                     st.session_state.current_topic_info = topic_info
                     st.session_state.topic_info = topic_info
@@ -3299,7 +3110,6 @@ def main():
                 )
 
                 if topics is not None:
-                    topic_info = normalize_topic_info(topic_info)
                     st.session_state.current_topics = topics
                     st.session_state.current_topic_info = topic_info
                     st.session_state.topic_info = topic_info
@@ -3394,7 +3204,7 @@ def main():
         # Display results
         if st.session_state.current_topics is not None:
             topics = st.session_state.current_topics
-            topic_info = normalize_topic_info(st.session_state.current_topic_info)
+            topic_info = st.session_state.current_topic_info
 
             # Calculate metrics
             total_docs = len(topics)
@@ -3505,7 +3315,7 @@ def main():
             with tabs[0]:  # Topics Overview
                 st.subheader("Topic Information")
 
-                display_df = normalize_topic_info(topic_info)
+                display_df = topic_info.copy()
                 if -1 in display_df['Topic'].values:
                     display_df = display_df[display_df['Topic'] != -1]
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
@@ -3997,7 +3807,7 @@ def main():
                         # Generate response based on topic data and current context
                         with st.spinner("Thinking..."):
                             # Get topic information
-                            topic_info_for_chat = normalize_topic_info(topic_info)
+                            topic_info_for_chat = topic_info
 
                             # Create context from topic data
                             context_parts = []
@@ -4074,7 +3884,7 @@ def main():
                 st.subheader("💾 Export Results")
 
                 export_df = st.session_state.browser_df.copy()
-                safe_topic_info = normalize_topic_info(topic_info)
+                safe_topic_info = topic_info
 
                 col1, col2, col3 = st.columns(3)
 
