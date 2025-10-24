@@ -4431,35 +4431,71 @@ Provide a clear, actionable summary:"""
                                         llm_model = None
                                         llm_tokenizer = None
 
+                                        # Debug: Log what we're checking
+                                        import logging
+                                        logging.info(f"Checking for existing LLM... llm_model exists: {'llm_model' in st.session_state}, reclusterer exists: {hasattr(st.session_state, 'reclusterer')}")
+
                                         # Check multiple possible LLM sources (prioritize most recently loaded)
                                         if 'llm_model' in st.session_state and st.session_state.llm_model is not None:
                                             # Topic summary LLM (if already loaded earlier)
                                             try:
                                                 llm_model, llm_tokenizer = st.session_state.llm_model
-                                                st.toast("✅ Using cached topic summary LLM", icon="⚡")
-                                            except (TypeError, ValueError):
+                                                st.toast("✅ Reusing existing LLM (already in memory)", icon="♻️")
+                                                logging.info(f"Reused st.session_state.llm_model successfully")
+                                            except (TypeError, ValueError) as e:
+                                                logging.warning(f"Failed to unpack llm_model: {e}")
                                                 pass  # Invalid tuple
-                                        elif 'chat_llm' in st.session_state and st.session_state.chat_llm is not None:
+
+                                        if llm_model is None and 'chat_llm' in st.session_state and st.session_state.chat_llm is not None:
                                             # Chat LLM (from RAG feature)
                                             try:
                                                 llm_model, llm_tokenizer = st.session_state.chat_llm
-                                                st.toast("✅ Reusing chat LLM for summary", icon="♻️")
-                                            except (TypeError, ValueError):
+                                                st.toast("✅ Reusing chat LLM (already in memory)", icon="♻️")
+                                                logging.info(f"Reused st.session_state.chat_llm successfully")
+                                            except (TypeError, ValueError) as e:
+                                                logging.warning(f"Failed to unpack chat_llm: {e}")
                                                 pass  # Invalid tuple
-                                        elif (hasattr(st.session_state, 'reclusterer') and
+
+                                        if llm_model is None and (hasattr(st.session_state, 'reclusterer') and
                                               st.session_state.reclusterer is not None and
                                               hasattr(st.session_state.reclusterer, 'llm_model') and
                                               st.session_state.reclusterer.llm_model is not None):
                                             # Main clustering LLM (stored in reclusterer)
                                             try:
                                                 llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
-                                                st.toast("✅ Reusing clustering LLM for summary", icon="♻️")
-                                            except (TypeError, ValueError):
+                                                st.toast("✅ Reusing clustering LLM (already in memory)", icon="♻️")
+                                                logging.info(f"Reused reclusterer.llm_model successfully")
+                                            except (TypeError, ValueError) as e:
+                                                logging.warning(f"Failed to unpack reclusterer.llm_model: {e}")
                                                 pass  # Invalid tuple
 
                                         # If no LLM found, load a new one
                                         if llm_model is None:
                                             from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                                            # Check GPU memory before loading
+                                            if torch.cuda.is_available():
+                                                # Try to free up memory first
+                                                torch.cuda.empty_cache()
+                                                import gc
+                                                gc.collect()
+
+                                                gpu_free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                                                gpu_total_gb = torch.cuda.mem_get_info()[1] / 1024**3
+                                                gpu_used_gb = gpu_total_gb - gpu_free_gb
+
+                                                st.caption(f"📊 GPU Memory: {gpu_used_gb:.1f}GB used / {gpu_total_gb:.1f}GB total ({gpu_free_gb:.1f}GB free)")
+
+                                                if gpu_free_gb < 2.0:
+                                                    st.error(f"❌ Insufficient GPU memory: {gpu_free_gb:.1f}GB free (need at least 2GB)")
+                                                    st.warning("🧹 **GPU Memory Full!** This likely means:")
+                                                    st.info("💡 **How to fix:**\n"
+                                                           "1. You already have an LLM loaded from earlier - check logs above for reuse messages\n"
+                                                           "2. OR multiple models are loaded (possible memory leak)\n"
+                                                           "3. **Best Solution:** Go to Post-Clustering section and click 'Generate LLM Analysis' button\n"
+                                                           "   - This loads ONE LLM that all features can reuse\n"
+                                                           "4. **OR restart the app** to clear GPU memory completely")
+                                                    raise RuntimeError(f"GPU OOM: Only {gpu_free_gb:.1f}GB free, need 2GB+")
 
                                             # Get model name from settings or use default
                                             llm_model_name = st.session_state.get('llm_model_name')
@@ -4472,8 +4508,8 @@ Provide a clear, actionable summary:"""
                                                 # Final fallback
                                                 llm_model_name = "microsoft/Phi-3-mini-4k-instruct"
 
-                                            st.info(f"📦 No LLM loaded yet. Loading {llm_model_name} for topic summary...")
-                                            st.caption("💡 **Tip:** To avoid this wait, enable LLM during clustering or run 'Generate LLM Analysis' first")
+                                            st.info(f"📦 No cached LLM found. Loading {llm_model_name} for topic summary...")
+                                            st.caption("💡 **Tip:** To avoid this wait and GPU usage, enable LLM during clustering or run 'Generate LLM Analysis' first")
 
                                             try:
                                                 with st.spinner("Loading LLM model for summary..."):
