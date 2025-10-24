@@ -2842,13 +2842,20 @@ def main():
 
             # Topic Size Control
             st.subheader("📏 Topic Size Control")
-            default_min_topic_size = max(2, min(10, len(df) // 50))
+            # Scale min_topic_size with dataset size (target 0.5-2% of data)
+            if len(df) < 1000:
+                default_min_topic_size = max(10, len(df) // 50)  # 2% for small datasets
+            elif len(df) < 10000:
+                default_min_topic_size = max(20, len(df) // 100)  # 1% for medium datasets
+            else:
+                default_min_topic_size = max(100, len(df) // 200)  # 0.5% for large datasets
+
             min_topic_size = st.slider(
                 "Minimum Topic Size",
                 min_value=2,
-                max_value=max(2, min(100, len(df) // 10)),
+                max_value=max(2, min(500, len(df) // 10)),
                 value=default_min_topic_size,
-                help="Minimum number of documents per topic. Topics smaller than this will be merged."
+                help=f"Minimum number of documents per topic. Default: {default_min_topic_size} ({(default_min_topic_size/len(df)*100):.1f}% of dataset)"
             )
 
             # Outlier Reduction Strategy
@@ -2876,7 +2883,13 @@ def main():
                         help=f"Number of topics to create (limited by min topic size of {min_topic_size})"
                     )
                 else:
-                    nr_topics = max(2, min(10, len(df) // 50))
+                    # Scale default nr_topics with dataset size (for HDBSCAN guidance)
+                    if len(df) < 1000:
+                        nr_topics = max(5, min(20, len(df) // 50))
+                    elif len(df) < 10000:
+                        nr_topics = max(10, min(50, len(df) // 200))
+                    else:
+                        nr_topics = max(20, min(100, len(df) // 400))
 
                 # UMAP parameters
                 n_neighbors = st.slider("UMAP n_neighbors", 2, 50, 15)
