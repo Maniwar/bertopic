@@ -4032,7 +4032,15 @@ def main():
                                     try:
                                         # Get all document texts for this topic
                                         topic_docs = filtered_df[text_col].head(summary_max_docs).tolist()
-                                        topic_keywords = st.session_state.topic_keywords.get(selected_topic_id, "")
+
+                                        # Get keywords from topic_info or browser_df
+                                        topic_keywords = ""
+                                        if 'Topic_Keywords' in filtered_df.columns and len(filtered_df) > 0:
+                                            topic_keywords = filtered_df.iloc[0]['Topic_Keywords']
+                                        elif hasattr(st.session_state, 'current_topic_info'):
+                                            topic_row = st.session_state.current_topic_info[st.session_state.current_topic_info['Topic'] == selected_topic_id]
+                                            if len(topic_row) > 0 and 'Keywords' in topic_row.columns:
+                                                topic_keywords = topic_row.iloc[0]['Keywords']
 
                                         # Load LLM if not already loaded
                                         if 'llm_model' not in st.session_state or st.session_state.llm_model is None:
@@ -4395,10 +4403,18 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                                 zf.writestr("umap_embeddings.npy", umap_buffer.getvalue())
 
                             # 3. Save topics and metadata
+                            # Build topic_keywords from topic_info
+                            topic_keywords_dict = {}
+                            if hasattr(st.session_state, 'current_topic_info'):
+                                topic_keywords_dict = dict(zip(
+                                    st.session_state.current_topic_info['Topic'],
+                                    st.session_state.current_topic_info['Keywords']
+                                ))
+
                             session_metadata = {
                                 'topics': st.session_state.current_topics.tolist(),
                                 'documents': st.session_state.documents,
-                                'topic_keywords': st.session_state.topic_keywords,
+                                'topic_keywords': topic_keywords_dict,
                                 'topic_human': st.session_state.topic_human,
                                 'parameters': {
                                     'min_topic_size': st.session_state.get('min_topic_size_used', 10),
