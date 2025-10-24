@@ -3430,6 +3430,9 @@ def main():
                 if llm_model:
                     st.session_state.reclusterer.llm_model = llm_model
                     st.session_state.reclusterer.llm_model_name = llm_model_name
+                    # Also store in top-level session state for easy reuse by other features
+                    st.session_state.llm_model = llm_model
+                    st.session_state.llm_model_name = llm_model_name
                     st.success(f"✅ LLM attached to reclusterer: {llm_model_name}")
                 else:
                     st.warning("⚠️ No LLM model to attach - will use TF-IDF fallback")
@@ -3622,6 +3625,10 @@ def main():
                     if post_llm is None:
                         st.error("❌ Failed to load LLM. Check the error messages above.")
                     else:
+                        # Store in session state for reuse by other features (like topic summary)
+                        st.session_state.llm_model = post_llm
+                        st.session_state.post_llm_model_name = post_llm_model_name
+
                         # Run LLM analysis
                         try:
                             updated_topic_info = run_llm_analysis_on_topics(
@@ -4219,10 +4226,43 @@ def main():
                                             if len(topic_row) > 0 and 'Keywords' in topic_row.columns:
                                                 topic_keywords = topic_row.iloc[0]['Keywords']
 
-                                        # Load LLM if not already loaded
-                                        if 'llm_model' not in st.session_state or st.session_state.llm_model is None:
+                                        # Try to reuse already-loaded LLM from clustering/analysis
+                                        llm_model = None
+                                        llm_tokenizer = None
+
+                                        # Check multiple possible LLM sources (prioritize most recently loaded)
+                                        if 'llm_model' in st.session_state and st.session_state.llm_model is not None:
+                                            # Topic summary LLM (if already loaded earlier)
+                                            llm_model, llm_tokenizer = st.session_state.llm_model
+                                            st.toast("✅ Using cached topic summary LLM", icon="⚡")
+                                        elif 'chat_llm' in st.session_state and st.session_state.chat_llm is not None:
+                                            # Chat LLM (from RAG feature)
+                                            llm_model, llm_tokenizer = st.session_state.chat_llm
+                                            st.toast("✅ Reusing chat LLM for summary", icon="♻️")
+                                        elif (hasattr(st.session_state, 'reclusterer') and
+                                              st.session_state.reclusterer is not None and
+                                              hasattr(st.session_state.reclusterer, 'llm_model') and
+                                              st.session_state.reclusterer.llm_model is not None):
+                                            # Main clustering LLM (stored in reclusterer)
+                                            llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
+                                            st.toast("✅ Reusing clustering LLM for summary", icon="♻️")
+
+                                        # If no LLM found, load a new one
+                                        if llm_model is None:
                                             from transformers import AutoModelForCausalLM, AutoTokenizer
-                                            llm_model_name = st.session_state.get('llm_model_name', "microsoft/Phi-3-mini-4k-instruct")
+
+                                            # Get model name from settings or use default
+                                            llm_model_name = st.session_state.get('llm_model_name')
+                                            if not llm_model_name:
+                                                # Try to get from different sources
+                                                llm_model_name = st.session_state.get('post_llm_model_name')
+                                            if not llm_model_name:
+                                                llm_model_name = st.session_state.get('chat_llm_model_name')
+                                            if not llm_model_name:
+                                                # Final fallback
+                                                llm_model_name = "microsoft/Phi-3-mini-4k-instruct"
+
+                                            st.info(f"📦 Loading {llm_model_name} for topic summary...")
 
                                             with st.spinner("Loading LLM model for summary..."):
                                                 llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
@@ -4268,8 +4308,6 @@ def main():
 
                                             # Show success message as toast (non-blocking)
                                             st.toast(f"✅ LLM loaded with {st.session_state.llm_attention_type}", icon="⚡")
-
-                                        llm_model, llm_tokenizer = st.session_state.llm_model
 
                                         # Sample documents intelligently (first, middle, last to get variety)
                                         sample_docs = []
