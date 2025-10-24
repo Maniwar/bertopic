@@ -653,6 +653,43 @@ Your response:"""
 
 
 # =====================================================
+# ✅ PERSISTENT DEBUG LOGGING
+# =====================================================
+def log_debug(message, message_type="info"):
+    """
+    Log debug message to persistent session state.
+    message_type: "info", "success", "warning", "error"
+    """
+    if 'debug_log' not in st.session_state:
+        st.session_state.debug_log = []
+
+    timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
+    st.session_state.debug_log.append({
+        'time': timestamp,
+        'type': message_type,
+        'message': message
+    })
+
+    # Keep only last 500 messages to avoid memory issues
+    if len(st.session_state.debug_log) > 500:
+        st.session_state.debug_log = st.session_state.debug_log[-500:]
+
+
+def show_debug_log():
+    """Display the persistent debug log in an expander"""
+    if 'debug_log' in st.session_state and st.session_state.debug_log:
+        with st.expander(f"🔍 Debug Log ({len(st.session_state.debug_log)} messages)", expanded=False):
+            if st.button("Clear Debug Log"):
+                st.session_state.debug_log = []
+                st.rerun()
+
+            # Show most recent first
+            for entry in reversed(st.session_state.debug_log[-100:]):  # Show last 100
+                icon = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌"}.get(entry['type'], "📝")
+                st.text(f"[{entry['time']}] {icon} {entry['message']}")
+
+
+# =====================================================
 # ✅ DOCUMENT CLEANING FOR LLM
 # =====================================================
 def clean_docs_for_llm(docs, max_docs=8, max_length=200):
@@ -802,15 +839,17 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # ✅ ENHANCED DEBUG: Always show response sample
-        st.caption(f"🔍 LLM Response length: {len(response)} chars")
-        st.caption(f"📝 Full LLM Response:\n```\n{response}\n```")
+        # ✅ LOG to persistent debug
+        log_debug(f"=== BATCH LLM ANALYSIS ===", "info")
+        log_debug(f"Batch size: {len(topic_batch)} topics", "info")
+        log_debug(f"Response length: {len(response)} chars", "info")
+        log_debug(f"Full response:\n{response}", "info")
 
         # Parse responses for each topic - ENHANCED PARSING with multiple strategies
         results = {}
 
         # Strategy 1: Try the structured parsing first
-        st.caption("🔍 Starting Strategy 1: Line-by-line parsing...")
+        log_debug("Starting Strategy 1: Line-by-line parsing", "info")
         lines = response.split('\n')
         current_topic_id = None
         current_analysis = []
@@ -835,14 +874,14 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                         analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
                         if analysis_text and len(analysis_text) > 10:
                             results[current_topic_id] = analysis_text
-                            st.success(f"✅ Topic {current_topic_id}: Extracted {len(analysis_text)} chars: '{analysis_text[:100]}...'")
+                            log_debug(f"Topic {current_topic_id}: Extracted {len(analysis_text)} chars: '{analysis_text[:100]}'", "success")
                         else:
-                            st.warning(f"⚠️ Topic {current_topic_id}: Analysis too short ({len(analysis_text)} chars): '{analysis_text}'")
+                            log_debug(f"Topic {current_topic_id}: Analysis too short ({len(analysis_text)} chars): '{analysis_text}'", "warning")
 
                     # Start new topic
                     current_topic_id = int(topic_match.group(1))
                     current_analysis = []
-                    st.caption(f"📍 Line {idx}: Found Topic {current_topic_id}")
+                    log_debug(f"Line {idx}: Found Topic {current_topic_id}", "info")
                     continue
 
             # Skip lines that are clearly not analysis
@@ -853,7 +892,6 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                            '1) What users', '2) Key patterns', '3) Any notable',
                            'Topic:', 'Documents:', 'Analysis for']
             if any(pattern in line for pattern in skip_patterns):
-                st.caption(f"⏭️ Line {idx}: Skipping (matches skip pattern): '{line[:60]}'")
                 continue
 
             # Look for "Analysis:" markers and capture what follows
@@ -861,14 +899,12 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                 parts = line.split(':', 1)
                 if len(parts) == 2 and parts[1].strip():
                     current_analysis.append(parts[1].strip())
-                    st.caption(f"📝 Line {idx}: Captured from 'Analysis:' marker: '{parts[1].strip()[:60]}'")
                 continue
 
             # Capture substantial text (not questions or prompts)
             if len(line) > 15 and not line.endswith('?') and not line.startswith(('-', '*', '•')):
                 # This looks like analysis content
                 current_analysis.append(line)
-                st.caption(f"📝 Line {idx}: Captured substantial text: '{line[:60]}'")
 
         # Don't forget the last topic
         if current_topic_id is not None and current_analysis:
@@ -878,22 +914,21 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
             if analysis_text and len(analysis_text) > 10:
                 results[current_topic_id] = analysis_text
-                st.success(f"✅ Topic {current_topic_id} (last): Extracted {len(analysis_text)} chars: '{analysis_text[:100]}...'")
+                log_debug(f"Topic {current_topic_id} (last): Extracted {len(analysis_text)} chars: '{analysis_text[:100]}'", "success")
             else:
-                st.warning(f"⚠️ Topic {current_topic_id} (last): Analysis too short ({len(analysis_text)} chars): '{analysis_text}'")
+                log_debug(f"Topic {current_topic_id} (last): Too short ({len(analysis_text)} chars): '{analysis_text}'", "warning")
 
         # Strategy 2: If structured parsing failed, try splitting by "Topic X" markers
         if not results:
-            st.caption("🔍 Strategy 1 failed. Trying Strategy 2: Regex split...")
+            log_debug("Strategy 1 got 0 results. Trying Strategy 2: Regex split", "warning")
             import re
             topic_sections = re.split(r'Topic\s+(\d+)', response, flags=re.IGNORECASE)
-            st.caption(f"📊 Split into {len(topic_sections)} sections")
+            log_debug(f"Split into {len(topic_sections)} sections", "info")
             # topic_sections will be: [before, id1, content1, id2, content2, ...]
             for i in range(1, len(topic_sections), 2):
                 if i + 1 < len(topic_sections):
                     topic_id = int(topic_sections[i])
                     content = topic_sections[i + 1]
-                    st.caption(f"📍 Processing Topic {topic_id} section ({len(content)} chars)")
 
                     # Extract meaningful text (skip prompt/labels)
                     lines = [l.strip() for l in content.split('\n') if l.strip()]
@@ -910,20 +945,15 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                         analysis = ' '.join(analysis_lines[:5])  # Take up to 5 lines
                         if len(analysis) > 20:
                             results[topic_id] = analysis
-                            st.success(f"✅ Topic {topic_id}: Strategy 2 extracted {len(analysis)} chars: '{analysis[:100]}...'")
-                        else:
-                            st.warning(f"⚠️ Topic {topic_id}: Strategy 2 result too short ({len(analysis)} chars)")
-                    else:
-                        st.warning(f"⚠️ Topic {topic_id}: Strategy 2 found no analysis lines")
+                            log_debug(f"Topic {topic_id}: Strategy 2 extracted {len(analysis)} chars", "success")
 
         # ✅ FINAL SUMMARY
         if results:
-            st.success(f"✅ Successfully parsed {len(results)}/{len(topic_batch)} topics from batch")
+            log_debug(f"Successfully parsed {len(results)}/{len(topic_batch)} topics from batch", "success")
             for topic_id, analysis in results.items():
-                st.caption(f"📄 Topic {topic_id}: {analysis[:200]}...")
+                log_debug(f"Topic {topic_id}: {analysis[:150]}", "info")
         else:
-            st.error(f"❌ Batch parsing extracted 0 results from {len(response)} char response")
-            st.caption("🔍 Check the detailed parsing output above to see why parsing failed")
+            log_debug(f"BATCH PARSING FAILED: 0 results from {len(response)} char response", "error")
 
         return results
 
@@ -2858,9 +2888,14 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
         all_topics: Array mapping doc index to topic ID
     """
     if faiss_index is None:
+        log_debug("RAG retrieval failed: faiss_index is None", "error")
         return []
 
     try:
+        log_debug(f"=== RAG RETRIEVAL ===", "info")
+        log_debug(f"Query: {query}", "info")
+        log_debug(f"Topic filter: {topic_filter}", "info")
+
         # Encode query
         query_embedding = safe_model.model.encode(
             [query],
@@ -2876,17 +2911,22 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
 
         # Get documents
         results = []
+        skipped_count = 0
         for i, idx in enumerate(indices[0]):
             if 0 <= idx < len(documents):
                 # ✅ TOPIC-AWARE: Filter by topic if specified
                 if topic_filter is not None and all_topics is not None:
-                    if idx < len(all_topics) and all_topics[idx] != topic_filter:
-                        continue  # Skip docs not in the target topic
+                    if idx < len(all_topics):
+                        doc_topic = all_topics[idx]
+                        if doc_topic != topic_filter:
+                            skipped_count += 1
+                            continue  # Skip docs not in the target topic
 
                 results.append({
                     'document': documents[idx],
                     'distance': float(distances[0][i]),
-                    'index': int(idx)
+                    'index': int(idx),
+                    'topic': all_topics[idx] if (all_topics is not None and idx < len(all_topics)) else None
                 })
 
                 # Stop once we have enough results
@@ -2894,9 +2934,11 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
                     break
 
         if topic_filter is not None:
+            log_debug(f"Topic-aware search: {len(results)} matches, {skipped_count} skipped (wrong topic)", "info")
             if len(results) > 0:
                 st.caption(f"🎯 Retrieved {len(results)} docs from Topic {topic_filter} (topic-aware search)")
             else:
+                log_debug(f"No docs found in Topic {topic_filter}, falling back to global search", "warning")
                 st.warning(f"⚠️ No docs found in Topic {topic_filter}, falling back to global search")
                 # Fallback: retrieve from all topics
                 results = []
@@ -2905,11 +2947,19 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
                         results.append({
                             'document': documents[idx],
                             'distance': float(distances[0][i]),
-                            'index': int(idx)
+                            'index': int(idx),
+                            'topic': all_topics[idx] if (all_topics is not None and idx < len(all_topics)) else None
                         })
+
+        # Log retrieved documents
+        for i, doc_info in enumerate(results):
+            doc_preview = doc_info['document'][:100]
+            doc_topic = doc_info.get('topic', '?')
+            log_debug(f"Doc {i+1} (topic {doc_topic}, dist {doc_info['distance']:.3f}): {doc_preview}", "info")
 
         return results
     except Exception as e:
+        log_debug(f"RAG retrieval error: {str(e)}", "error")
         st.error(f"❌ Document retrieval error: {str(e)}")
         return []
 
@@ -2917,9 +2967,11 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
 def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm_model, current_topic_id=None):
     """Generate response using LLM with retrieved documents as context (RAG)"""
     if llm_model is None:
+        log_debug("RAG generation failed: LLM not loaded", "error")
         return "❌ LLM not loaded. Please enable LLM in the sidebar and reload."
 
     try:
+        log_debug(f"=== RAG GENERATION ===", "info")
         model, tokenizer = llm_model
 
         # Build context from retrieved documents
@@ -2932,6 +2984,7 @@ def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm
                 row = topic_row.iloc[0]
                 context_parts.append(f"\nCurrently viewing Topic {current_topic_id}: {row['Human_Label']}")
                 context_parts.append(f"Keywords: {row['Keywords']}")
+                log_debug(f"Context includes Topic {current_topic_id}: {row['Human_Label']}", "info")
 
         context_parts.append("\nRelevant Documents:")
         for i, doc_info in enumerate(retrieved_docs[:5], 1):
@@ -2949,6 +3002,8 @@ Based on the relevant documents and topic information above, provide a clear, he
 
 Answer:"""
 
+        log_debug(f"RAG prompt ({len(prompt)} chars):\n{prompt}", "info")
+
         # Generate response
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
         if torch.cuda.is_available():
@@ -2965,14 +3020,19 @@ Answer:"""
             )
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        log_debug(f"RAG raw response ({len(response)} chars):\n{response}", "info")
 
         # Extract just the answer part
         if "Answer:" in response:
             response = response.split("Answer:")[-1].strip()
+            log_debug(f"RAG extracted answer ({len(response)} chars): {response}", "success")
+        else:
+            log_debug(f"RAG response has no 'Answer:' marker, using full response", "warning")
 
         return response
 
     except Exception as e:
+        log_debug(f"RAG generation error: {str(e)}", "error")
         st.error(f"❌ LLM generation error: {str(e)}")
         return f"Error generating response: {str(e)}"
 
@@ -3855,6 +3915,9 @@ def main():
                 st.error("⚠️ **Topic Distribution Imbalance Detected!**")
                 for warning in balance_analysis['warnings']:
                     st.warning(warning)
+
+            # ✅ Show persistent debug log
+            show_debug_log()
 
             # Tabs for different views
             tabs = st.tabs([
