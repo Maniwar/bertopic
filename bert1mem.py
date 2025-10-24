@@ -3655,6 +3655,164 @@ def main():
                             import traceback
                             st.code(traceback.format_exc())
 
+        # ✅ OPTION 2: Batch generate all topic summaries
+        st.markdown("---")
+        st.subheader("📝 Topic Summaries (Long-form)")
+
+        # Show coverage stats
+        num_summaries = len(st.session_state.get('topic_summaries', {}))
+        num_topics = len(st.session_state.get('current_topic_info', pd.DataFrame()))
+        if num_topics > 0:
+            coverage_pct = (num_summaries / num_topics) * 100
+            st.caption(f"💾 {num_summaries}/{num_topics} topics have summaries ({coverage_pct:.0f}% coverage)")
+
+        summary_max_docs = st.number_input(
+            "Max docs per summary:",
+            min_value=10,
+            max_value=500,
+            value=100,
+            step=10,
+            key="batch_summary_max_docs",
+            help="Number of documents to analyze for each topic summary"
+        )
+
+        if st.button("🚀 Generate All Topic Summaries", type="secondary", key="generate_all_summaries"):
+            if st.session_state.get('current_topics') is None:
+                st.error("❌ No topics found. Please cluster your data first.")
+            elif st.session_state.get('documents') is None:
+                st.error("❌ No documents found.")
+            else:
+                # Get LLM
+                llm_model = None
+                llm_tokenizer = None
+
+                # Reuse existing LLM
+                if 'llm_model' in st.session_state and st.session_state.llm_model is not None:
+                    llm_model, llm_tokenizer = st.session_state.llm_model
+                elif (hasattr(st.session_state, 'reclusterer') and
+                      st.session_state.reclusterer is not None and
+                      hasattr(st.session_state.reclusterer, 'llm_model')):
+                    llm_model, llm_tokenizer = st.session_state.reclusterer.llm_model
+
+                if llm_model is None:
+                    st.error("❌ No LLM loaded. Please run LLM analysis or enable LLM during clustering first.")
+                else:
+                    # Get topics to summarize
+                    topic_info = st.session_state.current_topic_info
+                    topics = st.session_state.current_topics
+                    documents = st.session_state.documents
+
+                    # Filter out outliers
+                    valid_topics = [t for t in topic_info['Topic'].unique() if t != -1]
+
+                    st.info(f"🚀 Generating summaries for {len(valid_topics)} topics...")
+
+                    # Initialize summary storage
+                    if 'topic_summaries' not in st.session_state:
+                        st.session_state.topic_summaries = {}
+
+                    # Progress tracking
+                    progress_bar = st.progress(0.0)
+                    status_text = st.empty()
+
+                    success_count = 0
+                    fail_count = 0
+
+                    for idx, topic_id in enumerate(valid_topics):
+                        try:
+                            status_text.info(f"📝 Generating summary for Topic {topic_id} ({idx+1}/{len(valid_topics)})...")
+
+                            # Get topic docs
+                            topic_doc_indices = [i for i, t in enumerate(topics) if t == topic_id]
+                            topic_docs = [documents[i] for i in topic_doc_indices[:summary_max_docs]]
+
+                            if not topic_docs:
+                                fail_count += 1
+                                continue
+
+                            # Get topic label and keywords
+                            topic_row = topic_info[topic_info['Topic'] == topic_id]
+                            if len(topic_row) == 0:
+                                fail_count += 1
+                                continue
+
+                            human_label = topic_row.iloc[0].get('Human_Label', f"Topic {topic_id}")
+                            topic_keywords = topic_row.iloc[0].get('Keywords', '')
+
+                            # Sample intelligently
+                            if len(topic_docs) <= 20:
+                                sample_docs = topic_docs
+                            else:
+                                sample_docs = topic_docs[:7] + topic_docs[len(topic_docs)//2-3:len(topic_docs)//2+4] + topic_docs[-6:]
+
+                            sample_docs_truncated = [doc[:300] for doc in sample_docs]
+                            docs_text = "\n\n".join([f"{i+1}. {doc}" for i, doc in enumerate(sample_docs_truncated)])
+
+                            prompt = f"""You are analyzing documents from a topic cluster. Provide a concise summary (3-5 sentences) that captures:
+1. The main theme/problem discussed
+2. Key patterns or common issues mentioned
+3. Notable insights or trends
+
+Topic Label: {human_label}
+Keywords: {topic_keywords}
+Total Documents in Topic: {len(topic_doc_indices)}
+Sample Documents (showing {len(sample_docs)} representative docs):
+
+{docs_text}
+
+Provide a clear, actionable summary:"""
+
+                            # Generate
+                            messages = [{"role": "user", "content": prompt}]
+                            model_inputs = llm_tokenizer.apply_chat_template(
+                                messages,
+                                add_generation_prompt=True,
+                                return_tensors="pt",
+                                return_dict=True
+                            )
+
+                            if torch.cuda.is_available():
+                                model_inputs = {k: v.to(llm_model.device) for k, v in model_inputs.items()}
+
+                            with torch.no_grad():
+                                outputs = llm_model.generate(
+                                    **model_inputs,
+                                    max_new_tokens=300,
+                                    temperature=0.7,
+                                    do_sample=True,
+                                    pad_token_id=llm_tokenizer.eos_token_id,
+                                    use_cache=True
+                                )
+
+                            input_length = model_inputs['input_ids'].shape[1]
+                            generated_tokens = outputs[0][input_length:]
+                            summary_text = llm_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+                            # Save summary
+                            st.session_state.topic_summaries[topic_id] = summary_text
+                            success_count += 1
+
+                        except Exception as e:
+                            st.warning(f"⚠️ Failed to generate summary for Topic {topic_id}: {str(e)}")
+                            fail_count += 1
+
+                        # Update progress
+                        progress_bar.progress((idx + 1) / len(valid_topics))
+
+                    # Clear progress
+                    progress_bar.empty()
+                    status_text.empty()
+
+                    # Show results
+                    st.success(f"✅ Generated {success_count}/{len(valid_topics)} topic summaries!")
+                    if fail_count > 0:
+                        st.warning(f"⚠️ {fail_count} topics failed to generate summaries")
+
+                    # Force refresh browser_df to show summaries
+                    if 'browser_df' in st.session_state:
+                        del st.session_state.browser_df
+                    st.rerun()
+
         # Display results
         if st.session_state.current_topics is not None:
             topics = st.session_state.current_topics
@@ -3728,6 +3886,12 @@ def main():
                 else:
                     browser_df['Topic_LLM_Analysis'] = ''
 
+                # ✅ Add Topic_Summary column from session state (OPTION 1 & 2)
+                if 'topic_summaries' in st.session_state and st.session_state.topic_summaries:
+                    browser_df['Topic_Summary'] = browser_df['Topic'].map(st.session_state.topic_summaries).fillna('')
+                else:
+                    browser_df['Topic_Summary'] = ''
+
                 browser_df['Valid_Document'] = [i in st.session_state.valid_indices for i in range(len(browser_df))]
 
                 # Cache in session state
@@ -3776,10 +3940,23 @@ def main():
                     display_df = display_df[display_df['Topic'] != -1]
                 display_df['Percentage'] = (display_df['Count'] / total_docs * 100).round(2)
 
-                # Include LLM_Analysis if available
-                if 'LLM_Analysis' in display_df.columns and display_df['LLM_Analysis'].any():
+                # Add Topic_Summary column if summaries exist
+                if 'topic_summaries' in st.session_state and st.session_state.topic_summaries:
+                    display_df['Topic_Summary'] = display_df['Topic'].map(st.session_state.topic_summaries).fillna('')
+
+                # Include LLM_Analysis and Topic_Summary if available
+                has_analysis = 'LLM_Analysis' in display_df.columns and display_df['LLM_Analysis'].any()
+                has_summary = 'Topic_Summary' in display_df.columns and display_df['Topic_Summary'].any()
+
+                if has_analysis and has_summary:
+                    display_df = display_df[['Topic', 'Human_Label', 'LLM_Analysis', 'Topic_Summary', 'Keywords', 'Count', 'Percentage']]
+                    st.caption("🤖 **LLM_Analysis** = short insight (1 sentence) | **Topic_Summary** = long summary (3-5 sentences)")
+                elif has_analysis:
                     display_df = display_df[['Topic', 'Human_Label', 'LLM_Analysis', 'Keywords', 'Count', 'Percentage']]
                     st.caption("🤖 **LLM_Analysis** column shows AI-generated insights about each topic")
+                elif has_summary:
+                    display_df = display_df[['Topic', 'Human_Label', 'Topic_Summary', 'Keywords', 'Count', 'Percentage']]
+                    st.caption("📝 **Topic_Summary** column shows detailed AI-generated summaries")
                 else:
                     display_df = display_df[['Topic', 'Human_Label', 'Keywords', 'Count', 'Percentage']]
 
@@ -4365,6 +4542,11 @@ Provide a clear, actionable summary:"""
                                         generated_tokens = outputs[0][input_length:]
                                         summary_text = llm_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
+                                        # ✅ OPTION 1: Save summary persistently for downloads
+                                        if 'topic_summaries' not in st.session_state:
+                                            st.session_state.topic_summaries = {}
+                                        st.session_state.topic_summaries[selected_topic_id] = summary_text
+
                                         # Display summary in expander
                                         with st.expander(f"📝 Topic {selected_topic_id} Summary ({len(filtered_df):,} docs)", expanded=True):
                                             st.markdown(f"**Topic:** {human_label}")
@@ -4590,9 +4772,20 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                     )
 
                 with col2:
-                    # Include LLM_Analysis if available
-                    if 'LLM_Analysis' in safe_topic_info.columns and safe_topic_info['LLM_Analysis'].any():
+                    # Add Topic_Summary to topic_info if summaries exist
+                    if 'topic_summaries' in st.session_state and st.session_state.topic_summaries:
+                        safe_topic_info['Topic_Summary'] = safe_topic_info['Topic'].map(st.session_state.topic_summaries).fillna('')
+
+                    # Include LLM_Analysis and Topic_Summary if available
+                    has_analysis = 'LLM_Analysis' in safe_topic_info.columns and safe_topic_info['LLM_Analysis'].any()
+                    has_summary = 'Topic_Summary' in safe_topic_info.columns and safe_topic_info['Topic_Summary'].any()
+
+                    if has_analysis and has_summary:
+                        export_cols = ['Topic', 'Human_Label', 'LLM_Analysis', 'Topic_Summary', 'Keywords', 'Count']
+                    elif has_analysis:
                         export_cols = ['Topic', 'Human_Label', 'LLM_Analysis', 'Keywords', 'Count']
+                    elif has_summary:
+                        export_cols = ['Topic', 'Human_Label', 'Topic_Summary', 'Keywords', 'Count']
                     else:
                         export_cols = ['Topic', 'Human_Label', 'Keywords', 'Count']
 
@@ -4691,6 +4884,12 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                             if 'topic_llm_analysis' in st.session_state and st.session_state.topic_llm_analysis:
                                 zf.writestr("llm_analysis.json", json.dumps(st.session_state.topic_llm_analysis, indent=2))
 
+                            # 7. Save topic summaries if available
+                            if 'topic_summaries' in st.session_state and st.session_state.topic_summaries:
+                                # Convert int keys to str for JSON compatibility
+                                summaries_serializable = {str(k): v for k, v in st.session_state.topic_summaries.items()}
+                                zf.writestr("topic_summaries.json", json.dumps(summaries_serializable, indent=2))
+
                         zip_buffer.seek(0)
 
                         st.download_button(
@@ -4753,6 +4952,12 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                                     # Load LLM analysis if available
                                     if "llm_analysis.json" in zf.namelist():
                                         st.session_state.topic_llm_analysis = json.loads(zf.read("llm_analysis.json"))
+
+                                    # Load topic summaries if available
+                                    if "topic_summaries.json" in zf.namelist():
+                                        summaries_data = json.loads(zf.read("topic_summaries.json"))
+                                        # Convert str keys back to int
+                                        st.session_state.topic_summaries = {int(k): v for k, v in summaries_data.items()}
 
                                     st.success(f"✅ Session loaded successfully!")
                                     st.info(f"📊 Loaded {len(st.session_state.documents):,} documents with {params['n_topics']} topics")
