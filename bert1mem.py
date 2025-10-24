@@ -715,14 +715,19 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # ✅ DEBUG: Log the raw response for troubleshooting
-        if len(response) < 500:
-            st.caption(f"🔍 LLM Response Sample: {response[:200]}...")
+        # ✅ ENHANCED DEBUG: Always show response sample
+        st.caption(f"🔍 LLM Response length: {len(response)} chars")
+        if len(response) < 1000:
+            st.caption(f"📝 Full response:\n{response}")
+        else:
+            st.caption(f"📝 Response start:\n{response[:800]}...")
+            st.caption(f"📝 Response end:\n...{response[-400:]}")
 
-        # Parse responses for each topic - IMPROVED PARSING
+        # Parse responses for each topic - ENHANCED PARSING with multiple strategies
         results = {}
-        lines = response.split('\n')
 
+        # Strategy 1: Try the structured parsing first
+        lines = response.split('\n')
         current_topic_id = None
         current_analysis = []
 
@@ -731,51 +736,93 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             if not line:
                 continue
 
-            # Track which topic we're parsing - look for "Topic X" at start
-            if line.startswith('Topic ') and ('-' in line or '(' in line):
-                # Save previous topic's analysis if we have one
-                if current_topic_id is not None and current_analysis:
-                    analysis_text = ' '.join(current_analysis).strip()
-                    analysis_text = analysis_text.strip('"\'.,;[](){}')
-                    # ✅ NO LENGTH LIMIT: Keep full detailed analysis
-                    if analysis_text:
-                        results[current_topic_id] = analysis_text
+            # Track which topic we're parsing - MORE FLEXIBLE matching
+            # Look for "Topic X" anywhere in the line, not just at start
+            if 'Topic ' in line:
+                # Try to extract topic number
+                import re
+                topic_match = re.search(r'Topic\s+(\d+)', line, re.IGNORECASE)
+                if topic_match:
+                    # Save previous topic's analysis if we have one
+                    if current_topic_id is not None and current_analysis:
+                        analysis_text = ' '.join(current_analysis).strip()
+                        # Clean up common prefixes/suffixes
+                        analysis_text = analysis_text.strip('"\'.,;[](){}')
+                        analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
+                        if analysis_text and len(analysis_text) > 10:
+                            results[current_topic_id] = analysis_text
 
-                # Start new topic
-                try:
-                    # Handle both "Topic X (" and "Topic X -" formats
-                    topic_part = line.split()[1]
-                    if topic_part.endswith(':') or topic_part.endswith('-'):
-                        topic_part = topic_part[:-1]
-                    topic_num = int(topic_part)
-                    current_topic_id = topic_num
+                    # Start new topic
+                    current_topic_id = int(topic_match.group(1))
                     current_analysis = []
-                except:
-                    pass
+                    continue
 
-            # Look for "Analysis:" or "Detailed Analysis:" and capture what follows
-            elif ('Analysis:' in line or 'analysis:' in line.lower()) and current_topic_id is not None:
+            # Skip lines that are clearly not analysis
+            if current_topic_id is None:
+                continue
+
+            skip_patterns = ['Sample documents:', 'Analyze these', 'provide a detailed',
+                           '1) What users', '2) Key patterns', '3) Any notable',
+                           'Topic:', 'Documents:', 'Analysis for']
+            if any(pattern in line for pattern in skip_patterns):
+                continue
+
+            # Look for "Analysis:" markers and capture what follows
+            if 'Analysis:' in line or 'analysis:' in line.lower():
                 parts = line.split(':', 1)
                 if len(parts) == 2 and parts[1].strip():
                     current_analysis.append(parts[1].strip())
+                continue
 
-            # Or capture any text that looks like analysis (after we've seen "Analysis:")
-            elif current_topic_id is not None and current_analysis and not line.startswith(('Topic ', 'Sample documents:', 'Analyze', '1)', '2)', '3)')):
-                # This line might be continuation of analysis - ✅ NO LENGTH LIMIT
+            # Capture substantial text (not questions or prompts)
+            if len(line) > 15 and not line.endswith('?') and not line.startswith(('-', '*', '•')):
+                # This looks like analysis content
                 current_analysis.append(line)
 
-        # Don't forget the last topic - ✅ NO LENGTH LIMIT
+        # Don't forget the last topic
         if current_topic_id is not None and current_analysis:
             analysis_text = ' '.join(current_analysis).strip()
             analysis_text = analysis_text.strip('"\'.,;[](){}')
-            if analysis_text:
+            import re
+            analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
+            if analysis_text and len(analysis_text) > 10:
                 results[current_topic_id] = analysis_text
+
+        # Strategy 2: If structured parsing failed, try splitting by "Topic X" markers
+        if not results:
+            import re
+            topic_sections = re.split(r'Topic\s+(\d+)', response, flags=re.IGNORECASE)
+            # topic_sections will be: [before, id1, content1, id2, content2, ...]
+            for i in range(1, len(topic_sections), 2):
+                if i + 1 < len(topic_sections):
+                    topic_id = int(topic_sections[i])
+                    content = topic_sections[i + 1]
+
+                    # Extract meaningful text (skip prompt/labels)
+                    lines = [l.strip() for l in content.split('\n') if l.strip()]
+                    analysis_lines = []
+                    for line in lines:
+                        # Skip metadata lines
+                        if any(skip in line for skip in ['Sample documents:', '-', 'Analysis:', 'Detailed Analysis:']):
+                            continue
+                        # Keep substantial sentences
+                        if len(line) > 20 and not line.endswith(':'):
+                            analysis_lines.append(line)
+
+                    if analysis_lines:
+                        analysis = ' '.join(analysis_lines[:5])  # Take up to 5 lines
+                        if len(analysis) > 20:
+                            results[topic_id] = analysis
 
         # ✅ DEBUG: Show parsing results
         if results:
             st.caption(f"✅ Successfully parsed {len(results)}/{len(topic_batch)} topics from batch")
+            # Show a sample
+            sample_topic = list(results.keys())[0]
+            st.caption(f"📄 Sample analysis for Topic {sample_topic}: {results[sample_topic][:150]}...")
         else:
             st.warning(f"⚠️ Batch parsing extracted 0 results. Raw response length: {len(response)}")
+            st.caption(f"🔍 Debug: First 1000 chars of response:\n{response[:1000]}")
 
         return results
 
