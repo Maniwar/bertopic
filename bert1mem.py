@@ -2817,52 +2817,51 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
 def main():
     st.title("🚀 Complete BERTopic with All Features")
 
-    # Initialize session state
-    if 'embeddings_computed' not in st.session_state:
-        st.session_state.embeddings_computed = False
-    if 'embeddings' not in st.session_state:
-        st.session_state.embeddings = None
-    if 'umap_embeddings' not in st.session_state:
-        st.session_state.umap_embeddings = None
-    if 'documents' not in st.session_state:
-        st.session_state.documents = None
-    if 'df' not in st.session_state:
-        st.session_state.df = None
-    if 'reclusterer' not in st.session_state:
-        st.session_state.reclusterer = None
-    if 'current_topics' not in st.session_state:
-        st.session_state.current_topics = None
-    if 'current_topic_info' not in st.session_state:
-        st.session_state.current_topic_info = None
-    if 'valid_indices' not in st.session_state:
-        st.session_state.valid_indices = None
-    if 'min_topic_size_used' not in st.session_state:
-        st.session_state.min_topic_size_used = 10
-    if 'uploaded_file_name' not in st.session_state:
-        st.session_state.uploaded_file_name = 'data'
-    if 'topic_info' not in st.session_state:
-        st.session_state.topic_info = None
-    if 'model' not in st.session_state:
-        st.session_state.model = None
-    if 'processed_df' not in st.session_state:
-        st.session_state.processed_df = None
-    if 'min_topic_size' not in st.session_state:
-        st.session_state.min_topic_size = 10
-    if 'clustering_method' not in st.session_state:
-        st.session_state.clustering_method = 'Unknown'
-    if 'gpu_used' not in st.session_state:
-        st.session_state.gpu_used = False
-    if 'text_col' not in st.session_state:
-        st.session_state.text_col = None
-    if 'browser_df' not in st.session_state:
-        st.session_state.browser_df = None
-    if 'topic_human' not in st.session_state:
-        st.session_state.topic_human = {}
-    if 'last_topics_hash' not in st.session_state:
-        st.session_state.last_topics_hash = None
+    # Initialize session state - Carmack style: one dict, one loop
+    SESSION_DEFAULTS = {
+        # Core data
+        'embeddings_computed': False,
+        'embeddings': None,
+        'umap_embeddings': None,
+        'documents': None,
+        'valid_indices': None,
 
-    # Check GPU capabilities (cached in session state to avoid repeated checks)
-    if 'gpu_capabilities' not in st.session_state:
+        # DataFrames
+        'df': None,
+        'processed_df': None,
+        'browser_df': None,
+        'topic_info': None,
+        'current_topic_info': None,
+
+        # Clustering
+        'reclusterer': None,
+        'current_topics': None,
+        'min_topic_size': 10,
+        'min_topic_size_used': 10,
+        'clustering_method': 'Unknown',
+
+        # Models
+        'model': None,
+        'llm_model': None,
+        'llm_model_name': None,
+
+        # UI state
+        'text_col': None,
+        'uploaded_file_name': 'data',
+        'topic_human': {},
+        'last_topics_hash': None,
+
+        # Hardware
+        'gpu_used': False,
+        'gpu_capabilities': None,
+    }
+
+    for key, default in SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    # Lazy-load GPU capabilities (expensive operation)
+    if st.session_state.gpu_capabilities is None:
         st.session_state.gpu_capabilities = check_gpu_capabilities()
     gpu_capabilities = st.session_state.gpu_capabilities
 
