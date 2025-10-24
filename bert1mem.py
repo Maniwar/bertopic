@@ -2232,15 +2232,31 @@ class FastReclusterer:
                 # Process batch with LLM
                 batch_results = generate_batch_llm_analysis(batch, self.llm_model)
 
-                # Collect results
+                # Collect results with fallback to individual processing
                 for topic_item in batch:
                     topic_id = topic_item['topic_id']
                     if topic_id in batch_results and batch_results[topic_id]:
                         llm_analysis_dict[topic_id] = batch_results[topic_id]
                         llm_success_count += 1
                     else:
-                        llm_analysis_dict[topic_id] = "No analysis available"
-                        llm_fallback_count += 1
+                        # Fallback: Try individual LLM analysis for this topic
+                        try:
+                            individual_result = generate_simple_llm_analysis(
+                                topic_id,
+                                topic_item['docs'][:8],
+                                topic_item['label'],
+                                self.llm_model,
+                                max_length=500
+                            )
+                            if individual_result and len(individual_result.strip()) > 10:
+                                llm_analysis_dict[topic_id] = individual_result
+                                llm_success_count += 1
+                            else:
+                                llm_analysis_dict[topic_id] = "No analysis available"
+                                llm_fallback_count += 1
+                        except Exception:
+                            llm_analysis_dict[topic_id] = "No analysis available"
+                            llm_fallback_count += 1
 
                     processed_count += 1
 
@@ -2437,15 +2453,31 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         # Process batch with LLM
         batch_results = generate_batch_llm_analysis(batch, llm_model)
 
-        # Collect results
+        # Collect results with fallback to individual processing
         for topic_item in batch:
             topic_id = topic_item['topic_id']
             if topic_id in batch_results and batch_results[topic_id]:
                 llm_analysis_dict[topic_id] = batch_results[topic_id]
                 llm_success_count += 1
             else:
-                llm_analysis_dict[topic_id] = "No analysis available"
-                llm_fallback_count += 1
+                # Fallback: Try individual LLM analysis for this topic
+                try:
+                    individual_result = generate_simple_llm_analysis(
+                        topic_id,
+                        topic_item['docs'][:8],
+                        topic_item['label'],
+                        llm_model,
+                        max_length=500
+                    )
+                    if individual_result and len(individual_result.strip()) > 10:
+                        llm_analysis_dict[topic_id] = individual_result
+                        llm_success_count += 1
+                    else:
+                        llm_analysis_dict[topic_id] = "No analysis available"
+                        llm_fallback_count += 1
+                except Exception:
+                    llm_analysis_dict[topic_id] = "No analysis available"
+                    llm_fallback_count += 1
 
             processed_count += 1
 
