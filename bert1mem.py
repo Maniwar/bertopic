@@ -804,21 +804,18 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
         # ✅ ENHANCED DEBUG: Always show response sample
         st.caption(f"🔍 LLM Response length: {len(response)} chars")
-        if len(response) < 1000:
-            st.caption(f"📝 Full response:\n{response}")
-        else:
-            st.caption(f"📝 Response start:\n{response[:800]}...")
-            st.caption(f"📝 Response end:\n...{response[-400:]}")
+        st.caption(f"📝 Full LLM Response:\n```\n{response}\n```")
 
         # Parse responses for each topic - ENHANCED PARSING with multiple strategies
         results = {}
 
         # Strategy 1: Try the structured parsing first
+        st.caption("🔍 Starting Strategy 1: Line-by-line parsing...")
         lines = response.split('\n')
         current_topic_id = None
         current_analysis = []
 
-        for line in lines:
+        for idx, line in enumerate(lines):
             line = line.strip()
             if not line:
                 continue
@@ -838,10 +835,14 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                         analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
                         if analysis_text and len(analysis_text) > 10:
                             results[current_topic_id] = analysis_text
+                            st.success(f"✅ Topic {current_topic_id}: Extracted {len(analysis_text)} chars: '{analysis_text[:100]}...'")
+                        else:
+                            st.warning(f"⚠️ Topic {current_topic_id}: Analysis too short ({len(analysis_text)} chars): '{analysis_text}'")
 
                     # Start new topic
                     current_topic_id = int(topic_match.group(1))
                     current_analysis = []
+                    st.caption(f"📍 Line {idx}: Found Topic {current_topic_id}")
                     continue
 
             # Skip lines that are clearly not analysis
@@ -852,6 +853,7 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                            '1) What users', '2) Key patterns', '3) Any notable',
                            'Topic:', 'Documents:', 'Analysis for']
             if any(pattern in line for pattern in skip_patterns):
+                st.caption(f"⏭️ Line {idx}: Skipping (matches skip pattern): '{line[:60]}'")
                 continue
 
             # Look for "Analysis:" markers and capture what follows
@@ -859,12 +861,14 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                 parts = line.split(':', 1)
                 if len(parts) == 2 and parts[1].strip():
                     current_analysis.append(parts[1].strip())
+                    st.caption(f"📝 Line {idx}: Captured from 'Analysis:' marker: '{parts[1].strip()[:60]}'")
                 continue
 
             # Capture substantial text (not questions or prompts)
             if len(line) > 15 and not line.endswith('?') and not line.startswith(('-', '*', '•')):
                 # This looks like analysis content
                 current_analysis.append(line)
+                st.caption(f"📝 Line {idx}: Captured substantial text: '{line[:60]}'")
 
         # Don't forget the last topic
         if current_topic_id is not None and current_analysis:
@@ -874,16 +878,22 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             analysis_text = re.sub(r'^(Analysis|Detailed Analysis|Summary):\s*', '', analysis_text, flags=re.IGNORECASE)
             if analysis_text and len(analysis_text) > 10:
                 results[current_topic_id] = analysis_text
+                st.success(f"✅ Topic {current_topic_id} (last): Extracted {len(analysis_text)} chars: '{analysis_text[:100]}...'")
+            else:
+                st.warning(f"⚠️ Topic {current_topic_id} (last): Analysis too short ({len(analysis_text)} chars): '{analysis_text}'")
 
         # Strategy 2: If structured parsing failed, try splitting by "Topic X" markers
         if not results:
+            st.caption("🔍 Strategy 1 failed. Trying Strategy 2: Regex split...")
             import re
             topic_sections = re.split(r'Topic\s+(\d+)', response, flags=re.IGNORECASE)
+            st.caption(f"📊 Split into {len(topic_sections)} sections")
             # topic_sections will be: [before, id1, content1, id2, content2, ...]
             for i in range(1, len(topic_sections), 2):
                 if i + 1 < len(topic_sections):
                     topic_id = int(topic_sections[i])
                     content = topic_sections[i + 1]
+                    st.caption(f"📍 Processing Topic {topic_id} section ({len(content)} chars)")
 
                     # Extract meaningful text (skip prompt/labels)
                     lines = [l.strip() for l in content.split('\n') if l.strip()]
@@ -900,16 +910,20 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
                         analysis = ' '.join(analysis_lines[:5])  # Take up to 5 lines
                         if len(analysis) > 20:
                             results[topic_id] = analysis
+                            st.success(f"✅ Topic {topic_id}: Strategy 2 extracted {len(analysis)} chars: '{analysis[:100]}...'")
+                        else:
+                            st.warning(f"⚠️ Topic {topic_id}: Strategy 2 result too short ({len(analysis)} chars)")
+                    else:
+                        st.warning(f"⚠️ Topic {topic_id}: Strategy 2 found no analysis lines")
 
-        # ✅ DEBUG: Show parsing results
+        # ✅ FINAL SUMMARY
         if results:
-            st.caption(f"✅ Successfully parsed {len(results)}/{len(topic_batch)} topics from batch")
-            # Show a sample
-            sample_topic = list(results.keys())[0]
-            st.caption(f"📄 Sample analysis for Topic {sample_topic}: {results[sample_topic][:150]}...")
+            st.success(f"✅ Successfully parsed {len(results)}/{len(topic_batch)} topics from batch")
+            for topic_id, analysis in results.items():
+                st.caption(f"📄 Topic {topic_id}: {analysis[:200]}...")
         else:
-            st.warning(f"⚠️ Batch parsing extracted 0 results. Raw response length: {len(response)}")
-            st.caption(f"🔍 Debug: First 1000 chars of response:\n{response[:1000]}")
+            st.error(f"❌ Batch parsing extracted 0 results from {len(response)} char response")
+            st.caption("🔍 Check the detailed parsing output above to see why parsing failed")
 
         return results
 
@@ -969,15 +983,21 @@ Detailed Analysis:"""
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
+        # ✅ DEBUG: Show full response for individual analysis
+        st.caption(f"🔍 Individual analysis for Topic {topic_id}: Response length {len(response)} chars")
+        st.caption(f"📝 Full individual response:\n```\n{response}\n```")
+
         # Extract answer - ✅ IMPROVED: Try multiple extraction methods
         extracted = None
 
         # Method 1: Look for "Detailed Analysis:"
         if "Detailed Analysis:" in response:
             extracted = response.split("Detailed Analysis:")[-1].strip()
+            st.caption(f"✅ Method 1: Extracted after 'Detailed Analysis:' ({len(extracted)} chars)")
         # Method 2: Look for "Analysis:"
         elif "Analysis:" in response:
             extracted = response.split("Analysis:")[-1].strip()
+            st.caption(f"✅ Method 2: Extracted after 'Analysis:' ({len(extracted)} chars)")
         # Method 3: Look for content after the prompt
         elif "Sample documents:" in response:
             # Take everything after the last "Sample documents:" section
@@ -990,16 +1010,22 @@ Detailed Analysis:"""
                 analysis_lines = [l for l in lines if len(l.strip()) > 20 and not l.strip().startswith('-')]
                 if analysis_lines:
                     extracted = ' '.join(analysis_lines[:3])  # First 3 substantial lines
+                    st.caption(f"✅ Method 3: Extracted from after sample docs ({len(extracted)} chars)")
 
         # Method 4: If all else fails, take the end of the response
         if not extracted or len(extracted.strip()) < 15:
+            st.caption(f"⚠️ Methods 1-3 failed or too short ({len(extracted) if extracted else 0} chars), trying Method 4...")
             # Take last substantial part of response
             lines = response.split('\n')
             substantial = [l.strip() for l in lines if len(l.strip()) > 20]
             if substantial:
                 extracted = ' '.join(substantial[-3:])  # Last 3 substantial lines
+                st.caption(f"✅ Method 4: Extracted last substantial lines ({len(extracted)} chars)")
+            else:
+                st.warning(f"❌ Method 4: No substantial lines found")
 
         if not extracted:
+            st.error(f"❌ Topic {topic_id}: All extraction methods failed!")
             return None
 
         # Clean up - ✅ KEEP MULTIPLE SENTENCES
@@ -1015,7 +1041,13 @@ Detailed Analysis:"""
         if len(response) > max_length:
             response = response[:max_length].strip() + "..."
 
-        return response if len(response) > 15 else None
+        final_result = response if len(response) > 15 else None
+        if final_result:
+            st.success(f"✅ Topic {topic_id}: Final extracted analysis ({len(final_result)} chars): '{final_result[:100]}...'")
+        else:
+            st.error(f"❌ Topic {topic_id}: Final result too short ({len(response)} chars): '{response}'")
+
+        return final_result
 
     except Exception as e:
         st.caption(f"⚠️ Topic {topic_id} LLM analysis failed: {str(e)[:100]}")
