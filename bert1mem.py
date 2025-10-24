@@ -2413,8 +2413,20 @@ def build_faiss_index(embeddings):
         return None
 
 
-def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5):
-    """Retrieve top-k most relevant documents using FAISS"""
+def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5, topics=None, topic_filter=None):
+    """
+    Retrieve top-k most relevant documents using FAISS.
+
+    Args:
+        query: User query string
+        faiss_index: FAISS index
+        embeddings: Document embeddings
+        documents: List of documents
+        safe_model: Embedding model
+        top_k: Number of documents to return
+        topics: Array of topic assignments (same length as documents)
+        topic_filter: If set, only return documents from this topic ID
+    """
     if faiss_index is None:
         return []
 
@@ -2426,18 +2438,31 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
             normalize_embeddings=True
         )[0].reshape(1, -1).astype('float32')
 
+        # If topic filtering, retrieve more candidates to ensure we get enough after filtering
+        search_k = top_k * 10 if topic_filter is not None and topics is not None else top_k
+
         # Search FAISS index
-        distances, indices = faiss_index.search(query_embedding, top_k)
+        distances, indices = faiss_index.search(query_embedding, search_k)
 
         # Get documents
         results = []
         for i, idx in enumerate(indices[0]):
             if 0 <= idx < len(documents):
+                # Apply topic filter if specified
+                if topic_filter is not None and topics is not None:
+                    if idx < len(topics) and topics[idx] != topic_filter:
+                        continue  # Skip documents not in the target topic
+
                 results.append({
                     'document': documents[idx],
                     'distance': float(distances[0][i]),
-                    'index': int(idx)
+                    'index': int(idx),
+                    'topic': topics[idx] if topics is not None and idx < len(topics) else None
                 })
+
+                # Stop once we have enough results
+                if len(results) >= top_k:
+                    break
 
         return results
     except Exception as e:
@@ -2467,7 +2492,8 @@ def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm
         context_parts.append("\nRelevant Documents:")
         for i, doc_info in enumerate(retrieved_docs[:5], 1):
             doc_preview = doc_info['document'][:300] + "..." if len(doc_info['document']) > 300 else doc_info['document']
-            context_parts.append(f"\n[Doc {i}]: {doc_preview}")
+            topic_tag = f" [from Topic {doc_info['topic']}]" if doc_info.get('topic') is not None else ""
+            context_parts.append(f"\n[Doc {i}]{topic_tag}: {doc_preview}")
 
         context = "\n".join(context_parts)
 
@@ -2526,20 +2552,32 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
 
     # RAG MODE: Use FAISS + LLM for intelligent responses
     if use_rag and llm_model and faiss_index and documents and safe_model:
-        st.info("🤖 Using RAG mode (FAISS + LLM)...")
+        # Parse query to detect if user is asking about a specific topic
+        topic_filter = None
+        topic_match = re.search(r'topic\s+(\d+)', query_lower)
+        if topic_match:
+            topic_filter = int(topic_match.group(1))
+            st.info(f"🤖 Using RAG mode (FAISS + LLM) - Filtering to Topic {topic_filter}...")
+        else:
+            st.info("🤖 Using RAG mode (FAISS + LLM)...")
 
-        # Retrieve relevant documents
+        # Retrieve relevant documents (with optional topic filtering)
         retrieved_docs = retrieve_relevant_documents(
             user_query,
             faiss_index,
             embeddings,
             documents,
             safe_model,
-            top_k=5
+            top_k=5,
+            topics=topics,
+            topic_filter=topic_filter
         )
 
         if retrieved_docs:
-            st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents")
+            if topic_filter is not None:
+                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents from Topic {topic_filter}")
+            else:
+                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents")
 
             # Generate response using LLM with retrieved context
             response = generate_rag_response(
@@ -2551,11 +2589,12 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
                 current_topic_id
             )
 
-            # Add source references
+            # Add source references with topic info
             response += "\n\n**Sources:**\n"
             for i, doc in enumerate(retrieved_docs[:3], 1):
                 doc_preview = doc['document'][:100] + "..." if len(doc['document']) > 100 else doc['document']
-                response += f"{i}. {doc_preview}\n"
+                topic_tag = f" [Topic {doc['topic']}]" if doc.get('topic') is not None else ""
+                response += f"{i}. {doc_preview}{topic_tag}\n"
 
             return response
         else:
