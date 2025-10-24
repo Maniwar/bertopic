@@ -548,32 +548,36 @@ Sample documents:
 
 What are users saying? Provide one clear sentence describing their main concerns or feedback."""
 
-        # ✅ CARMACK FIX: Use apply_chat_template for Phi-3 and other chat models
-        # This is why LLM analysis dropped from 8/10 to 2/10 - wrong tokenization!
+        # ✅ CARMACK FIX v2: Use apply_chat_template with return_dict=True (2025 best practice)
+        # Original issue: Wrong tokenization caused 8/10 → 2/10 success rate
+        # v2: Add attention_mask for proper generation (user caught this)
         try:
             # Try chat template first (works for Phi-3, Llama, etc.)
             messages = [{"role": "user", "content": prompt}]
-            inputs = tokenizer.apply_chat_template(
+
+            # return_dict=True gives us both input_ids and attention_mask
+            model_inputs = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
-                return_tensors="pt"
+                return_tensors="pt",
+                return_dict=True
             )
 
             if torch.cuda.is_available():
-                inputs = inputs.to(model.device)
+                model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
             with torch.no_grad():
                 outputs = model.generate(
-                    inputs,
+                    **model_inputs,  # Unpacks input_ids and attention_mask
                     max_new_tokens=100,
-                    temperature=0.5,
+                    temperature=0.7,  # Slightly higher for more natural variation
                     do_sample=True,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id
                 )
 
             # Decode only the new tokens (exclude the prompt)
-            input_length = inputs.shape[1]
+            input_length = model_inputs['input_ids'].shape[1]
             generated_ids = outputs[0][input_length:]
             response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
@@ -4087,21 +4091,22 @@ Sample Documents (showing {len(sample_docs)} representative docs):
 
 Provide a clear, actionable summary:"""
 
-                                        # Generate summary
+                                        # Generate summary (✅ CARMACK: Use return_dict=True for attention_mask)
                                         messages = [{"role": "user", "content": prompt}]
-                                        inputs = llm_tokenizer.apply_chat_template(
+                                        model_inputs = llm_tokenizer.apply_chat_template(
                                             messages,
                                             add_generation_prompt=True,
-                                            return_tensors="pt"
+                                            return_tensors="pt",
+                                            return_dict=True
                                         )
 
                                         if torch.cuda.is_available():
-                                            inputs = inputs.to(llm_model.device)
+                                            model_inputs = {k: v.to(llm_model.device) for k, v in model_inputs.items()}
 
                                         # Generate
                                         with torch.no_grad():
                                             outputs = llm_model.generate(
-                                                inputs,
+                                                **model_inputs,  # Unpacks input_ids and attention_mask
                                                 max_new_tokens=300,
                                                 temperature=0.7,
                                                 do_sample=True,
@@ -4109,7 +4114,7 @@ Provide a clear, actionable summary:"""
                                             )
 
                                         # Decode only the generated tokens (skip prompt)
-                                        input_length = inputs.shape[1]
+                                        input_length = model_inputs['input_ids'].shape[1]
                                         generated_tokens = outputs[0][input_length:]
                                         summary_text = llm_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
