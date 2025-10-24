@@ -509,7 +509,8 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             topic_id = future_to_topic[future]
             try:
                 analysis = future.result()
-                if analysis and len(analysis.strip()) > 10:
+                # Stronger validation: >20 chars and contains spaces (real sentences)
+                if analysis and len(analysis.strip()) > 20 and ' ' in analysis:
                     results[topic_id] = analysis
                 # Note: We don't add "No analysis available" here
                 # Let the caller decide what to do with missing results
@@ -545,9 +546,7 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
 Sample documents:
 {docs_text}
 
-In one clear sentence, what are users saying in this topic? Focus on their main concerns, questions, or feedback.
-
-Answer:"""
+What are users saying? Provide one clear sentence describing their main concerns or feedback."""
 
         # Generate
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
@@ -557,26 +556,53 @@ Answer:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=80,  # Short response
+                max_new_tokens=100,  # Slightly longer for complete sentences
                 temperature=0.5,
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id
             )
 
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Extract answer
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
+        # Decode only the new tokens (exclude the prompt)
+        generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
         # Clean up
-        response = response.split('\n')[0].strip()  # Take first line
-        response = response.strip('"\'.,;[](){}')
+        response = response.strip()
+
+        # Remove common LLM artifacts and prompt repetitions
+        artifacts = [
+            "Answer:", "answer:", "Based on analysis", "based on analysis",
+            "According to", "according to", "The documents show",
+            "The users are saying", "Users are saying", "In this topic"
+        ]
+        for artifact in artifacts:
+            if response.startswith(artifact):
+                response = response[len(artifact):].strip()
+                response = response.lstrip(':,.- ')
+
+        # Take first sentence
+        response = response.split('\n')[0].strip()
+        for delimiter in ['. ', '? ', '! ']:
+            if delimiter in response:
+                response = response.split(delimiter)[0] + delimiter.rstrip()
+                break
+
+        # Final cleanup
+        response = response.strip('"\'[](){}')
+
+        # Validate: Must be substantial (>20 chars) and contain meaningful words
+        if len(response) < 20:
+            return None
+
+        # Reject if it's just fragments like "on analysis", "of the", etc.
+        words = response.lower().split()
+        if len(words) < 4:  # Require at least 4 words for a meaningful sentence
+            return None
 
         # Truncate if needed
         if len(response) > max_length:
-            response = response[:max_length].strip() + "..."
+            response = response[:max_length].rsplit(' ', 1)[0].strip() + "..."
 
         return response if response else None
 
