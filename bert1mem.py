@@ -677,33 +677,36 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     try:
         model, tokenizer = llm_model
 
-        # Build batched prompt
-        prompt_parts = ["Analyze these topics and provide a one-sentence summary for each:\n"]
+        # Build batched prompt - ✅ ENHANCED for more detailed analysis
+        prompt_parts = ["Analyze these customer topics. For each, provide a detailed 2-3 sentence analysis covering:\n"]
+        prompt_parts.append("1) What users are saying/asking")
+        prompt_parts.append("2) Key patterns or themes")
+        prompt_parts.append("3) Any notable issues or trends\n")
 
         for item in topic_batch:
             topic_id = item['topic_id']
             label = item['label']
-            docs = item['docs'][:3]  # Use fewer docs per topic for batching
+            docs = item['docs'][:5]  # ✅ Use more docs for better context
 
             # Clean docs
-            cleaned = [str(d).strip()[:150] for d in docs if d and str(d).strip()]
-            docs_text = " | ".join(cleaned[:3])
+            cleaned = [str(d).strip()[:200] for d in docs if d and str(d).strip()]
+            docs_text = " | ".join(cleaned[:5])
 
-            prompt_parts.append(f"\nTopic {topic_id} ({label}):")
-            prompt_parts.append(f"Documents: {docs_text}")
-            prompt_parts.append(f"Analysis:")
+            prompt_parts.append(f"\nTopic {topic_id} - {label}:")
+            prompt_parts.append(f"Sample documents: {docs_text}")
+            prompt_parts.append(f"Detailed Analysis:")
 
         prompt = "\n".join(prompt_parts)
 
-        # Generate
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2000)
+        # Generate - ✅ MORE TOKENS for detailed analysis
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3000)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=200,  # More tokens for multiple topics
+                max_new_tokens=500,  # ✅ INCREASED: More tokens for detailed multi-sentence analysis
                 temperature=0.5,
                 do_sample=True,
                 top_p=0.9,
@@ -712,47 +715,82 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Parse responses for each topic
+        # ✅ DEBUG: Log the raw response for troubleshooting
+        if len(response) < 500:
+            st.caption(f"🔍 LLM Response Sample: {response[:200]}...")
+
+        # Parse responses for each topic - IMPROVED PARSING
         results = {}
         lines = response.split('\n')
 
         current_topic_id = None
+        current_analysis = []
+
         for line in lines:
             line = line.strip()
+            if not line:
+                continue
 
-            # Look for "Analysis:" followed by text
-            if 'Analysis:' in line:
-                parts = line.split('Analysis:', 1)
-                if len(parts) == 2:
-                    analysis_text = parts[1].strip()
-                    if analysis_text and current_topic_id is not None:
-                        # Clean up
-                        analysis_text = analysis_text.split('\n')[0].strip()
-                        analysis_text = analysis_text.strip('"\'.,;[](){}')
-                        if len(analysis_text) > 150:
-                            analysis_text = analysis_text[:150] + "..."
+            # Track which topic we're parsing - look for "Topic X" at start
+            if line.startswith('Topic ') and ('-' in line or '(' in line):
+                # Save previous topic's analysis if we have one
+                if current_topic_id is not None and current_analysis:
+                    analysis_text = ' '.join(current_analysis).strip()
+                    analysis_text = analysis_text.strip('"\'.,;[](){}')
+                    # ✅ NO LENGTH LIMIT: Keep full detailed analysis
+                    if analysis_text:
                         results[current_topic_id] = analysis_text
 
-            # Track which topic we're parsing
-            if line.startswith('Topic ') and '(' in line:
+                # Start new topic
                 try:
-                    topic_num = int(line.split()[1].split('(')[0])
+                    # Handle both "Topic X (" and "Topic X -" formats
+                    topic_part = line.split()[1]
+                    if topic_part.endswith(':') or topic_part.endswith('-'):
+                        topic_part = topic_part[:-1]
+                    topic_num = int(topic_part)
                     current_topic_id = topic_num
+                    current_analysis = []
                 except:
                     pass
+
+            # Look for "Analysis:" or "Detailed Analysis:" and capture what follows
+            elif ('Analysis:' in line or 'analysis:' in line.lower()) and current_topic_id is not None:
+                parts = line.split(':', 1)
+                if len(parts) == 2 and parts[1].strip():
+                    current_analysis.append(parts[1].strip())
+
+            # Or capture any text that looks like analysis (after we've seen "Analysis:")
+            elif current_topic_id is not None and current_analysis and not line.startswith(('Topic ', 'Sample documents:', 'Analyze', '1)', '2)', '3)')):
+                # This line might be continuation of analysis - ✅ NO LENGTH LIMIT
+                current_analysis.append(line)
+
+        # Don't forget the last topic - ✅ NO LENGTH LIMIT
+        if current_topic_id is not None and current_analysis:
+            analysis_text = ' '.join(current_analysis).strip()
+            analysis_text = analysis_text.strip('"\'.,;[](){}')
+            if analysis_text:
+                results[current_topic_id] = analysis_text
+
+        # ✅ DEBUG: Show parsing results
+        if results:
+            st.caption(f"✅ Successfully parsed {len(results)}/{len(topic_batch)} topics from batch")
+        else:
+            st.warning(f"⚠️ Batch parsing extracted 0 results. Raw response length: {len(response)}")
 
         return results
 
     except Exception as e:
-        st.caption(f"⚠️ Batch LLM analysis failed: {str(e)[:100]}")
+        st.error(f"❌ Batch LLM analysis exception: {str(e)}")
+        import traceback
+        st.caption(f"Stack trace: {traceback.format_exc()[:200]}")
         return {}
 
 
-def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=150):
+def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=500):
     """
-    Generate a simple one-sentence analysis of what users are saying in this topic.
+    Generate detailed analysis of what users are saying in this topic.
 
-    Prompt: "Look at topic X and tell me what users are saying in one sentence."
+    ✅ ENHANCED: Now generates 2-3 sentence detailed analysis instead of one sentence.
     """
     if not sample_docs or llm_model is None:
         return None
@@ -760,24 +798,27 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
     try:
         model, tokenizer = llm_model
 
-        # Clean and prepare documents
+        # Clean and prepare documents - ✅ MORE DOCS
         cleaned_docs = [str(doc).strip() for doc in sample_docs if doc and str(doc).strip()]
         if not cleaned_docs:
             return None
 
-        # Build simple prompt
-        docs_text = "\n".join([f"- {doc[:200]}" for doc in cleaned_docs[:5]])
+        # Build detailed prompt - ✅ LONGER EXCERPTS
+        docs_text = "\n".join([f"- {doc[:200]}" for doc in cleaned_docs[:8]])
 
         prompt = f"""Topic: {topic_label}
 
 Sample documents:
 {docs_text}
 
-In one clear sentence, what are users saying in this topic? Focus on their main concerns, questions, or feedback.
+Analyze this topic in 2-3 sentences covering:
+1) What users are saying/asking
+2) Key patterns or themes
+3) Any notable issues or trends
 
-Answer:"""
+Detailed Analysis:"""
 
-        # Generate
+        # Generate - ✅ MORE TOKENS
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1500)
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
@@ -785,7 +826,7 @@ Answer:"""
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=80,  # Short response
+                max_new_tokens=250,  # ✅ INCREASED for detailed analysis
                 temperature=0.5,
                 do_sample=True,
                 top_p=0.9,
@@ -795,14 +836,16 @@ Answer:"""
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         # Extract answer
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
+        if "Detailed Analysis:" in response:
+            response = response.split("Detailed Analysis:")[-1].strip()
+        elif "Analysis:" in response:
+            response = response.split("Analysis:")[-1].strip()
 
-        # Clean up
-        response = response.split('\n')[0].strip()  # Take first line
+        # Clean up - ✅ KEEP MULTIPLE SENTENCES
+        response = response.strip()
         response = response.strip('"\'.,;[](){}')
 
-        # Truncate if needed
+        # ✅ HIGHER LENGTH LIMIT for detailed analysis
         if len(response) > max_length:
             response = response[:max_length].strip() + "..."
 
@@ -2232,15 +2275,31 @@ class FastReclusterer:
                 # Process batch with LLM
                 batch_results = generate_batch_llm_analysis(batch, self.llm_model)
 
-                # Collect results
+                # Collect results with fallback to individual processing
                 for topic_item in batch:
                     topic_id = topic_item['topic_id']
                     if topic_id in batch_results and batch_results[topic_id]:
                         llm_analysis_dict[topic_id] = batch_results[topic_id]
                         llm_success_count += 1
                     else:
-                        llm_analysis_dict[topic_id] = "No analysis available"
-                        llm_fallback_count += 1
+                        # ✅ FALLBACK: Try individual analysis if batch failed for this topic
+                        try:
+                            individual_result = generate_simple_llm_analysis(
+                                topic_id,
+                                topic_item['docs'][:5],
+                                topic_item['label'],
+                                self.llm_model,
+                                max_length=150
+                            )
+                            if individual_result and len(individual_result.strip()) > 10:
+                                llm_analysis_dict[topic_id] = individual_result
+                                llm_success_count += 1
+                            else:
+                                llm_analysis_dict[topic_id] = "No analysis available"
+                                llm_fallback_count += 1
+                        except:
+                            llm_analysis_dict[topic_id] = "No analysis available"
+                            llm_fallback_count += 1
 
                     processed_count += 1
 
@@ -3999,7 +4058,7 @@ def main():
                     with col_rag1:
                         use_rag_chat = st.checkbox(
                             "🤖 Enable RAG Mode (FAISS + LLM)",
-                            value=False,
+                            value=True,  # ✅ FIX: Default to True - chat without RAG produces no results
                             help="Use Retrieval-Augmented Generation for intelligent responses based on your actual documents"
                         )
                     with col_rag2:
