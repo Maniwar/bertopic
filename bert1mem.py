@@ -4459,52 +4459,62 @@ Provide a clear, actionable summary:"""
                                                 # Final fallback
                                                 llm_model_name = "microsoft/Phi-3-mini-4k-instruct"
 
-                                            st.info(f"📦 Loading {llm_model_name} for topic summary...")
+                                            st.info(f"📦 No LLM loaded yet. Loading {llm_model_name} for topic summary...")
+                                            st.caption("💡 **Tip:** To avoid this wait, enable LLM during clustering or run 'Generate LLM Analysis' first")
 
-                                            with st.spinner("Loading LLM model for summary..."):
-                                                llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
+                                            try:
+                                                with st.spinner("Loading LLM model for summary..."):
+                                                    llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
 
-                                                # Try Flash Attention 2 first, then SDPA, then default
-                                                attention_type = "default"
-                                                if torch.cuda.is_available():
-                                                    try:
-                                                        llm_model = AutoModelForCausalLM.from_pretrained(
-                                                            llm_model_name,
-                                                            torch_dtype=torch.float16,
-                                                            device_map="auto",
-                                                            attn_implementation="flash_attention_2",
-                                                            trust_remote_code=True
-                                                        )
-                                                        attention_type = "Flash Attention 2"
-                                                    except (ImportError, ValueError):
+                                                    # Try Flash Attention 2 first, then SDPA, then default
+                                                    attention_type = "default"
+                                                    if torch.cuda.is_available():
                                                         try:
                                                             llm_model = AutoModelForCausalLM.from_pretrained(
                                                                 llm_model_name,
                                                                 torch_dtype=torch.float16,
                                                                 device_map="auto",
-                                                                attn_implementation="sdpa",
+                                                                attn_implementation="flash_attention_2",
                                                                 trust_remote_code=True
                                                             )
-                                                            attention_type = "SDPA"
+                                                            attention_type = "Flash Attention 2"
                                                         except (ImportError, ValueError):
-                                                            llm_model = AutoModelForCausalLM.from_pretrained(
-                                                                llm_model_name,
-                                                                torch_dtype=torch.float16,
-                                                                device_map="auto",
-                                                                trust_remote_code=True
-                                                            )
-                                                else:
-                                                    llm_model = AutoModelForCausalLM.from_pretrained(
-                                                        llm_model_name,
-                                                        torch_dtype=torch.float32,
-                                                        trust_remote_code=True
-                                                    )
+                                                            try:
+                                                                llm_model = AutoModelForCausalLM.from_pretrained(
+                                                                    llm_model_name,
+                                                                    torch_dtype=torch.float16,
+                                                                    device_map="auto",
+                                                                    attn_implementation="sdpa",
+                                                                    trust_remote_code=True
+                                                                )
+                                                                attention_type = "SDPA"
+                                                            except (ImportError, ValueError):
+                                                                llm_model = AutoModelForCausalLM.from_pretrained(
+                                                                    llm_model_name,
+                                                                    torch_dtype=torch.float16,
+                                                                    device_map="auto",
+                                                                    trust_remote_code=True
+                                                                )
+                                                    else:
+                                                        llm_model = AutoModelForCausalLM.from_pretrained(
+                                                            llm_model_name,
+                                                            torch_dtype=torch.float32,
+                                                            trust_remote_code=True
+                                                        )
 
-                                                st.session_state.llm_model = (llm_model, llm_tokenizer)
-                                                st.session_state.llm_attention_type = attention_type
+                                                    st.session_state.llm_model = (llm_model, llm_tokenizer)
+                                                    st.session_state.llm_attention_type = attention_type
 
-                                            # Show success message as toast (non-blocking)
-                                            st.toast(f"✅ LLM loaded with {st.session_state.llm_attention_type}", icon="⚡")
+                                                # Show success message as toast (non-blocking)
+                                                st.toast(f"✅ LLM loaded with {st.session_state.llm_attention_type}", icon="⚡")
+
+                                            except Exception as load_error:
+                                                st.error(f"❌ Failed to load LLM: {str(load_error)}")
+                                                st.info("💡 **To fix this:**\n"
+                                                       "1. Check your internet connection (needs to download model first time)\n"
+                                                       "2. Free up GPU/RAM memory (try closing other applications)\n"
+                                                       "3. OR go to Post-Clustering section and use 'Generate LLM Analysis' button with different settings")
+                                                raise  # Re-raise to trigger outer exception handler
 
                                         # Sample documents intelligently (first, middle, last to get variety)
                                         sample_docs = []
