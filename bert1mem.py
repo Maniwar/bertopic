@@ -3895,6 +3895,140 @@ def main():
                             human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
                             st.info(f"📊 Topic {selected_topic_id}: **{human_label}** — Showing {len(display_df):,} of {len(filtered_df):,} documents")
 
+                            # ✅ CARMACK: LLM Topic Summary Feature
+                            # Generate quick summary of all documents in this topic
+                            col_summary1, col_summary2 = st.columns([1, 4])
+                            with col_summary1:
+                                if st.button(f"🤖 Summarize Topic {selected_topic_id}", help="Get LLM-powered summary of all documents in this topic"):
+                                    st.session_state[f'generate_topic_summary_{selected_topic_id}'] = True
+
+                            with col_summary2:
+                                summary_max_docs = st.number_input(
+                                    "Max docs for summary:",
+                                    min_value=10,
+                                    max_value=500,
+                                    value=100,
+                                    step=10,
+                                    key=f"summary_max_docs_{selected_topic_id}",
+                                    help="Limit number of documents to analyze (more = slower but comprehensive)"
+                                )
+
+                            # Generate summary if requested
+                            if st.session_state.get(f'generate_topic_summary_{selected_topic_id}', False):
+                                with st.spinner(f"🤖 Analyzing {min(len(filtered_df), summary_max_docs)} documents from Topic {selected_topic_id}..."):
+                                    try:
+                                        # Get all document texts for this topic
+                                        topic_docs = filtered_df[text_col].head(summary_max_docs).tolist()
+                                        topic_keywords = st.session_state.topic_keywords.get(selected_topic_id, "")
+
+                                        # Load LLM if not already loaded
+                                        if 'llm_model' not in st.session_state or st.session_state.llm_model is None:
+                                            from transformers import AutoModelForCausalLM, AutoTokenizer
+                                            llm_model_name = st.session_state.get('llm_model_name', "microsoft/Phi-3-mini-4k-instruct")
+
+                                            with st.spinner("Loading LLM model for summary..."):
+                                                llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
+                                                llm_model = AutoModelForCausalLM.from_pretrained(
+                                                    llm_model_name,
+                                                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                                                    device_map="auto" if torch.cuda.is_available() else None,
+                                                    trust_remote_code=True
+                                                )
+                                                st.session_state.llm_model = (llm_model, llm_tokenizer)
+
+                                        llm_model, llm_tokenizer = st.session_state.llm_model
+
+                                        # Sample documents intelligently (first, middle, last to get variety)
+                                        sample_docs = []
+                                        if len(topic_docs) <= 20:
+                                            sample_docs = topic_docs
+                                        else:
+                                            # Take first 7, middle 7, last 6
+                                            sample_docs = topic_docs[:7] + topic_docs[len(topic_docs)//2-3:len(topic_docs)//2+4] + topic_docs[-6:]
+
+                                        # Truncate documents for context window
+                                        sample_docs_truncated = [doc[:300] for doc in sample_docs]
+
+                                        # Create prompt
+                                        docs_text = "\n\n".join([f"{i+1}. {doc}" for i, doc in enumerate(sample_docs_truncated)])
+
+                                        prompt = f"""You are analyzing documents from a topic cluster. Provide a concise summary (3-5 sentences) that captures:
+1. The main theme/problem discussed
+2. Key patterns or common issues mentioned
+3. Notable insights or trends
+
+Topic Label: {human_label}
+Keywords: {topic_keywords}
+Total Documents in Topic: {len(filtered_df)}
+Sample Documents (showing {len(sample_docs)} representative docs):
+
+{docs_text}
+
+Provide a clear, actionable summary:"""
+
+                                        # Generate summary
+                                        messages = [{"role": "user", "content": prompt}]
+                                        inputs = llm_tokenizer.apply_chat_template(
+                                            messages,
+                                            add_generation_prompt=True,
+                                            return_tensors="pt"
+                                        )
+
+                                        if torch.cuda.is_available():
+                                            inputs = inputs.to(llm_model.device)
+
+                                        # Generate
+                                        with torch.no_grad():
+                                            outputs = llm_model.generate(
+                                                inputs,
+                                                max_new_tokens=300,
+                                                temperature=0.7,
+                                                do_sample=True,
+                                                pad_token_id=llm_tokenizer.eos_token_id
+                                            )
+
+                                        # Decode only the generated tokens (skip prompt)
+                                        input_length = inputs.shape[1]
+                                        generated_tokens = outputs[0][input_length:]
+                                        summary_text = llm_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+                                        # Display summary in expander
+                                        with st.expander(f"📝 Topic {selected_topic_id} Summary ({len(filtered_df):,} docs)", expanded=True):
+                                            st.markdown(f"**Topic:** {human_label}")
+                                            st.markdown(f"**Keywords:** {topic_keywords}")
+                                            st.markdown(f"**Documents Analyzed:** {min(len(filtered_df), summary_max_docs):,} of {len(filtered_df):,}")
+                                            st.markdown("---")
+                                            st.markdown("**Summary:**")
+                                            st.write(summary_text)
+
+                                            # Download button for summary
+                                            summary_report = f"""Topic {selected_topic_id} Summary
+{human_label}
+
+Keywords: {topic_keywords}
+Total Documents: {len(filtered_df):,}
+Documents Analyzed: {min(len(filtered_df), summary_max_docs):,}
+
+SUMMARY:
+{summary_text}
+
+Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
+"""
+                                            st.download_button(
+                                                label="📥 Download Summary",
+                                                data=summary_report.encode("utf-8"),
+                                                file_name=f"topic_{selected_topic_id}_summary.txt",
+                                                mime="text/plain",
+                                                key=f"download_summary_{selected_topic_id}"
+                                            )
+
+                                        # Clear the flag
+                                        st.session_state[f'generate_topic_summary_{selected_topic_id}'] = False
+
+                                    except Exception as e:
+                                        st.error(f"❌ Failed to generate summary: {str(e)}")
+                                        st.exception(e)
+
                     # Reorder columns - put topic metadata first
                     meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_LLM_Analysis', 'Topic_Keywords']
                     other_cols = [c for c in display_df.columns if c not in meta_cols and c not in ['Topic_Label', 'Valid_Document']]
