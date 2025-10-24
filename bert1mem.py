@@ -3659,6 +3659,16 @@ def main():
         st.markdown("---")
         st.subheader("📝 Topic Summaries (Long-form)")
 
+        # Show completion status if batch generation just finished
+        if 'batch_summary_complete' in st.session_state:
+            result = st.session_state.batch_summary_complete
+            st.success(f"✅ **Batch generation completed at {result['timestamp']}:** "
+                      f"{result['success_count']}/{result['total_topics']} summaries generated "
+                      f"using {result['attention_type']} optimization")
+            if result['fail_count'] > 0:
+                st.warning(f"⚠️ {result['fail_count']} topics failed to generate")
+            st.info("💡 Summaries are now visible in the Topic_Summary column in Topics Overview and Topic Browser tabs")
+
         # Show coverage stats
         num_summaries = len(st.session_state.get('topic_summaries', {}))
         num_topics = len(st.session_state.get('current_topic_info', pd.DataFrame()))
@@ -3708,6 +3718,13 @@ def main():
                            "2. OR run **'Generate LLM Analysis for Current Topics'** button above\n"
                            "3. Then come back and click 'Generate All Topic Summaries'")
                 else:
+                    # Check what performance optimizations are active
+                    attention_type = "Unknown"
+                    if hasattr(llm_model, 'config') and hasattr(llm_model.config, '_attn_implementation'):
+                        attention_type = llm_model.config._attn_implementation
+                    elif st.session_state.get('llm_attention_type'):
+                        attention_type = st.session_state.llm_attention_type
+
                     # Get topics to summarize
                     topic_info = st.session_state.current_topic_info
                     topics = st.session_state.current_topics
@@ -3716,7 +3733,7 @@ def main():
                     # Filter out outliers
                     valid_topics = [t for t in topic_info['Topic'].unique() if t != -1]
 
-                    st.info(f"🚀 Generating summaries for {len(valid_topics)} topics...")
+                    st.info(f"🚀 Generating summaries for {len(valid_topics)} topics using {attention_type} optimization...")
 
                     # Initialize summary storage
                     if 'topic_summaries' not in st.session_state:
@@ -3827,14 +3844,23 @@ Provide a clear, actionable summary:"""
                     progress_bar.empty()
                     status_text.empty()
 
-                    # Show results
-                    st.success(f"✅ Generated {success_count}/{len(valid_topics)} topic summaries!")
-                    if fail_count > 0:
-                        st.warning(f"⚠️ {fail_count} topics failed to generate summaries")
+                    # Store completion state for persistent display after rerun
+                    st.session_state.batch_summary_complete = {
+                        'success_count': success_count,
+                        'total_topics': len(valid_topics),
+                        'fail_count': fail_count,
+                        'attention_type': attention_type,
+                        'timestamp': pd.Timestamp.now().strftime('%H:%M:%S')
+                    }
 
                     # Force refresh browser_df to show summaries
                     if 'browser_df' in st.session_state:
                         del st.session_state.browser_df
+
+                    st.success(f"✅ Generated {success_count}/{len(valid_topics)} topic summaries with {attention_type}!")
+                    if fail_count > 0:
+                        st.warning(f"⚠️ {fail_count} topics failed")
+                    st.info("🔄 Refreshing display to show summaries in tables...")
                     st.rerun()
 
         # Display results
