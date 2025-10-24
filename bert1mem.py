@@ -1068,6 +1068,13 @@ class RobustTextPreprocessor:
             text = re.sub(r'[\[\]{}"\']', ' ', text)
             text = ' '.join(text.split())
 
+        # ✅ CARMACK: Remove PII masking artifacts that pollute topic analysis
+        # Remove <{entity_type}>, [name], [email], [phone], etc.
+        text = re.sub(r'<\{?entity_type\}?>', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)  # Remove any other <tags>
+        text = re.sub(r'\[(name|email|phone|address|ssn|number|date|location|organization|person)\]', ' ', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[PII\]', ' ', text, flags=re.IGNORECASE)
+
         # Remove problematic characters
         text = text.replace('\x00', '')
         text = text.replace('\r', ' ')
@@ -1985,8 +1992,12 @@ class FastReclusterer:
                     'should','may','might','must','shall','can','need','it','this','that','these','those',
                     'i','you','he','she','we','they'
                 }
-                
-                filtered = {w: c for w, c in word_counts.items() if w not in common_words and len(w) > 2}
+
+                # ✅ CARMACK: Add custom stopwords from session state
+                custom_stopwords = st.session_state.get('custom_stopwords', set())
+                all_stopwords = common_words | custom_stopwords
+
+                filtered = {w: c for w, c in word_counts.items() if w not in all_stopwords and len(w) > 2}
                 top_words = sorted(filtered.items(), key=lambda x: x[1], reverse=True)[:top_n_words]
                 keywords = [w for w, _ in top_words] or ['topic', str(topic_id)]
                 keywords_str = ', '.join(keywords[:5])
@@ -2777,6 +2788,7 @@ def main():
         # UI state
         'text_col': None,
         'uploaded_file_name': 'data',
+        'custom_stopwords': set(),
         'topic_human': {},
         'last_topics_hash': None,
 
@@ -2865,6 +2877,25 @@ def main():
                     1, 100, 10,
                     help="Documents shorter than this will be removed"
                 )
+
+                st.divider()
+
+                # ✅ CARMACK: Custom stopwords to exclude domain-specific common words
+                custom_stopwords_input = st.text_area(
+                    "Custom Stopwords (comma-separated)",
+                    value="",
+                    help="Add domain-specific words to exclude from topics (e.g., 'samsung, product, customer'). These will be filtered from keywords and topic names.",
+                    placeholder="samsung, product, customer, service"
+                )
+
+                custom_stopwords = set()
+                if custom_stopwords_input.strip():
+                    custom_stopwords = {w.strip().lower() for w in custom_stopwords_input.split(',') if w.strip()}
+
+                # Store in session state for use in clustering
+                st.session_state.custom_stopwords = custom_stopwords
+                if custom_stopwords:
+                    st.info(f"✅ Custom stopwords: {', '.join(sorted(custom_stopwords))}")
 
             # Topic Size Control
             st.subheader("📏 Topic Size Control")
