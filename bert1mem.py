@@ -1516,12 +1516,19 @@ def _to_title_case(text):
 
 def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
     """
-    Create a hierarchical, descriptive label with main category and specific details.
-    Format: "Main Category - Specific Details"
+    ✅ CARMACK OPTION C: Create TRUE 3-level semantic hierarchy.
+
+    Each level provides distinct insight:
+    - Level 1: Broad domain/category (trigrams)
+    - Level 2: Specific problem/topic area (bigrams/trigrams)
+    - Level 3: Contextual detail (unigrams/keywords)
+
     Examples:
-    - "Customer Service - Response Times & Issues"
-    - "Product Orders - Samsung Washer Delivery"
-    - "Technical Support - Installation Problems"
+    - "Customer Service - Response Times - Phone Support"
+    - "Product Orders - Delivery Issues - Samsung Appliances"
+    - "Technical Support - Installation Problems - Software Setup"
+
+    Falls back to 2 levels if insufficient distinct phrases.
     """
     # Clean all phrases
     clean_phrases_23 = [_clean_phrase(p) for p in phrases_23 if p and len(_clean_phrase(p)) > 3]
@@ -1533,107 +1540,96 @@ def _create_descriptive_label(phrases_23, phrases_1, keywords, max_len=70):
     else:
         keyword_list = list(keywords) if keywords else []
 
-    # Build main category and details
-    main_category = None
-    details = None
+    def _is_distinct(phrase1, phrase2, min_distinct_ratio=0.6):
+        """Check if two phrases are semantically distinct (< 40% overlap)"""
+        words1 = set(phrase1.lower().split())
+        words2 = set(phrase2.lower().split())
 
-    # PRIORITY 1: Use longest trigram as main category, and second as details
-    if len(clean_phrases_23) >= 2:
-        # First phrase is main category
-        main_category = _to_title_case(clean_phrases_23[0])
+        if words2.issubset(words1) or words1.issubset(words2):
+            return False
 
-        # Find complementary second phrase for details
-        first_words = set(clean_phrases_23[0].lower().split())
-        for second in clean_phrases_23[1:4]:
-            second_words = set(second.lower().split())
+        overlap = len(words1 & words2)
+        total = len(words1 | words2)
+        return (overlap / total) < (1 - min_distinct_ratio) if total > 0 else False
 
-            # Skip if too similar
-            if second_words.issubset(first_words) or first_words.issubset(second_words):
-                continue
+    # Try to build 3 distinct levels
+    level1 = None  # Broad domain
+    level2 = None  # Specific problem
+    level3 = None  # Context
 
-            overlap = len(first_words & second_words)
-            total = len(first_words | second_words)
-            if overlap / total < 0.6:  # Less than 60% overlap
-                details = _to_title_case(second)
+    # LEVEL 1: Broadest category (first trigram/bigram)
+    if clean_phrases_23:
+        level1 = _to_title_case(clean_phrases_23[0])
+
+    # LEVEL 2: Find second distinct phrase
+    if level1 and len(clean_phrases_23) >= 2:
+        for phrase in clean_phrases_23[1:4]:
+            if _is_distinct(level1, phrase):
+                level2 = _to_title_case(phrase)
                 break
 
-        # If no good second phrase, use keywords for details
-        if not details and len(keyword_list) >= 2:
-            kw_detail = ' '.join([_to_title_case(kw) for kw in keyword_list[:2] if kw.lower() not in main_category.lower()])
-            if kw_detail:
-                details = kw_detail
+    # LEVEL 3: Find third distinct element (unigrams or keywords)
+    if level1 and level2:
+        # Try unigrams first
+        used_words = set(level1.lower().split()) | set(level2.lower().split())
+        detail_candidates = [w for w in clean_phrases_1[:6] if w.lower() not in used_words]
 
-    # PRIORITY 2: Use first trigram as main, combine unigrams for details
-    elif len(clean_phrases_23) >= 1:
-        main_category = _to_title_case(clean_phrases_23[0])
-
-        # Use unigrams that aren't in main category for details
-        main_words = set(main_category.lower().split())
-        detail_words = [w for w in clean_phrases_1[:4] if w.lower() not in main_words]
-        if len(detail_words) >= 2:
-            details = _to_title_case(' '.join(detail_words[:2]))
-        elif len(keyword_list) >= 2:
-            kw_detail = ' '.join([_to_title_case(kw) for kw in keyword_list[:2] if kw.lower() not in main_category.lower()])
-            if kw_detail:
-                details = kw_detail
-
-    # PRIORITY 3: Build from unigrams
-    elif len(clean_phrases_1) >= 3:
-        # First 1-2 words as main category
-        main_category = _to_title_case(' '.join(clean_phrases_1[:2]))
-        # Next 1-2 words as details
-        detail_words = clean_phrases_1[2:4]
-        if detail_words:
-            details = _to_title_case(' '.join(detail_words))
-
-    # PRIORITY 4: Use keywords
-    elif len(keyword_list) >= 3:
-        main_category = _to_title_case(' '.join(keyword_list[:2]))
-        details = _to_title_case(' '.join(keyword_list[2:4]))
-
-    # Fallback to simple labels if hierarchical structure isn't possible
-    if not main_category:
-        if clean_phrases_23:
-            main_category = _to_title_case(clean_phrases_23[0])
-        elif clean_phrases_1:
-            main_category = _to_title_case(' '.join(clean_phrases_1[:2]))
-        elif keyword_list:
-            main_category = _to_title_case(' '.join(keyword_list[:2]))
+        if len(detail_candidates) >= 2:
+            level3 = _to_title_case(' '.join(detail_candidates[:2]))
+        elif len(detail_candidates) >= 1:
+            level3 = _to_title_case(detail_candidates[0])
         else:
-            main_category = "Miscellaneous Topic"
-
-    # Ensure we have details - use remaining keywords if needed
-    if not details:
-        if len(keyword_list) >= 1:
-            main_words = set(main_category.lower().split())
-            detail_kws = [_to_title_case(kw) for kw in keyword_list[:3] if kw.lower() not in main_words]
+            # Fall back to keywords
+            detail_kws = [_to_title_case(kw) for kw in keyword_list[:3] if kw.lower() not in used_words]
             if detail_kws:
-                details = ' '.join(detail_kws[:2])
+                level3 = ' '.join(detail_kws[:2]) if len(detail_kws) >= 2 else detail_kws[0]
 
-        # Last resort: use "Related Topics" or part of main category
-        if not details:
-            if len(clean_phrases_1) > 0:
-                main_words = set(main_category.lower().split())
-                extra_words = [w for w in clean_phrases_1 if w.lower() not in main_words]
-                if extra_words:
-                    details = _to_title_case(extra_words[0])
-                else:
-                    details = "General Topics"
+    # SUCCESS: We have 3 distinct levels!
+    if level1 and level2 and level3:
+        label = f"{level1} - {level2} - {level3}"
+
+        # Truncate if needed (shorten level 3 first)
+        if len(label) > max_len:
+            max_level3_len = max_len - len(level1) - len(level2) - 6  # 6 for " - " x2
+            if max_level3_len > 5:
+                level3 = level3[:max_level3_len].rstrip() + "…"
+                label = f"{level1} - {level2} - {level3}"
             else:
-                details = "General Topics"
+                label = label[:max_len].rstrip() + "…"
 
-    # Construct final hierarchical label
-    label = f"{main_category} - {details}"
+        return label
+
+    # FALLBACK: 2-level structure (let deduplication add 3rd level if needed)
+    if level1 and level2:
+        label = f"{level1} - {level2}"
+    elif level1:
+        # Need level 2 - use unigrams or keywords
+        used_words = set(level1.lower().split())
+        detail_words = [w for w in clean_phrases_1[:4] if w.lower() not in used_words]
+        if detail_words:
+            level2 = _to_title_case(' '.join(detail_words[:2])) if len(detail_words) >= 2 else _to_title_case(detail_words[0])
+        else:
+            detail_kws = [_to_title_case(kw) for kw in keyword_list[:3] if kw.lower() not in used_words]
+            level2 = ' '.join(detail_kws[:2]) if len(detail_kws) >= 2 else (detail_kws[0] if detail_kws else "General")
+
+        label = f"{level1} - {level2}"
+    else:
+        # Last resort: build from available materials
+        if len(clean_phrases_1) >= 3:
+            level1 = _to_title_case(' '.join(clean_phrases_1[:2]))
+            level2 = _to_title_case(' '.join(clean_phrases_1[2:4]))
+        elif len(keyword_list) >= 3:
+            level1 = _to_title_case(' '.join(keyword_list[:2]))
+            level2 = _to_title_case(' '.join(keyword_list[2:4]))
+        else:
+            level1 = _to_title_case(' '.join(clean_phrases_1[:2])) if clean_phrases_1 else "Miscellaneous"
+            level2 = "Topics"
+
+        label = f"{level1} - {level2}"
 
     # Truncate if too long
     if len(label) > max_len:
-        # Try to shorten details first
-        max_details_len = max_len - len(main_category) - 3  # 3 for " - "
-        if max_details_len > 10:
-            details = details[:max_details_len].rstrip() + "…"
-            label = f"{main_category} - {details}"
-        else:
-            label = label[:max_len].rstrip() + "…"
+        label = label[:max_len].rstrip() + "…"
 
     return label
 
@@ -2394,7 +2390,33 @@ def load_embedding_model(model_name):
 
 @st.cache_data
 def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
-    """Compute and cache UMAP reduced embeddings"""
+    """
+    Compute and cache UMAP reduced embeddings.
+
+    ✅ CARMACK: Added disk caching to skip 15s UMAP reduction on re-runs.
+    Cache is keyed by parameters + embedding shape + sample hash.
+    """
+    import hashlib
+
+    # Generate cache key from parameters and embedding characteristics
+    # Use shape + hash of first/last 1000 bytes for speed
+    emb_sample = np.concatenate([embeddings[:100].flatten(), embeddings[-100:].flatten()])
+    emb_hash = hashlib.md5(emb_sample.tobytes()).hexdigest()[:16]
+    cache_key = f"{n_neighbors}_{n_components}_{embeddings.shape[0]}_{embeddings.shape[1]}_{emb_hash}"
+    cache_file = f".cache/umap_{cache_key}.npy"
+
+    # Try to load from disk cache
+    if os.path.exists(cache_file):
+        try:
+            cached_embeddings = np.load(cache_file)
+            if cached_embeddings.shape == (len(embeddings), n_components):
+                st.info(f"✅ Loaded UMAP embeddings from cache (skipped {len(embeddings):,} doc reduction)")
+                return cached_embeddings
+        except Exception as e:
+            # Cache corrupted, ignore and recompute
+            pass
+
+    # Compute UMAP (original logic)
     valid_mask = np.any(embeddings != 0, axis=1)
     if np.sum(valid_mask) < 10:
         return None
@@ -2417,6 +2439,15 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
     umap_embeddings = np.zeros((len(embeddings), n_components))
     umap_embeddings[valid_mask] = reducer.fit_transform(embeddings[valid_mask])
 
+    # Save to disk cache
+    try:
+        os.makedirs(".cache", exist_ok=True)
+        np.save(cache_file, umap_embeddings)
+        st.success(f"💾 Cached UMAP embeddings to {cache_file}")
+    except Exception as e:
+        # Non-critical failure, just log
+        pass
+
     return umap_embeddings
 
 
@@ -2424,27 +2455,53 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
 # FAISS INDEXING FOR RAG CHAT
 # -----------------------------------------------------
 def build_faiss_index(embeddings):
-    """Build FAISS index from embeddings for fast similarity search"""
+    """
+    Build FAISS index from embeddings for fast similarity search.
+
+    ✅ CARMACK: Uses IVF (Inverted File Index) for >50k documents (5-10x faster).
+    For smaller datasets, uses flat index (exact search).
+    """
     if not faiss_available:
         st.warning("⚠️ FAISS not available. Install with: pip install faiss-cpu or faiss-gpu")
         return None
 
     try:
         dimension = embeddings.shape[1]
+        n_docs = len(embeddings)
 
-        # Use GPU if available
-        if faiss_gpu_available:
-            st.info("🎮 Building FAISS index on GPU...")
-            res = faiss.StandardGpuResources()
-            index = faiss.IndexFlatL2(dimension)
-            gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
-            gpu_index.add(embeddings.astype('float32'))
-            return gpu_index
-        else:
-            st.info("💻 Building FAISS index on CPU...")
-            index = faiss.IndexFlatL2(dimension)
+        # Choose index type based on dataset size
+        if n_docs > 50000:
+            # Large dataset: Use IVF for speed
+            nlist = min(int(np.sqrt(n_docs)), 4096)  # Number of clusters
+            st.info(f"🚀 Building IVF FAISS index for {n_docs:,} documents ({nlist} clusters)...")
+
+            quantizer = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
+
+            # Train the index
+            index.train(embeddings.astype('float32'))
             index.add(embeddings.astype('float32'))
+
+            # Set search parameters (trade accuracy for speed)
+            index.nprobe = min(32, nlist // 4)  # Search 32 clusters
+
+            st.success(f"✅ IVF index built: {nlist} clusters, nprobe={index.nprobe}")
             return index
+        else:
+            # Small/medium dataset: Use flat index (exact search)
+            if faiss_gpu_available:
+                st.info(f"🎮 Building flat FAISS index on GPU for {n_docs:,} documents...")
+                res = faiss.StandardGpuResources()
+                index = faiss.IndexFlatL2(dimension)
+                gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+                gpu_index.add(embeddings.astype('float32'))
+                return gpu_index
+            else:
+                st.info(f"💻 Building flat FAISS index on CPU for {n_docs:,} documents...")
+                index = faiss.IndexFlatL2(dimension)
+                index.add(embeddings.astype('float32'))
+                return index
+
     except Exception as e:
         st.error(f"❌ Failed to build FAISS index: {str(e)}")
         return None
@@ -3537,7 +3594,7 @@ def main():
                                     # Extract keywords (simple word frequency)
                                     all_text = ' '.join(topic_docs[:50]).lower()
                                     words = all_text.split()
-                                    from collections import Counter
+                                    # ✅ CARMACK: Use module-level Counter import (avoid local import scoping issues)
                                     common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to'}
                                     word_counts = Counter(w for w in words if len(w) > 3 and w not in common_words)
                                     keywords = ', '.join([w for w, _ in word_counts.most_common(5)])
@@ -4063,6 +4120,134 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
                         mime="text/plain",
                         help="Summary report"
                     )
+
+                st.markdown("---")
+                st.subheader("📦 Session Export/Import")
+                st.markdown("✅ **CARMACK**: Save complete session to resume work later or skip re-embedding")
+
+                # Session Export
+                if st.button("📦 Export Full Session (ZIP)", help="Save embeddings, topics, and all results to resume work later"):
+                    import zipfile
+                    from io import BytesIO
+                    import json
+                    from datetime import datetime
+
+                    with st.spinner("Creating session export..."):
+                        zip_buffer = BytesIO()
+
+                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                            # 1. Save embeddings
+                            emb_buffer = BytesIO()
+                            np.save(emb_buffer, st.session_state.embeddings)
+                            zf.writestr("embeddings.npy", emb_buffer.getvalue())
+
+                            # 2. Save UMAP embeddings if available
+                            if st.session_state.umap_embeddings is not None:
+                                umap_buffer = BytesIO()
+                                np.save(umap_buffer, st.session_state.umap_embeddings)
+                                zf.writestr("umap_embeddings.npy", umap_buffer.getvalue())
+
+                            # 3. Save topics and metadata
+                            session_metadata = {
+                                'topics': st.session_state.current_topics.tolist(),
+                                'documents': st.session_state.documents,
+                                'topic_keywords': st.session_state.topic_keywords,
+                                'topic_human': st.session_state.topic_human,
+                                'parameters': {
+                                    'min_topic_size': st.session_state.get('min_topic_size_used', 10),
+                                    'n_topics': len(set(st.session_state.current_topics)),
+                                    'clustering_method': st.session_state.clustering_method,
+                                    'model_name': st.session_state.model_name,
+                                    'uploaded_file_name': st.session_state.uploaded_file_name,
+                                },
+                                'export_timestamp': datetime.now().isoformat(),
+                                'version': '1.0'
+                            }
+                            zf.writestr("session_metadata.json", json.dumps(session_metadata, indent=2))
+
+                            # 4. Save results CSV
+                            zf.writestr("results.csv", export_df.to_csv(index=False))
+
+                            # 5. Save topic info
+                            topic_info_export = safe_topic_info[export_cols] if 'LLM_Analysis' in export_cols else safe_topic_info
+                            zf.writestr("topic_info.csv", topic_info_export.to_csv(index=False))
+
+                            # 6. Save LLM analysis if available
+                            if 'topic_llm_analysis' in st.session_state and st.session_state.topic_llm_analysis:
+                                zf.writestr("llm_analysis.json", json.dumps(st.session_state.topic_llm_analysis, indent=2))
+
+                        zip_buffer.seek(0)
+
+                        st.download_button(
+                            label="📥 Download Session ZIP",
+                            data=zip_buffer.getvalue(),
+                            file_name=f"bertopic_session_{st.session_state.uploaded_file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            help="Complete session including embeddings (can resume work without re-embedding)"
+                        )
+
+                        st.success("✅ Session exported successfully! Contains embeddings, topics, and all results.")
+                        st.info("💡 **Tip**: Import this ZIP file later to resume work instantly without re-embedding documents")
+
+                # Session Import
+                st.markdown("### 📂 Import Session")
+                uploaded_session = st.file_uploader(
+                    "Upload Session ZIP",
+                    type=['zip'],
+                    help="Import a previously exported session to resume work",
+                    key='session_import'
+                )
+
+                if uploaded_session is not None:
+                    if st.button("🔄 Load Session"):
+                        import zipfile
+                        import json
+                        from io import BytesIO
+
+                        with st.spinner("Loading session..."):
+                            try:
+                                with zipfile.ZipFile(uploaded_session, 'r') as zf:
+                                    # Load metadata
+                                    metadata = json.loads(zf.read("session_metadata.json"))
+
+                                    # Load embeddings
+                                    st.session_state.embeddings = np.load(BytesIO(zf.read("embeddings.npy")))
+
+                                    # Load UMAP embeddings if available
+                                    if "umap_embeddings.npy" in zf.namelist():
+                                        st.session_state.umap_embeddings = np.load(BytesIO(zf.read("umap_embeddings.npy")))
+
+                                    # Load topics and documents
+                                    st.session_state.current_topics = np.array(metadata['topics'])
+                                    st.session_state.documents = metadata['documents']
+                                    st.session_state.topic_keywords = metadata['topic_keywords']
+                                    st.session_state.topic_human = metadata['topic_human']
+
+                                    # Load parameters
+                                    params = metadata['parameters']
+                                    st.session_state.min_topic_size_used = params.get('min_topic_size', 10)
+                                    st.session_state.clustering_method = params.get('clustering_method', 'HDBSCAN')
+                                    st.session_state.model_name = params.get('model_name', 'all-MiniLM-L6-v2')
+                                    st.session_state.uploaded_file_name = params.get('uploaded_file_name', 'imported_session')
+
+                                    # Load results
+                                    results_csv = pd.read_csv(BytesIO(zf.read("results.csv")))
+                                    st.session_state.browser_df = results_csv
+                                    st.session_state.df = results_csv
+
+                                    # Load LLM analysis if available
+                                    if "llm_analysis.json" in zf.namelist():
+                                        st.session_state.topic_llm_analysis = json.loads(zf.read("llm_analysis.json"))
+
+                                    st.success(f"✅ Session loaded successfully!")
+                                    st.info(f"📊 Loaded {len(st.session_state.documents):,} documents with {params['n_topics']} topics")
+                                    st.info(f"🕐 Original session: {metadata.get('export_timestamp', 'Unknown')}")
+                                    st.info(f"⚡ Embeddings loaded - no re-computation needed!")
+                                    st.rerun()
+
+                            except Exception as e:
+                                st.error(f"❌ Failed to load session: {str(e)}")
+                                st.exception(e)
 
     elif 'df' not in st.session_state or st.session_state.df is None:
         # Welcome screen
