@@ -4551,25 +4551,6 @@ Oversized Categories: {len(balance_analysis['oversized_topics'])}
             - **Multiple export** formats
             """)
 
-        st.header("✨ What's New")
-        st.success("""
-        **🧠 Chain-of-Thought LLM Labeling**: LLM now reads full documents and THINKS before labeling! 
-        It analyzes what customers need, then creates descriptive category names. Much smarter than forcing it into a box.
-        
-        **📖 Richer Context**: Shows up to 800 characters per document (was 400) - LLM sees the full story!
-        
-        **🎯 Trust the AI**: Removed restrictive validation. Let the LLM use as many words as needed to be clear and specific.
-        
-        **🚀 Longer Responses**: 800 tokens for LLM output (was 200-300) - room for thoughtful analysis.
-        
-        **⚡ Better Generation**: Higher temperature (0.5), more diverse sampling (top_p 0.92), gentler repetition penalty.
-        
-        **🎯 Improved Labels**: Instead of "Help Order Placed", you'll get "Samsung Washer Delivery Scheduling and Installation"!
-        
-        **🚀 Phi-3-mini-128k Support**: Analyze 50+ full documents per topic with 128k context window!
-        
-        **🚀 Memory Optimization Profiles**: Choose Conservative (8GB), Balanced (16GB), Aggressive (32GB+), or Extreme (64GB+)!
-        """)
 
         # System check
         with st.expander("🔍 Check Your System"):
