@@ -3785,15 +3785,28 @@ Provide a clear, actionable summary:"""
                             if torch.cuda.is_available():
                                 model_inputs = {k: v.to(llm_model.device) for k, v in model_inputs.items()}
 
+                            # Generate with cache fallback
                             with torch.no_grad():
-                                outputs = llm_model.generate(
-                                    **model_inputs,
-                                    max_new_tokens=300,
-                                    temperature=0.7,
-                                    do_sample=True,
-                                    pad_token_id=llm_tokenizer.eos_token_id,
-                                    use_cache=True
-                                )
+                                try:
+                                    # Try with cache first (faster)
+                                    outputs = llm_model.generate(
+                                        **model_inputs,
+                                        max_new_tokens=300,
+                                        temperature=0.7,
+                                        do_sample=True,
+                                        pad_token_id=llm_tokenizer.eos_token_id,
+                                        use_cache=True
+                                    )
+                                except (AttributeError, RuntimeError):
+                                    # Cache error - fall back to no cache
+                                    outputs = llm_model.generate(
+                                        **model_inputs,
+                                        max_new_tokens=300,
+                                        temperature=0.7,
+                                        do_sample=True,
+                                        pad_token_id=llm_tokenizer.eos_token_id,
+                                        use_cache=False
+                                    )
 
                             input_length = model_inputs['input_ids'].shape[1]
                             generated_tokens = outputs[0][input_length:]
@@ -4556,16 +4569,29 @@ Provide a clear, actionable summary:"""
                                         if torch.cuda.is_available():
                                             model_inputs = {k: v.to(llm_model.device) for k, v in model_inputs.items()}
 
-                                        # Generate
+                                        # Generate (with fallback for cache issues)
                                         with torch.no_grad():
-                                            outputs = llm_model.generate(
-                                                **model_inputs,  # Unpacks input_ids and attention_mask
-                                                max_new_tokens=300,
-                                                temperature=0.7,
-                                                do_sample=True,
-                                                pad_token_id=llm_tokenizer.eos_token_id,
-                                                use_cache=True  # 30-50% speedup with static KV cache
-                                            )
+                                            try:
+                                                # Try with cache first (faster)
+                                                outputs = llm_model.generate(
+                                                    **model_inputs,  # Unpacks input_ids and attention_mask
+                                                    max_new_tokens=300,
+                                                    temperature=0.7,
+                                                    do_sample=True,
+                                                    pad_token_id=llm_tokenizer.eos_token_id,
+                                                    use_cache=True  # 30-50% speedup with static KV cache
+                                                )
+                                            except (AttributeError, RuntimeError) as cache_error:
+                                                # Cache error (e.g., "no attribute seen_token") - fall back to no cache
+                                                st.warning("⚠️ Cache error detected, retrying without cache (slightly slower)")
+                                                outputs = llm_model.generate(
+                                                    **model_inputs,
+                                                    max_new_tokens=300,
+                                                    temperature=0.7,
+                                                    do_sample=True,
+                                                    pad_token_id=llm_tokenizer.eos_token_id,
+                                                    use_cache=False  # Disable cache to avoid errors
+                                                )
 
                                         # Decode only the generated tokens (skip prompt)
                                         input_length = model_inputs['input_ids'].shape[1]
