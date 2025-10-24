@@ -2895,6 +2895,10 @@ def main():
         st.session_state.topic_human = {}
     if 'last_topics_hash' not in st.session_state:
         st.session_state.last_topics_hash = None
+    if 'llm_model' not in st.session_state:
+        st.session_state.llm_model = None
+    if 'llm_model_name' not in st.session_state:
+        st.session_state.llm_model_name = None
 
     # Check GPU capabilities (cached in session state to avoid repeated checks)
     if 'gpu_capabilities' not in st.session_state:
@@ -3216,6 +3220,9 @@ def main():
                             # Debug: Show model info
                             model, tokenizer = llm_model
                             st.info(f"📦 Model loaded: {type(model).__name__} | Tokenizer: {type(tokenizer).__name__}")
+                            # ✅ FIX: Store LLM model in session state for persistence across reruns
+                            st.session_state.llm_model = llm_model
+                            st.session_state.llm_model_name = llm_model_name
                         else:
                             st.error("❌ LLM FAILED TO LOAD!")
                             st.warning("⚠️ Will use TF-IDF fallback for all labels")
@@ -3224,6 +3231,8 @@ def main():
                                    "- Insufficient system RAM (need 12GB+ for CPU mode)\n"
                                    "- Model download failed (check internet connection)\n"
                                    "- Missing dependencies (install transformers, accelerate)")
+                            st.session_state.llm_model = None
+                            st.session_state.llm_model_name = None
                 elif use_llm_labeling and not llm_model_name:
                     st.error("❌ LLM checkbox is checked but no model selected!")
                     st.info("Please select an LLM model from the dropdown")
@@ -3291,6 +3300,15 @@ def main():
     if st.session_state.embeddings_computed:
         st.success("✅ Embeddings ready! Use the controls below for instant topic adjustment.")
 
+        # ✅ FIX: Restore LLM model to reclusterer on every rerun (handles Streamlit's rerun behavior)
+        if (st.session_state.reclusterer is not None and
+            st.session_state.llm_model is not None):
+            # Restore the LLM model if it's not already set or if it's different
+            if (st.session_state.reclusterer.llm_model is None or
+                st.session_state.reclusterer.llm_model_name != st.session_state.llm_model_name):
+                st.session_state.reclusterer.llm_model = st.session_state.llm_model
+                st.session_state.reclusterer.llm_model_name = st.session_state.llm_model_name
+
         # Interactive controls section
         st.header("🎚️ Dynamic Topic Adjustment")
 
@@ -3326,6 +3344,12 @@ def main():
         # Recluster button
         if st.button("🔄 Recluster with New Settings", type="secondary"):
             with st.spinner(f"Reclustering into {n_topics_slider} topics... (This is fast!)"):
+                # ✅ FIX: Restore LLM model before reclustering
+                if st.session_state.llm_model is not None:
+                    st.session_state.reclusterer.llm_model = st.session_state.llm_model
+                    st.session_state.reclusterer.llm_model_name = st.session_state.llm_model_name
+                    st.info("🤖 Using LLM for enhanced topic labels and analysis")
+
                 method = 'kmeans' if "K-means" in clustering_method else 'hdbscan'
                 topics, topic_info = st.session_state.reclusterer.recluster(
                     n_topics=n_topics_slider,
