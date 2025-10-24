@@ -653,8 +653,90 @@ Your response:"""
 
 
 # =====================================================
-# ✅ GLOBAL DEDUPLICATION
+# ✅ DOCUMENT CLEANING FOR LLM
 # =====================================================
+def clean_docs_for_llm(docs, max_docs=8, max_length=200):
+    """
+    Clean and deduplicate documents before sending to LLM.
+
+    Removes:
+    - Duplicate documents
+    - Excessive word repetition
+    - Extra whitespace
+    - Very short/empty docs
+
+    Returns list of cleaned, unique document strings.
+    """
+    if not docs:
+        return []
+
+    # Step 1: Basic cleaning
+    cleaned = []
+    seen = set()
+
+    for doc in docs:
+        if not doc:
+            continue
+
+        # Convert to string and normalize whitespace
+        text = str(doc).strip()
+        text = ' '.join(text.split())  # Normalize all whitespace to single spaces
+
+        if len(text) < 10:  # Skip very short docs
+            continue
+
+        # Step 2: Remove word-level repetition
+        words = text.split()
+        # Remove consecutive duplicate words
+        deduped_words = []
+        prev_word = None
+        for word in words:
+            word_lower = word.lower()
+            if word_lower != prev_word:
+                deduped_words.append(word)
+                prev_word = word_lower
+
+        text = ' '.join(deduped_words)
+
+        # Step 3: Deduplicate documents (case-insensitive)
+        text_lower = text.lower()
+        if text_lower in seen:
+            continue
+
+        # Also check for substantial overlap (>80% similar using simple word overlap)
+        is_duplicate = False
+        text_words = set(text_lower.split())
+        for seen_text in seen:
+            seen_words = set(seen_text.split())
+            if len(text_words) > 0 and len(seen_words) > 0:
+                overlap = len(text_words & seen_words) / min(len(text_words), len(seen_words))
+                if overlap > 0.8:  # More than 80% overlap
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
+            continue
+
+        seen.add(text_lower)
+
+        # Step 4: Truncate at word boundary
+        if len(text) > max_length:
+            # Find last space before max_length
+            truncated = text[:max_length]
+            last_space = truncated.rfind(' ')
+            if last_space > max_length * 0.7:  # Only truncate at space if it's not too far back
+                text = truncated[:last_space] + '...'
+            else:
+                text = truncated + '...'
+
+        cleaned.append(text)
+
+        if len(cleaned) >= max_docs:
+            break
+
+    return cleaned
+
+
 def generate_batch_llm_analysis(topic_batch, llm_model):
     """
     Generate LLM analysis for multiple topics in a single batch call.
@@ -686,11 +768,16 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
         for item in topic_batch:
             topic_id = item['topic_id']
             label = item['label']
-            docs = item['docs'][:5]  # ✅ Use more docs for better context
+            docs = item['docs']
 
-            # Clean docs
-            cleaned = [str(d).strip()[:200] for d in docs if d and str(d).strip()]
-            docs_text = " | ".join(cleaned[:5])
+            # ✅ CLEAN: Deduplicate and remove repetition
+            cleaned = clean_docs_for_llm(docs, max_docs=5, max_length=200)
+
+            # Skip if no valid docs after cleaning
+            if not cleaned:
+                continue
+
+            docs_text = " | ".join(cleaned)
 
             prompt_parts.append(f"\nTopic {topic_id} - {label}:")
             prompt_parts.append(f"Sample documents: {docs_text}")
@@ -845,13 +932,13 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
     try:
         model, tokenizer = llm_model
 
-        # Clean and prepare documents - ✅ MORE DOCS
-        cleaned_docs = [str(doc).strip() for doc in sample_docs if doc and str(doc).strip()]
+        # ✅ CLEAN: Deduplicate and remove repetition
+        cleaned_docs = clean_docs_for_llm(sample_docs, max_docs=8, max_length=200)
         if not cleaned_docs:
             return None
 
-        # Build detailed prompt - ✅ LONGER EXCERPTS
-        docs_text = "\n".join([f"- {doc[:200]}" for doc in cleaned_docs[:8]])
+        # Build detailed prompt with cleaned docs
+        docs_text = "\n".join([f"- {doc}" for doc in cleaned_docs])
 
         prompt = f"""Topic: {topic_label}
 
