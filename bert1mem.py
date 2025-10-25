@@ -497,10 +497,11 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             executor.submit(
                 generate_simple_llm_analysis,
                 item['topic_id'],
-                item['docs'][:8],  # More docs = better context (not limited by batch size)
+                item['docs'][:20],  # ✅ CARMACK: Use up to 20 docs like interactive summary (was 8)
                 item['label'],
                 llm_model,
-                max_length=500
+                max_length=500,
+                keywords=item.get('keywords', '')  # ✅ CARMACK: Pass keywords for better context
             ): item['topic_id']
             for item in topic_batch
         }
@@ -510,15 +511,14 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             topic_id = future_to_topic[future]
             try:
                 analysis = future.result()
-                # Relaxed validation: >15 chars and contains spaces (real sentences)
-                # (Was 20 chars, but short valid responses like "Users report bugs" are 16 chars)
-                if analysis and len(analysis.strip()) > 15 and ' ' in analysis:
+                # ✅ CARMACK: Validation for 3-5 sentence summaries (50+ chars, was 15 for single sentence)
+                if analysis and len(analysis.strip()) > 50 and ' ' in analysis:
                     results[topic_id] = analysis
                 else:
                     # Log why validation failed for debugging
                     if analysis:
                         import logging
-                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip())}, has_space={' ' in analysis}): {analysis[:50]}")
+                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip())}, has_space={' ' in analysis}): {analysis[:100]}")
                 # Note: We don't add "No analysis available" here
                 # Let the caller decide what to do with missing results
             except Exception as e:
@@ -530,11 +530,14 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     return results
 
 
-def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=150):
+def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=300, keywords=""):
     """
-    Generate a simple one-sentence analysis of what users are saying in this topic.
+    Generate a comprehensive 3-5 sentence analysis of what users are saying in this topic.
 
-    Prompt: "Look at topic X and tell me what users are saying in one sentence."
+    Uses the same high-quality approach as the interactive topic summary feature,
+    but optimized for batch processing during initial topic modeling.
+
+    Prompt: Provide concise summary capturing main theme, key patterns, and insights.
     """
     if not sample_docs or llm_model is None:
         return None
@@ -556,15 +559,34 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
             logging.warning(f"Topic {topic_id} REJECTED - insufficient document content ({total_content_length} chars)")
             return None
 
-        # Build simple prompt
-        docs_text = "\n".join([f"- {doc[:200]}" for doc in cleaned_docs[:5]])
+        # ✅ CARMACK: Intelligent sampling like the interactive summary feature
+        # Sample documents intelligently (first, middle, last to get variety)
+        if len(cleaned_docs) <= 20:
+            sample_docs_intelligent = cleaned_docs
+        else:
+            # Take first 7, middle 7, last 6 (same strategy as interactive summary)
+            sample_docs_intelligent = (
+                cleaned_docs[:7] +
+                cleaned_docs[len(cleaned_docs)//2-3:len(cleaned_docs)//2+4] +
+                cleaned_docs[-6:]
+            )
 
-        prompt = f"""Topic: {topic_label}
+        # Use longer excerpts for better context (300 chars like interactive summary)
+        docs_text = "\n\n".join([f"{i+1}. {doc[:300]}" for i, doc in enumerate(sample_docs_intelligent)])
 
-Sample documents:
+        # ✅ CARMACK: Use comprehensive prompt like interactive summary (3-5 sentences, structured)
+        prompt = f"""You are analyzing documents from a topic cluster. Provide a concise summary (3-5 sentences) that captures:
+1. The main theme/problem discussed
+2. Key patterns or common issues mentioned
+3. Notable insights or trends
+
+Topic Label: {topic_label}
+Keywords: {keywords}
+Sample Documents (showing {len(sample_docs_intelligent)} representative docs):
+
 {docs_text}
 
-What are users saying? Provide one clear sentence describing their main concerns or feedback."""
+Provide a clear, actionable summary:"""
 
         # ✅ CARMACK FIX v2: Use apply_chat_template with return_dict=True (2025 best practice)
         # Original issue: Wrong tokenization caused 8/10 → 2/10 success rate
@@ -587,7 +609,7 @@ What are users saying? Provide one clear sentence describing their main concerns
             with torch.no_grad():
                 outputs = model.generate(
                     **model_inputs,  # Unpacks input_ids and attention_mask
-                    max_new_tokens=100,
+                    max_new_tokens=300,  # ✅ CARMACK: Longer for 3-5 sentence summaries (was 100)
                     temperature=0.7,  # Slightly higher for more natural variation
                     do_sample=True,
                     top_p=0.9,
@@ -617,7 +639,7 @@ What are users saying? Provide one clear sentence describing their main concerns
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=100,
+                    max_new_tokens=300,  # ✅ CARMACK: Longer for 3-5 sentence summaries (was 100)
                     temperature=0.5,
                     do_sample=True,
                     top_p=0.9,
@@ -636,25 +658,23 @@ What are users saying? Provide one clear sentence describing their main concerns
 
         # Clean up
         response = response.strip()
-        raw_response_preview = response[:100]  # Save for debugging
+        raw_response_preview = response[:200]  # Save more for debugging (longer summaries)
 
         # Remove common LLM artifacts and prompt repetitions
         artifacts = [
             "Answer:", "answer:", "Based on analysis", "based on analysis",
             "According to", "according to", "The documents show",
-            "The users are saying", "Users are saying", "In this topic"
+            "The users are saying", "Users are saying", "In this topic",
+            "Summary:", "summary:", "Here is", "here is"
         ]
         for artifact in artifacts:
             if response.startswith(artifact):
                 response = response[len(artifact):].strip()
                 response = response.lstrip(':,.- ')
 
-        # Take first sentence
-        response = response.split('\n')[0].strip()
-        for delimiter in ['. ', '? ', '! ']:
-            if delimiter in response:
-                response = response.split(delimiter)[0] + delimiter.rstrip()
-                break
+        # ✅ CARMACK: Keep full 3-5 sentence summary (don't truncate to first sentence)
+        # Only remove excessive newlines while preserving paragraph structure
+        response = '\n'.join(line.strip() for line in response.split('\n') if line.strip())
 
         # Final cleanup
         response = response.strip('"\'[](){}')
@@ -662,18 +682,17 @@ What are users saying? Provide one clear sentence describing their main concerns
         # Log cleaning results
         import logging
         if response != raw_response_preview[:len(response)]:
-            logging.debug(f"Topic {topic_id} cleaned: '{raw_response_preview}' → '{response}'")
+            logging.debug(f"Topic {topic_id} cleaned: '{raw_response_preview}' → '{response[:200]}'")
 
         # Validate: Must be substantial enough to be meaningful
-        # Relaxed from 20 chars to 12 chars (e.g., "Users report bugs" = 16 chars)
-        if len(response) < 12:
+        # For 3-5 sentences, require at least 50 chars (was 12 for single sentence)
+        if len(response) < 50:
             logging.warning(f"Topic {topic_id} REJECTED - too short ({len(response)} chars): '{response}'")
             return None
 
-        # Require at least 3 words for a meaningful sentence
-        # (Was 4, but "Users report bugs" is valid with just 3 words)
+        # Require at least 10 words for a meaningful multi-sentence summary (was 3 for single sentence)
         words = response.lower().split()
-        if len(words) < 3:
+        if len(words) < 10:
             logging.warning(f"Topic {topic_id} REJECTED - too few words ({len(words)}): '{response}'")
             return None
 
