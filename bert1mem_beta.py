@@ -4036,6 +4036,9 @@ def main():
                         help="Limit rows for faster display"
                     )
 
+                # Get the selected topic ID (needed for both search and browsing)
+                selected_topic_id = topic_options[selected_option]
+
                 # Semantic Search Feature
                 st.markdown("---")
                 with st.expander("🔍 Semantic Search (AI-powered)", expanded=False):
@@ -4188,9 +4191,6 @@ def main():
                     
                 else:
                     # Normal topic browsing view
-                    # Get the selected topic ID
-                    selected_topic_id = topic_options[selected_option]
-
                     # Fast filtering - single topic only
                     if selected_topic_id == "all":
                         display_df = browser_df.head(max_rows)
