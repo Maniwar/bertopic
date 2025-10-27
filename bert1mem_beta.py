@@ -2720,12 +2720,37 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
 # -----------------------------------------------------
 # FAISS INDEXING FOR RAG CHAT
 # -----------------------------------------------------
+def validate_document_indexing(embeddings, documents, topics=None):
+    """
+    Validate that embeddings, documents, and topics arrays are properly aligned.
+    Returns (is_valid, error_message)
+    """
+    if embeddings is None or documents is None:
+        return False, "Embeddings or documents is None"
+
+    if len(embeddings) != len(documents):
+        return False, f"Length mismatch: {len(embeddings)} embeddings but {len(documents)} documents"
+
+    if topics is not None and len(topics) != len(documents):
+        return False, f"Length mismatch: {len(topics)} topics but {len(documents)} documents"
+
+    # Check for any obviously invalid embeddings
+    if len(embeddings) > 0:
+        zero_embeddings = np.all(embeddings == 0, axis=1).sum()
+        if zero_embeddings > len(embeddings) * 0.5:  # More than 50% are zero
+            return False, f"Warning: {zero_embeddings} embeddings are all zeros (may indicate indexing issue)"
+
+    return True, "All arrays are properly aligned"
+
+
 def build_faiss_index(embeddings):
     """
     Build FAISS index from embeddings for fast similarity search.
 
     ✅ CARMACK: Uses IVF (Inverted File Index) for >50k documents (5-10x faster).
     For smaller datasets, uses flat index (exact search).
+
+    The FAISS index maps: index_position[i] → embeddings[i] → documents[i]
     """
     if not faiss_available:
         st.warning("⚠️ FAISS not available. Install with: pip install faiss-cpu or faiss-gpu")
@@ -2734,6 +2759,11 @@ def build_faiss_index(embeddings):
     try:
         dimension = embeddings.shape[1]
         n_docs = len(embeddings)
+
+        # Validate embeddings quality
+        zero_embeddings = np.all(embeddings == 0, axis=1).sum()
+        if zero_embeddings > 0:
+            st.warning(f"⚠️ Found {zero_embeddings} zero embeddings (may be invalid documents)")
 
         # Choose index type based on dataset size
         if n_docs > 50000:
@@ -2788,7 +2818,20 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
         topic_filter: If set, only return documents from this topic ID
     """
     if faiss_index is None:
+        st.error("❌ FAISS index is None - cannot retrieve documents")
         return []
+
+    if len(documents) == 0:
+        st.error("❌ No documents available for retrieval")
+        return []
+
+    # Validate topics array matches documents
+    if topics is not None and len(topics) != len(documents):
+        st.error(f"❌ Topics array mismatch: {len(topics)} topics but {len(documents)} documents!")
+        st.error("This will cause incorrect filtering. Please recompute embeddings.")
+        # For now, disable topic filtering to at least get some results
+        st.warning("⚠️ Disabling topic filtering due to mismatch")
+        topics = None
 
     try:
         # Encode query
@@ -2798,35 +2841,118 @@ def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_
             normalize_embeddings=True
         )[0].reshape(1, -1).astype('float32')
 
-        # If topic filtering, retrieve more candidates to ensure we get enough after filtering
-        search_k = top_k * 10 if topic_filter is not None and topics is not None else top_k
+        # ✅ CARMACK: If filtering by topic, retrieve more candidates to ensure enough after filtering
+        # Otherwise, just get what we need
+        show_debug = st.session_state.get('show_rag_debug', False)
+        if topic_filter is not None and topics is not None:
+            search_k = min(top_k * 10, len(documents))  # 10x oversampling for filtering
+            if show_debug:
+                st.caption(f"🔍 Filtering mode: will search {search_k} docs to find {top_k} in topic {topic_filter}")
+        else:
+            search_k = min(top_k, len(documents))  # No filtering, get exactly what we need
+            if show_debug:
+                st.caption(f"🔍 Full search mode: searching all {len(documents)} docs for top {search_k} results")
+
+        # Debug: Show search parameters
+        if st.session_state.get('show_rag_debug', False):
+            st.caption(f"🔍 FAISS index: {faiss_index.ntotal} vectors indexed")
+            if topics is not None:
+                st.caption(f"🔍 Topics array: {len(topics)} topic assignments available")
 
         # Search FAISS index
         distances, indices = faiss_index.search(query_embedding, search_k)
 
+        # Debug: Show what FAISS returned
+        if show_debug:
+            st.caption(f"🔍 FAISS returned: {len(indices[0])} indices, range: [{indices[0].min()}, {indices[0].max()}]")
+
+            # Debug: Show topic distribution in FAISS results
+            if topics is not None:
+                sample_indices = indices[0][:min(10, len(indices[0]))]
+                sample_topics = [topics[int(idx)] if 0 <= idx < len(topics) else 'OOR' for idx in sample_indices]
+                st.caption(f"🔍 Top 10 FAISS results have topics: {sample_topics}")
+
+                # Show overall topic distribution in data
+                from collections import Counter
+                all_topics_dist = Counter(topics)
+                st.caption(f"🔍 Topic distribution in full dataset: {len(all_topics_dist)} unique topics")
+
+                # Show topic distribution in FAISS results
+                faiss_result_topics = [topics[int(idx)] for idx in indices[0] if 0 <= idx < len(topics)]
+                faiss_topics_dist = Counter(faiss_result_topics)
+                st.caption(f"🔍 Topics in FAISS results ({len(indices[0])} docs): {dict(faiss_topics_dist)}")
+
         # Get documents
         results = []
+        skipped_by_filter = 0
+        out_of_range = 0
         for i, idx in enumerate(indices[0]):
-            if 0 <= idx < len(documents):
-                # Apply topic filter if specified
-                if topic_filter is not None and topics is not None:
-                    if idx < len(topics) and topics[idx] != topic_filter:
-                        continue  # Skip documents not in the target topic
+            if idx < 0 or idx >= len(documents):
+                out_of_range += 1
+                st.caption(f"⚠️ Index {idx} is out of range [0, {len(documents)-1}]")
+                continue
 
-                results.append({
-                    'document': documents[idx],
-                    'distance': float(distances[0][i]),
-                    'index': int(idx),
-                    'topic': topics[idx] if topics is not None and idx < len(topics) else None
-                })
+            # Apply topic filter if specified
+            if topic_filter is not None and topics is not None:
+                if idx < len(topics) and topics[idx] != topic_filter:
+                    skipped_by_filter += 1
+                    # Debug: Show why we're skipping (only first few)
+                    if show_debug and skipped_by_filter <= 3:
+                        st.caption(f"⏭️ Skipping idx={idx}: has topic {topics[idx]}, want topic {topic_filter}")
+                    continue  # Skip documents not in the target topic
 
-                # Stop once we have enough results
-                if len(results) >= top_k:
-                    break
+            results.append({
+                'document': documents[idx],
+                'distance': float(distances[0][i]),
+                'index': int(idx),
+                'topic': topics[idx] if topics is not None and idx < len(topics) else None
+            })
+
+            # Stop once we have enough results
+            if len(results) >= top_k:
+                break
+
+        # Debug summary
+        if out_of_range > 0:
+            st.error(f"❌ {out_of_range} indices were out of range! FAISS index may not match documents array.")
+
+        if show_debug:
+            if topic_filter is not None:
+                st.caption(f"🔍 Topic filtering: searched {search_k} docs, skipped {skipped_by_filter} from other topics, kept {len(results)}")
+            else:
+                st.caption(f"✅ No topic filtering: retrieved {len(results)} most relevant documents from entire corpus")
+
+            # Show topic distribution in final results
+            if len(results) > 0 and topics is not None:
+                from collections import Counter
+                result_topics = [r['topic'] for r in results if r.get('topic') is not None]
+                result_topics_dist = Counter(result_topics)
+                st.caption(f"🔍 Final results topic distribution: {dict(result_topics_dist)}")
+
+                # Check if any topic is missing
+                all_unique_topics = set(topics)
+                result_unique_topics = set(result_topics)
+                missing_topics = all_unique_topics - result_unique_topics
+                if missing_topics and len(missing_topics) < 10:  # Don't spam if many missing
+                    st.warning(f"⚠️ {len(missing_topics)} topics not in results: {sorted(list(missing_topics))}")
+
+                    # Show how many documents each missing topic has
+                    topic_counts = Counter(topics)
+                    for missing_topic in sorted(list(missing_topics))[:5]:  # Show first 5
+                        count = topic_counts.get(missing_topic, 0)
+                        st.caption(f"   → Topic {missing_topic}: has {count} documents in dataset")
+
+        if len(results) == 0:
+            st.error(f"❌ Retrieved 0 documents! This should not happen. Check debug output above.")
+        else:
+            if show_debug:
+                st.success(f"✅ Retrieved {len(results)} documents successfully")
 
         return results
     except Exception as e:
         st.error(f"❌ Document retrieval error: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
         return []
 
 
@@ -2912,33 +3038,99 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
     query_lower = user_query.lower()
 
     # RAG MODE: Use FAISS + LLM for intelligent responses
-    if use_rag and llm_model and faiss_index and documents and safe_model:
+    # ✅ Fixed: Check 'is not None' instead of truthiness to allow empty lists
+    if use_rag and llm_model is not None and faiss_index is not None and documents is not None and safe_model is not None:
+        # Debug: Show what we have
+        if st.session_state.get('show_rag_debug', False):
+            docs_len = len(documents) if documents is not None else 0
+            topics_len = len(topics) if topics is not None else 0
+            st.caption(f"🔍 RAG Debug: embeddings={type(embeddings)}, docs={docs_len}, topics={topics_len}, faiss={faiss_index is not None}")
+
+        # Validate we have documents to search
+        if len(documents) == 0:
+            st.error("❌ RAG mode enabled but no documents available. Please recompute embeddings.")
+            return "Error: No documents available for RAG search."
+
+        # Validate indexing alignment
+        is_valid, validation_msg = validate_document_indexing(embeddings, documents, topics)
+        if not is_valid:
+            st.error(f"❌ Indexing validation failed: {validation_msg}")
+            return f"Error: Document indexing issue - {validation_msg}. Please recompute embeddings."
+        else:
+            st.caption(f"✅ Validation passed: {validation_msg}")
+
         # Parse query to detect if user is asking about a specific topic
+        # ✅ CARMACK FIX: Only filter by topic if user explicitly mentions it
         topic_filter = None
         topic_match = re.search(r'topic\s+(\d+)', query_lower)
         if topic_match:
             topic_filter = int(topic_match.group(1))
-            st.info(f"🤖 Using RAG mode (FAISS + LLM) - Filtering to Topic {topic_filter}...")
-        else:
-            st.info("🤖 Using RAG mode (FAISS + LLM)...")
+            # Validate topic exists
+            if topics is not None:
+                unique_topics = set(topics)
+                if topic_filter not in unique_topics:
+                    st.warning(f"⚠️ Topic {topic_filter} not found in data. Searching all topics instead.")
+                    topic_filter = None
+                else:
+                    st.info(f"🤖 Using RAG mode (FAISS + LLM) - Filtering to Topic {topic_filter}...")
+            else:
+                st.warning(f"⚠️ Topics data not available. Searching all documents.")
+                topic_filter = None
 
-        # Retrieve relevant documents (with optional topic filtering)
+        if topic_filter is None:
+            st.info("🤖 Using RAG mode (FAISS + LLM) - Searching ALL documents across ALL topics...")
+
+        # Debug: Check what we're passing to retrieval
+        st.caption(f"🔍 Calling retrieval with: query='{user_query[:50]}...', topic_filter={topic_filter}, topics={'array of '+str(len(topics)) if topics is not None else 'None'}")
+
+        # ✅ CRITICAL VALIDATION: Ensure all arrays are aligned
+        validation_checks = []
+        if embeddings is not None and documents is not None:
+            if len(embeddings) != len(documents):
+                st.error(f"🚨 CRITICAL: embeddings({len(embeddings)}) != documents({len(documents)})")
+                validation_checks.append(False)
+            else:
+                validation_checks.append(True)
+
+        if topics is not None and documents is not None:
+            if len(topics) != len(documents):
+                st.error(f"🚨 CRITICAL: topics({len(topics)}) != documents({len(documents)})")
+                st.error("This WILL cause retrieval to fail! Topics and documents must match.")
+                validation_checks.append(False)
+            else:
+                validation_checks.append(True)
+
+        if faiss_index is not None and embeddings is not None:
+            if faiss_index.ntotal != len(embeddings):
+                st.error(f"🚨 CRITICAL: FAISS index({faiss_index.ntotal}) != embeddings({len(embeddings)})")
+                validation_checks.append(False)
+            else:
+                validation_checks.append(True)
+
+        if len(validation_checks) > 0 and all(validation_checks):
+            topics_len = len(topics) if topics is not None else 0
+            st.caption(f"✅ All arrays aligned: {len(documents)} docs, {len(embeddings)} emb, {faiss_index.ntotal} indexed, {topics_len} topics")
+
+        # Retrieve relevant documents (NO topic filtering by default)
+        # ✅ CARMACK: Search ALL docs unless user specifically asks for a topic
+        # Auto-adapt document count based on model capacity
+        doc_count = st.session_state.get('rag_doc_count', 10)  # Default to 10 if not set
         retrieved_docs = retrieve_relevant_documents(
             user_query,
             faiss_index,
             embeddings,
             documents,
             safe_model,
-            top_k=5,
-            topics=topics,
-            topic_filter=topic_filter
+            top_k=doc_count,  # Auto-adapts: 8 for 4k model, 50 for 128k model
+            topics=topics,  # Pass for metadata only
+            topic_filter=topic_filter  # None unless user asks for specific topic
         )
 
         if retrieved_docs:
             if topic_filter is not None:
                 st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents from Topic {topic_filter}")
             else:
-                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents")
+                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents across all topics")
 
             # Generate response using LLM with retrieved context
             response = generate_rag_response(
@@ -2959,9 +3151,30 @@ def generate_chat_response(user_query, context, topic_info_df, topics, processed
 
             return response
         else:
-            st.warning("⚠️ No relevant documents found, using rule-based fallback")
+            # ✅ Fixed: Return error instead of falling back to rule-based mode
+            st.error("❌ No relevant documents found for your query. Try rephrasing or check if documents are properly indexed.")
+            return "No relevant documents found in the knowledge base for your query. Please try rephrasing your question or ensure your documents are properly indexed."
 
-    # RULE-BASED MODE (fallback or default)
+    # Check why RAG mode is not active
+    elif use_rag:
+        missing_components = []
+        if llm_model is None:
+            missing_components.append("LLM model (llm_model=None)")
+        if faiss_index is None:
+            missing_components.append("FAISS index (faiss_index=None)")
+        if documents is None:
+            missing_components.append("documents (documents=None)")
+        elif len(documents) == 0:
+            missing_components.append("documents (empty list)")
+        if safe_model is None:
+            missing_components.append("embedding model (safe_model=None)")
+
+        error_msg = f"❌ RAG mode requested but missing: {', '.join(missing_components)}. Please recompute embeddings or load the required models."
+        st.error(error_msg)
+        st.caption(f"🔍 Debug: use_rag={use_rag}, llm_model={llm_model is not None}, faiss={faiss_index is not None}, docs={documents is not None and len(documents) if documents else 0}, safe_model={safe_model is not None}")
+        return error_msg
+
+    # RULE-BASED MODE (only when RAG is explicitly disabled)
 
 
     # Handle queries about the current topic
@@ -3396,19 +3609,28 @@ def main():
                     st.session_state.umap_embeddings = umap_embeddings
 
                 # Step 4: Build FAISS index for RAG and LLM Analysis
+                # First validate that arrays are aligned
+                is_valid, validation_msg = validate_document_indexing(embeddings, cleaned_docs, topics=None)
+                if not is_valid:
+                    st.error(f"❌ Document indexing validation failed: {validation_msg}")
+                    st.error("This may cause issues with RAG search. Please check your data.")
+                else:
+                    st.success(f"✅ Document indexing validated: {validation_msg}")
+                    st.caption(f"📊 Indexed: {len(embeddings):,} embeddings ↔ {len(cleaned_docs):,} documents")
+
                 if use_llm_labeling:
                     with st.spinner("🔍 Step 4: Building FAISS index for LLM analysis and RAG chat..."):
                         faiss_index = build_faiss_index(embeddings)
                         st.session_state.faiss_index = faiss_index
                         if faiss_index:
-                            st.success("✅ FAISS index ready! Will use for intelligent document selection in LLM analysis.")
+                            st.success(f"✅ FAISS index built with {faiss_index.ntotal:,} vectors - ready for LLM analysis & RAG!")
                 else:
                     # Still build for RAG chat even if LLM labeling is disabled
                     with st.spinner("🔍 Step 4: Building FAISS index for RAG chat..."):
                         faiss_index = build_faiss_index(embeddings)
                         st.session_state.faiss_index = faiss_index
                         if faiss_index:
-                            st.success("✅ FAISS index ready for RAG chat!")
+                            st.success(f"✅ FAISS index built with {faiss_index.ntotal:,} vectors - ready for RAG chat!")
 
                 # ✅ Clear GPU memory before loading LLM
                 if torch.cuda.is_available() and use_llm_labeling:
@@ -4455,7 +4677,7 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                     st.caption("Get AI-powered insights using FAISS retrieval and LLM generation")
 
                     # RAG Settings
-                    col_rag1, col_rag2 = st.columns(2)
+                    col_rag1, col_rag2, col_rag3 = st.columns(3)
                     with col_rag1:
                         use_rag_chat = st.checkbox(
                             "🤖 Enable RAG Mode (FAISS + LLM)",
@@ -4463,6 +4685,15 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                             help="Use Retrieval-Augmented Generation for intelligent responses based on your actual documents"
                         )
                     with col_rag2:
+                        show_rag_debug = st.checkbox(
+                            "🔍 Show Debug Info",
+                            value=True,
+                            help="Show detailed diagnostic information about document retrieval",
+                            key="show_rag_debug_checkbox"
+                        )
+                        # Store in session state so retrieval function can access it
+                        st.session_state.show_rag_debug = show_rag_debug
+                    with col_rag3:
                         if use_rag_chat:
                             chat_llm_model_name = st.selectbox(
                                 "Chat LLM Model",
@@ -4495,8 +4726,47 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                     # Check if FAISS index is available
                     has_faiss = st.session_state.get('faiss_index') is not None
                     if use_rag_chat and not has_faiss:
-                        st.warning("⚠️ FAISS index not available. Please recompute embeddings to enable RAG mode.")
+                        st.error("❌ FAISS index not available. RAG mode requires FAISS index. Please recompute embeddings with 'Enable LLM Labeling' checked to build the index.")
                         use_rag_chat = False
+                    elif use_rag_chat and has_faiss:
+                        # Show diagnostic info
+                        num_docs = len(st.session_state.get('documents', []))
+                        num_topics = len(set(st.session_state.get('current_topics', [])))
+                        st.success(f"✅ RAG Mode Active: {num_docs:,} documents across {num_topics} topics available for search")
+
+                        # ✅ CARMACK: Smart auto-adapt document count based on model capacity
+                        model_config = LLM_MODEL_CONFIG.get(chat_llm_model_name, {})
+                        recommended_docs = model_config.get('recommended_docs', 10)
+                        context_window = model_config.get('context_window', 4096)
+
+                        # Advanced RAG settings (collapsed by default)
+                        with st.expander("⚙️ Advanced RAG Settings", expanded=False):
+                            st.caption(f"Model: {chat_llm_model_name.split('/')[-1]}")
+                            st.caption(f"Context window: {context_window:,} tokens")
+
+                            use_custom_docs = st.checkbox(
+                                "🎛️ Custom document count",
+                                value=False,
+                                help="Override auto-recommended document count",
+                                key="use_custom_doc_count"
+                            )
+
+                            if use_custom_docs:
+                                rag_doc_count = st.slider(
+                                    "Documents to retrieve",
+                                    min_value=1,
+                                    max_value=100,
+                                    value=recommended_docs,
+                                    help=f"Recommended: {recommended_docs} for this model",
+                                    key="rag_doc_count_slider"
+                                )
+                                st.caption(f"→ Using {rag_doc_count} documents (custom)")
+                            else:
+                                rag_doc_count = recommended_docs
+                                st.caption(f"→ Auto: {rag_doc_count} documents (recommended for {context_window//1024}k model)")
+
+                        # Store for use in retrieval
+                        st.session_state.rag_doc_count = rag_doc_count
 
                     # Initialize chat history in session state
                     if 'chat_history' not in st.session_state:
@@ -4545,6 +4815,16 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 
                             context = "\n".join(context_parts)
 
+                            # Debug: Check what we're passing
+                            if use_rag_chat:
+                                docs = st.session_state.get('documents')
+                                docs_len = len(docs) if docs is not None else 0
+                                st.caption(f"🔧 Calling RAG with: use_rag={use_rag_chat}, llm={chat_llm is not None}, "
+                                          f"faiss={st.session_state.get('faiss_index') is not None}, "
+                                          f"docs={docs_len}, "
+                                          f"emb={st.session_state.get('embeddings') is not None}, "
+                                          f"model={st.session_state.get('safe_model') is not None}")
+
                             # Generate response with RAG or rule-based
                             response = generate_chat_response(
                                 prompt,
@@ -4572,19 +4852,23 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 
                     if len(st.session_state.chat_history) == 0:
                         if use_rag_chat:
-                            st.info("🤖 **RAG Mode Active!** I'll retrieve relevant documents and use LLM to answer your questions.\n\n"
-                                   "Try asking:\n"
+                            num_docs = len(st.session_state.get('documents', []))
+                            num_topics = len(set(st.session_state.get('current_topics', [])))
+                            st.info(f"🤖 **RAG Mode Active!** All {num_docs:,} documents from {num_topics} topics are available.\n\n"
+                                   "I'll use semantic search + LLM to answer based on your actual documents.\n\n"
+                                   "**Try asking:**\n"
                                    "- 'What do customers say about delivery?'\n"
                                    "- 'Find issues related to installation'\n"
                                    "- 'Summarize the main complaints'\n"
-                                   "- 'What are people saying about Samsung products?'")
+                                   "- 'What are people saying about Samsung products?'\n"
+                                   "- 'Tell me about topic 5' (filters to specific topic)")
                         else:
                             st.info("👋 Ask me anything about your topics. For example:\n"
                                    "- 'What are the main themes in my data?'\n"
                                    "- 'Tell me about the current topic'\n"
                                    "- 'Which topics are most common?'\n"
                                    "- 'Show me insights about customer complaints'\n\n"
-                                   "💡 **Tip:** Enable RAG Mode above for AI-powered responses!")
+                                   "💡 **Tip:** Enable RAG Mode above for AI-powered document-based responses!")
                     else:
                         # Display chat history (newest first)
                         for message in reversed(st.session_state.chat_history):
