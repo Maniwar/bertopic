@@ -589,16 +589,17 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             topic_id = future_to_topic[future]
             try:
                 analysis = future.result()
-                # Validation: accept shorter analyses for small topics (20+ chars, reduced from 50)
-                if analysis and len(analysis.strip()) > 20 and ' ' in analysis:
+                # Validation: VERY lenient - accept even short analyses (10+ chars)
+                # Better to have brief summaries than no summaries at all
+                if analysis and len(analysis.strip()) >= 10:
                     results[topic_id] = analysis
                 else:
                     # Log why validation failed for debugging
                     if analysis:
                         import logging
-                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip())}, has_space={' ' in analysis}): {analysis[:100]}")
-                # Note: We don't add "No analysis available" here
-                # Let the caller decide what to do with missing results
+                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip()) if analysis else 0}): {analysis[:100] if analysis else 'None'}")
+                # Note: We don't add fallback here - let the caller handle missing results
+                # The caller will use label/keywords for fallback
             except Exception as e:
                 # Log error for debugging but don't crash
                 import logging
@@ -628,15 +629,21 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
         if not cleaned_docs:
             import logging
             logging.warning(f"Topic {topic_id} REJECTED - no valid documents after cleaning")
+            # Return basic summary based on label/keywords instead of None
+            if topic_label and keywords:
+                return f"Topic about {topic_label}. Keywords: {keywords}"
+            elif topic_label:
+                return f"Topic: {topic_label}"
             return None
 
         # Check if documents have enough content (not just whitespace/noise)
-        # Lowered threshold: even very short topics deserve analysis
+        # VERY lenient threshold: even tiny topics deserve some analysis
         total_content_length = sum(len(doc) for doc in cleaned_docs)
-        if total_content_length < 10:  # Only reject if < 10 chars (almost empty)
+        if total_content_length < 5:  # Only reject if < 5 chars (essentially empty)
             import logging
-            logging.warning(f"Topic {topic_id} REJECTED - insufficient document content ({total_content_length} chars)")
-            return None
+            logging.warning(f"Topic {topic_id} has very low content ({total_content_length} chars), attempting anyway...")
+            # Still try to generate something if we have label/keywords
+            # Don't return None here - let LLM try with whatever we have
 
         # ✅ CARMACK: Intelligent sampling like the interactive summary feature
         # Sample documents intelligently (first, middle, last to get variety)
@@ -764,15 +771,26 @@ Provide a clear, actionable summary:"""
             logging.debug(f"Topic {topic_id} cleaned: '{raw_response_preview}' → '{response[:200]}'")
 
         # Validate: Must be substantial enough to be meaningful
-        # Reduced from 50 to 20 chars to handle small topics with brief content
-        if len(response) < 20:
+        # VERY lenient: accept even short responses (10+ chars, 3+ words)
+        # Better to have a brief summary than no summary at all
+        if len(response) < 10:
             logging.warning(f"Topic {topic_id} REJECTED - too short ({len(response)} chars): '{response}'")
+            # Return basic info instead of None
+            if topic_label and keywords:
+                return f"Topic about {topic_label}. Keywords: {keywords}"
+            elif topic_label:
+                return f"Topic: {topic_label}"
             return None
 
-        # Require at least 5 words for a meaningful summary (reduced from 10 to handle small topics)
+        # Require at least 3 words for a meaningful summary (very lenient)
         words = response.lower().split()
-        if len(words) < 5:
+        if len(words) < 3:
             logging.warning(f"Topic {topic_id} REJECTED - too few words ({len(words)}): '{response}'")
+            # Return basic info instead of None
+            if topic_label and keywords:
+                return f"Topic about {topic_label}. Keywords: {keywords}"
+            elif topic_label:
+                return f"Topic: {topic_label}"
             return None
 
         # Log successful analysis
@@ -2510,7 +2528,13 @@ class FastReclusterer:
                             llm_analysis_dict[topic_id] = retry_results[topic_id]
                             llm_success_count += 1
                         else:
-                            llm_analysis_dict[topic_id] = "No analysis available (topic may have insufficient data)"
+                            # Provide informative fallback using available metadata
+                            label = topic_item.get('label', f'Topic {topic_id}')
+                            keywords = topic_item.get('keywords', '')
+                            if keywords:
+                                llm_analysis_dict[topic_id] = f"Topic about {label}. Keywords: {keywords}"
+                            else:
+                                llm_analysis_dict[topic_id] = f"Topic: {label} (insufficient document data for detailed analysis)"
                             llm_fallback_count += 1
 
                 # Update progress bar
@@ -2529,11 +2553,11 @@ class FastReclusterer:
                     f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
                 )
                 if llm_fallback_count > 0:
-                    # Find which topics failed
+                    # Find which topics used fallback (insufficient data)
                     failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
-                                       if "No analysis available" in analysis]
-                    st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis: {failed_topic_ids}")
-                    st.caption("💡 Failed topics may have insufficient or low-quality document content. Enable debug mode to see details.")
+                                       if "insufficient document data" in analysis or "No analysis available" in analysis]
+                    st.warning(f"⚠️ {llm_fallback_count} topics used fallback summaries: {failed_topic_ids}")
+                    st.caption("💡 Fallback topics have basic summaries using label/keywords due to low document quality.")
             else:
                 st.warning("⚠️ LLM analysis failed for all topics")
 
@@ -2735,7 +2759,13 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
                     llm_analysis_dict[topic_id] = retry_results[topic_id]
                     llm_success_count += 1
                 else:
-                    llm_analysis_dict[topic_id] = "No analysis available (topic may have insufficient data)"
+                    # Provide informative fallback using available metadata
+                    label = topic_item.get('label', f'Topic {topic_id}')
+                    keywords = topic_item.get('keywords', '')
+                    if keywords:
+                        llm_analysis_dict[topic_id] = f"Topic about {label}. Keywords: {keywords}"
+                    else:
+                        llm_analysis_dict[topic_id] = f"Topic: {label} (insufficient document data for detailed analysis)"
                     llm_fallback_count += 1
 
         # Update progress bar
@@ -2752,11 +2782,11 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         success_pct = (llm_success_count / num_topics) * 100
         st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
         if llm_fallback_count > 0:
-            # Find which topics failed
+            # Find which topics used fallback (insufficient data)
             failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
-                               if "No analysis available" in analysis]
-            st.warning(f"⚠️ {llm_fallback_count} topics failed LLM analysis: {failed_topic_ids}")
-            st.caption("💡 Failed topics may have insufficient or low-quality document content. Enable debug mode to see details.")
+                               if "insufficient document data" in analysis or "No analysis available" in analysis]
+            st.warning(f"⚠️ {llm_fallback_count} topics used fallback summaries: {failed_topic_ids}")
+            st.caption("💡 Fallback topics have basic summaries using label/keywords due to low document quality.")
     else:
         st.warning("⚠️ LLM analysis failed for all topics")
 
