@@ -589,17 +589,19 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
             topic_id = future_to_topic[future]
             try:
                 analysis = future.result()
-                # Validation: VERY lenient - accept even short analyses (10+ chars)
-                # Better to have brief summaries than no summaries at all
-                if analysis and len(analysis.strip()) >= 10:
+                # Validation: EXTREMELY lenient - accept very short analyses (5+ chars)
+                # Most real LLM responses should easily pass this
+                if analysis and len(analysis.strip()) >= 5:
                     results[topic_id] = analysis
                 else:
                     # Log why validation failed for debugging
                     if analysis:
                         import logging
-                        logging.debug(f"Topic {topic_id} analysis rejected (len={len(analysis.strip()) if analysis else 0}): {analysis[:100] if analysis else 'None'}")
+                        logging.warning(f"Topic {topic_id} analysis rejected (len={len(analysis.strip()) if analysis else 0}): '{analysis[:100] if analysis else 'None'}")
+                    else:
+                        import logging
+                        logging.warning(f"Topic {topic_id} returned None from LLM generation")
                 # Note: We don't add fallback here - let the caller handle missing results
-                # The caller will use label/keywords for fallback
             except Exception as e:
                 # Log error for debugging but don't crash
                 import logging
@@ -609,16 +611,20 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     return results
 
 
-def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=2000, keywords=""):
+def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length=2000, keywords="", retry_count=0):
     """
     Generate a comprehensive 3-5 sentence analysis of what users are saying in this topic.
 
     Uses the same high-quality approach as the interactive topic summary feature,
     but optimized for batch processing during initial topic modeling.
 
+    Includes automatic retry logic: retries up to 2 times if LLM returns None or very short response.
+
     Prompt: Provide concise summary capturing main theme, key patterns, and insights.
     """
     if not sample_docs or llm_model is None:
+        import logging
+        logging.warning(f"Topic {topic_id} skipped - no docs ({len(sample_docs) if sample_docs else 0}) or no LLM")
         return None
 
     try:
@@ -628,13 +634,10 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
         cleaned_docs = [str(doc).strip() for doc in sample_docs if doc and str(doc).strip()]
         if not cleaned_docs:
             import logging
-            logging.warning(f"Topic {topic_id} REJECTED - no valid documents after cleaning")
-            # Return basic summary based on label/keywords instead of None
-            if topic_label and keywords:
-                return f"Topic about {topic_label}. Keywords: {keywords}"
-            elif topic_label:
-                return f"Topic: {topic_label}"
-            return None
+            logging.warning(f"Topic {topic_id} REJECTED - no valid documents after cleaning (had {len(sample_docs)} raw docs)")
+            # This shouldn't happen often - log it prominently
+            logging.error(f"Topic {topic_id} has {len(sample_docs)} documents but all became empty after cleaning!")
+            return None  # Can't retry if there are truly no documents
 
         # Check if documents have enough content (not just whitespace/noise)
         # VERY lenient threshold: even tiny topics deserve some analysis
@@ -661,7 +664,10 @@ def generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, 
         docs_text = "\n\n".join([f"{i+1}. {doc[:300]}" for i, doc in enumerate(sample_docs_intelligent)])
 
         # ✅ CARMACK: Use comprehensive prompt like interactive summary (3-5 sentences, structured)
-        prompt = f"""You are analyzing documents from a topic cluster. Provide a concise summary (3-5 sentences) that captures:
+        # Add emphasis on response length to prevent empty/very short outputs
+        if retry_count == 0:
+            # First attempt - standard prompt
+            prompt = f"""You are analyzing documents from a topic cluster. Provide a concise summary (3-5 sentences) that captures:
 1. The main theme/problem discussed
 2. Key patterns or common issues mentioned
 3. Notable insights or trends
@@ -673,6 +679,17 @@ Sample Documents (showing {len(sample_docs_intelligent)} representative docs):
 {docs_text}
 
 Provide a clear, actionable summary:"""
+        else:
+            # Retry attempt - more explicit about minimum length
+            prompt = f"""Analyze these documents and write a detailed 3-5 sentence summary. Be specific and thorough.
+
+Topic: {topic_label}
+Keywords: {keywords}
+
+Documents:
+{docs_text}
+
+Write a complete summary explaining what these documents are about:"""
 
         # ✅ CARMACK FIX v2: Use apply_chat_template with return_dict=True (2025 best practice)
         # Original issue: Wrong tokenization caused 8/10 → 2/10 success rate
@@ -692,11 +709,14 @@ Provide a clear, actionable summary:"""
             if torch.cuda.is_available():
                 model_inputs = {k: v.to(model.device) for k, v in model_inputs.items()}
 
+            # Adjust temperature based on retry count - higher temp for retries to get different output
+            temperature = 0.7 + (retry_count * 0.15)  # 0.7, 0.85, 1.0 for retries 0,1,2
+
             with torch.no_grad():
                 outputs = model.generate(
                     **model_inputs,  # Unpacks input_ids and attention_mask
                     max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
-                    temperature=0.7,  # Slightly higher for more natural variation
+                    temperature=min(temperature, 1.0),  # Cap at 1.0
                     do_sample=True,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
@@ -722,11 +742,14 @@ Provide a clear, actionable summary:"""
             if torch.cuda.is_available():
                 inputs = {k: v.cuda() for k, v in inputs.items()}
 
+            # Adjust temperature for retries
+            temperature = 0.5 + (retry_count * 0.15)  # 0.5, 0.65, 0.8 for retries 0,1,2
+
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
-                    temperature=0.5,
+                    temperature=min(temperature, 0.9),
                     do_sample=True,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
@@ -746,7 +769,7 @@ Provide a clear, actionable summary:"""
         response = response.strip()
         raw_response_preview = response[:200]  # Save more for debugging (longer summaries)
 
-        # Remove common LLM artifacts and prompt repetitions
+        # Remove common LLM artifacts and prompt repetitions (only if followed by content)
         artifacts = [
             "Answer:", "answer:", "Based on analysis", "based on analysis",
             "According to", "according to", "The documents show",
@@ -755,8 +778,11 @@ Provide a clear, actionable summary:"""
         ]
         for artifact in artifacts:
             if response.startswith(artifact):
-                response = response[len(artifact):].strip()
-                response = response.lstrip(':,.- ')
+                # Only remove artifact if there's substantial content after it
+                temp = response[len(artifact):].strip().lstrip(':,.- ')
+                if len(temp) > 10:  # Only strip if at least 10 chars remain
+                    response = temp
+                    break  # Stop after first match
 
         # ✅ CARMACK: Keep full 3-5 sentence summary (don't truncate to first sentence)
         # Only remove excessive newlines while preserving paragraph structure
@@ -771,26 +797,26 @@ Provide a clear, actionable summary:"""
             logging.debug(f"Topic {topic_id} cleaned: '{raw_response_preview}' → '{response[:200]}'")
 
         # Validate: Must be substantial enough to be meaningful
-        # VERY lenient: accept even short responses (10+ chars, 3+ words)
-        # Better to have a brief summary than no summary at all
-        if len(response) < 10:
+        # EXTREMELY lenient: accept very short responses (5+ chars, 2+ words)
+        # Most LLM responses should easily pass this threshold
+        if len(response) < 5:
             logging.warning(f"Topic {topic_id} REJECTED - too short ({len(response)} chars): '{response}'")
-            # Return basic info instead of None
-            if topic_label and keywords:
-                return f"Topic about {topic_label}. Keywords: {keywords}"
-            elif topic_label:
-                return f"Topic: {topic_label}"
+            logging.warning(f"  Raw response was: '{raw_response_preview}'")
+            # Retry if we haven't exceeded max retries
+            if retry_count < 2:
+                logging.warning(f"Topic {topic_id} retrying (attempt {retry_count + 2}/3)...")
+                return generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length, keywords, retry_count + 1)
             return None
 
-        # Require at least 3 words for a meaningful summary (very lenient)
+        # Require at least 2 words for a meaningful summary (extremely lenient)
         words = response.lower().split()
-        if len(words) < 3:
+        if len(words) < 2:
             logging.warning(f"Topic {topic_id} REJECTED - too few words ({len(words)}): '{response}'")
-            # Return basic info instead of None
-            if topic_label and keywords:
-                return f"Topic about {topic_label}. Keywords: {keywords}"
-            elif topic_label:
-                return f"Topic: {topic_label}"
+            logging.warning(f"  Raw response was: '{raw_response_preview}'")
+            # Retry if we haven't exceeded max retries
+            if retry_count < 2:
+                logging.warning(f"Topic {topic_id} retrying (attempt {retry_count + 2}/3)...")
+                return generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length, keywords, retry_count + 1)
             return None
 
         # Log successful analysis
@@ -800,15 +826,27 @@ Provide a clear, actionable summary:"""
         if len(response) > max_length:
             response = response[:max_length].rsplit(' ', 1)[0].strip() + "..."
 
-        return response if response else None
+        # Final check - if somehow response is empty, retry
+        if not response:
+            logging.warning(f"Topic {topic_id} - empty response after all processing")
+            if retry_count < 2:
+                logging.warning(f"Topic {topic_id} retrying (attempt {retry_count + 2}/3)...")
+                return generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length, keywords, retry_count + 1)
+            return None
+
+        return response
 
     except Exception as e:
         # Log the actual error for debugging
         import logging
         logging.warning(f"Topic {topic_id} LLM generation exception: {str(e)}")
+        # Retry if we haven't exceeded max retries
+        if retry_count < 2:
+            logging.warning(f"Topic {topic_id} retrying after exception (attempt {retry_count + 2}/3)...")
+            return generate_simple_llm_analysis(topic_id, sample_docs, topic_label, llm_model, max_length, keywords, retry_count + 1)
         # Only show in UI if it's a critical error (not during batch processing)
         if hasattr(st, 'caption'):
-            st.caption(f"⚠️ Topic {topic_id} analysis failed: {str(e)[:100]}")
+            st.caption(f"⚠️ Topic {topic_id} analysis failed after {retry_count + 1} attempts: {str(e)[:100]}")
         return None
 
 
@@ -2455,6 +2493,10 @@ class FastReclusterer:
             progress_bar = st.progress(0.0)
             status_text = st.empty()
 
+            # Calculate optimal doc count based on model's context window
+            max_docs = get_max_docs_for_model(self.llm_model_name) if self.llm_model_name else 10
+            st.caption(f"📊 Using {max_docs} documents per topic (optimized for {self.llm_model_name.split('/')[-1] if self.llm_model_name else 'default'} context window)")
+
             # Prepare all topics with FAISS-selected documents
             all_topics_prepared = []
             for topic_id, docs in topics_dict.items():
@@ -2464,24 +2506,24 @@ class FastReclusterer:
                 doc_indices = topic_doc_indices.get(topic_id, [])
                 label = labels_dict.get(topic_id, f"Topic {topic_id}")
 
-                # Select representative documents using FAISS (increased to 10 for better quality)
+                # Select representative documents using FAISS (dynamically scaled by context window)
                 if faiss_index is not None and embeddings_for_analysis is not None and len(doc_indices) > 0:
                     try:
                         topic_embeddings = embeddings_for_analysis[doc_indices]
                         centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                        _, indices = faiss_index.search(centroid, min(10, len(doc_indices)))
+                        _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
 
                         idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
                         selected_docs = []
                         for idx in indices[0]:
                             if idx in idx_to_pos:
                                 selected_docs.append(docs[idx_to_pos[idx]])
-                                if len(selected_docs) >= 10:
+                                if len(selected_docs) >= max_docs:
                                     break
                     except Exception:
-                        selected_docs = docs[:10]
+                        selected_docs = docs[:max_docs]
                 else:
-                    selected_docs = docs[:10]
+                    selected_docs = docs[:max_docs]
 
                 # Get keywords for this topic to enable better fallback summaries
                 keywords = keywords_dict.get(topic_id, '')
@@ -2532,13 +2574,9 @@ class FastReclusterer:
                             llm_analysis_dict[topic_id] = retry_results[topic_id]
                             llm_success_count += 1
                         else:
-                            # Provide informative fallback using available metadata
-                            label = topic_item.get('label', f'Topic {topic_id}')
-                            keywords = topic_item.get('keywords', '')
-                            if keywords:
-                                llm_analysis_dict[topic_id] = f"Topic about {label}. Keywords: {keywords}"
-                            else:
-                                llm_analysis_dict[topic_id] = f"Topic: {label} (insufficient document data for detailed analysis)"
+                            # No redundant fallback - leave empty if LLM can't generate meaningful analysis
+                            # Users already see label and keywords in other columns
+                            llm_analysis_dict[topic_id] = ""
                             llm_fallback_count += 1
 
                 # Update progress bar
@@ -2557,11 +2595,11 @@ class FastReclusterer:
                     f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
                 )
                 if llm_fallback_count > 0:
-                    # Find which topics used fallback (insufficient data)
-                    failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
-                                       if "insufficient document data" in analysis or "No analysis available" in analysis]
-                    st.warning(f"⚠️ {llm_fallback_count} topics used fallback summaries: {failed_topic_ids}")
-                    st.caption("💡 Fallback topics have basic summaries using label/keywords due to low document quality.")
+                    # Find which topics have no analysis (empty string)
+                    failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items() if not analysis or analysis.strip() == ""]
+                    st.warning(f"⚠️ {llm_fallback_count} topics have no LLM analysis: {failed_topic_ids}")
+                    st.caption("💡 These topics had insufficient document content for LLM analysis. Label and keywords are still available.")
+                    st.caption("🔍 **Tip:** Enable 'Debug logging' above and check your terminal/console to see why specific topics failed.")
             else:
                 st.warning("⚠️ LLM analysis failed for all topics")
 
@@ -2644,7 +2682,7 @@ def normalize_topic_info(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------
 # STANDALONE LLM ANALYSIS FOR EXISTING TOPICS
 # -----------------------------------------------------
-def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_model):
+def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_model, model_name=None):
     """
     Run LLM analysis on already-clustered topics.
     This allows adding AI insights after clustering without reclustering.
@@ -2691,6 +2729,10 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
+    # Calculate optimal doc count based on model's context window
+    max_docs = get_max_docs_for_model(model_name) if model_name else 10
+    st.caption(f"📊 Using {max_docs} documents per topic (optimized for {model_name.split('/')[-1] if model_name else 'default'} context window)")
+
     # Prepare all topics with FAISS-selected documents
     all_topics_prepared = []
     for topic_id, docs in topics_dict.items():
@@ -2701,24 +2743,24 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         label = labels_dict.get(topic_id, f"Topic {topic_id}")
         keywords = keywords_dict.get(topic_id, '')
 
-        # Select docs with FAISS (increased to 10 for better quality)
+        # Select docs with FAISS (dynamically scaled by context window)
         if faiss_index is not None and embeddings is not None and len(doc_indices) > 0:
             try:
                 topic_embeddings = embeddings[doc_indices]
                 centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                _, indices = faiss_index.search(centroid, min(10, len(doc_indices)))
+                _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
 
                 idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
                 selected_docs = []
                 for idx in indices[0]:
                     if idx in idx_to_pos:
                         selected_docs.append(docs[idx_to_pos[idx]])
-                        if len(selected_docs) >= 10:
+                        if len(selected_docs) >= max_docs:
                             break
             except Exception:
-                selected_docs = docs[:10]
+                selected_docs = docs[:max_docs]
         else:
-            selected_docs = docs[:10]
+            selected_docs = docs[:max_docs]
 
         all_topics_prepared.append({
             'topic_id': topic_id,
@@ -2766,13 +2808,9 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
                     llm_analysis_dict[topic_id] = retry_results[topic_id]
                     llm_success_count += 1
                 else:
-                    # Provide informative fallback using available metadata
-                    label = topic_item.get('label', f'Topic {topic_id}')
-                    keywords = topic_item.get('keywords', '')
-                    if keywords:
-                        llm_analysis_dict[topic_id] = f"Topic about {label}. Keywords: {keywords}"
-                    else:
-                        llm_analysis_dict[topic_id] = f"Topic: {label} (insufficient document data for detailed analysis)"
+                    # No redundant fallback - leave empty if LLM can't generate meaningful analysis
+                    # Users already see label and keywords in other columns
+                    llm_analysis_dict[topic_id] = ""
                     llm_fallback_count += 1
 
         # Update progress bar
@@ -2789,11 +2827,11 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         success_pct = (llm_success_count / num_topics) * 100
         st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
         if llm_fallback_count > 0:
-            # Find which topics used fallback (insufficient data)
-            failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items()
-                               if "insufficient document data" in analysis or "No analysis available" in analysis]
-            st.warning(f"⚠️ {llm_fallback_count} topics used fallback summaries: {failed_topic_ids}")
-            st.caption("💡 Fallback topics have basic summaries using label/keywords due to low document quality.")
+            # Find which topics have no analysis (empty string)
+            failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items() if not analysis or analysis.strip() == ""]
+            st.warning(f"⚠️ {llm_fallback_count} topics have no LLM analysis: {failed_topic_ids}")
+            st.caption("💡 These topics had insufficient document content for LLM analysis. Label and keywords are still available.")
+            st.caption("🔍 **Tip:** Enable 'Debug logging' checkbox and check your terminal/console to see why specific topics failed.")
     else:
         st.warning("⚠️ LLM analysis failed for all topics")
 
@@ -4752,7 +4790,8 @@ def main():
                                 topic_info=st.session_state.current_topic_info,
                                 documents=st.session_state.documents,
                                 embeddings=st.session_state.embeddings,
-                                llm_model=post_llm
+                                llm_model=post_llm,
+                                model_name=post_llm_model_name
                             )
 
                             # Update session state with new topic_info
