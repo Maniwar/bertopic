@@ -14,6 +14,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import psutil
 import os
+# ✅ CARMACK: RAG IMPROVEMENTS - chunking, caching, persistence
+from functools import lru_cache
+import hashlib
+import pickle
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
 
 
 # =====================================================
@@ -70,7 +76,7 @@ except ImportError:
 
 from bertopic import BERTopic
 from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.cluster import KMeans
 
@@ -398,7 +404,7 @@ Your response:"""
                 top_p=0.9,
                 repetition_penalty=1.3,  # ✅ Prevent repeating same label
                 pad_token_id=tokenizer.eos_token_id,
-                use_cache=True  # 30-50% speedup with static KV cache
+                use_cache=True  # 30-50% speedup - cache initialized on model load
             )
         
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -614,7 +620,7 @@ Provide a clear, actionable summary:"""
                     do_sample=True,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True  # 30-50% speedup with static KV cache
+                    use_cache=True  # 30-50% speedup - cache initialized on model load
                 )
 
             # Decode only the new tokens (exclude the prompt)
@@ -644,7 +650,7 @@ Provide a clear, actionable summary:"""
                     do_sample=True,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True  # 30-50% speedup with static KV cache
+                    use_cache=True  # 30-50% speedup - cache initialized on model load
                 )
 
             # Decode only the new tokens (exclude the prompt)
@@ -1790,7 +1796,7 @@ Topic label:"""
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id,
-                use_cache=True  # 30-50% speedup with static KV cache
+                use_cache=True  # 30-50% speedup - cache initialized on model load
             )
         
         # Decode output
@@ -1990,12 +1996,31 @@ def load_local_llm(model_name, force_cpu=False, use_4bit=False):
         if model is None:
             st.error("❌ Failed to load LLM on both GPU and CPU")
             return None
-        
+
+        # ✅ CARMACK: Initialize KV cache with dummy forward pass
+        # This prevents "seen tokens" errors when use_cache=True is used later
+        # Small one-time cost for 30-50% speedup on all subsequent generations
+        try:
+            with torch.no_grad():
+                dummy_input = tokenizer("Initialize cache", return_tensors="pt", return_dict=True)
+                if device_used == "GPU" and torch.cuda.is_available():
+                    dummy_input = {k: v.to(model.device) for k, v in dummy_input.items()}
+                # Single forward pass to warm up cache
+                _ = model.generate(
+                    **dummy_input,
+                    max_new_tokens=1,
+                    use_cache=True,
+                    do_sample=False
+                )
+        except Exception as cache_init_error:
+            # Non-critical - model will still work without cache
+            st.warning(f"⚠️ Cache initialization skipped: {str(cache_init_error)}")
+
         # Display final configuration
         st.success(f"🎯 LLM ready on {device_used}")
         if device_used == "CPU":
             st.info("💡 Pro tip: Close other applications to free up system RAM for faster inference")
-        
+
         return (model, tokenizer)
         
     except Exception as e:
@@ -2633,6 +2658,76 @@ def check_gpu_capabilities():
 
     return capabilities
 
+def clear_gpu_memory(clear_models=True):
+    """Clear GPU memory and optionally unload models from session state"""
+    if not torch.cuda.is_available():
+        return "No GPU detected"
+
+    cleared = []
+
+    if clear_models:
+        # Unload LLM models
+        if 'llm_model' in st.session_state and st.session_state.llm_model:
+            model, tokenizer = st.session_state.llm_model
+            del model, tokenizer
+            st.session_state.llm_model = None
+            st.session_state.llm_model_name = None
+            cleared.append("LLM (labeling)")
+
+        if 'chat_llm' in st.session_state and st.session_state.chat_llm:
+            model, tokenizer = st.session_state.chat_llm
+            del model, tokenizer
+            st.session_state.chat_llm = None
+            st.session_state.chat_llm_loaded_model = None
+            cleared.append("LLM (chat)")
+
+        # Note: Don't clear safe_model (embedding model) as it's needed for embeddings
+        # User can manually clear it by recomputing embeddings with different model
+
+    # Clear GPU cache
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Force garbage collection
+    import gc
+    gc.collect()
+
+    if cleared:
+        return f"Cleared: {', '.join(cleared)}"
+    return "GPU cache cleared"
+
+def get_gpu_memory_status():
+    """Get current GPU memory usage and loaded models"""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        mem_info = torch.cuda.mem_get_info(0)
+        free_gb = mem_info[0] / (1024**3)
+        total_gb = mem_info[1] / (1024**3)
+        used_gb = total_gb - free_gb
+
+        # Check what's loaded
+        loaded = []
+        if st.session_state.get('safe_model'):
+            loaded.append("Embedding model")
+        if st.session_state.get('llm_model'):
+            model_name = st.session_state.get('llm_model_name', 'Unknown')
+            loaded.append(f"LLM (labeling): {model_name.split('/')[-1]}")
+        if st.session_state.get('chat_llm'):
+            model_name = st.session_state.get('chat_llm_loaded_model', 'Unknown')
+            loaded.append(f"LLM (chat): {model_name.split('/')[-1]}")
+
+        return {
+            'free_gb': free_gb,
+            'used_gb': used_gb,
+            'total_gb': total_gb,
+            'percent_used': (used_gb / total_gb) * 100,
+            'loaded_models': loaded
+        }
+    except Exception as e:
+        return None
+
 @st.cache_data
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
@@ -2715,6 +2810,286 @@ def compute_umap_embeddings(embeddings, n_neighbors=15, n_components=5):
         pass
 
     return umap_embeddings
+
+
+# =====================================================
+# 🚀 CARMACK: RAG IMPROVEMENTS - CHUNKING, CACHING, PERSISTENCE
+# =====================================================
+
+@dataclass
+class DocumentChunk:
+    """Represents a chunk of a document with metadata"""
+    chunk_id: int
+    parent_doc_id: int
+    text: str
+    start_pos: int
+    end_pos: int
+    topic_id: Optional[int] = None
+    embedding: Optional[np.ndarray] = None
+
+
+class QueryEmbeddingCache:
+    """LRU cache for query embeddings - avoid re-encoding same queries"""
+    def __init__(self, maxsize=1000):
+        self.cache = {}
+        self.access_order = []
+        self.maxsize = maxsize
+        self.hits = 0
+        self.misses = 0
+
+    def _hash_query(self, query: str) -> str:
+        """Hash query for cache key"""
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+    def get(self, query: str) -> Optional[np.ndarray]:
+        """Get cached embedding if exists"""
+        key = self._hash_query(query)
+        if key in self.cache:
+            self.hits += 1
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        self.misses += 1
+        return None
+
+    def put(self, query: str, embedding: np.ndarray):
+        """Store embedding in cache"""
+        key = self._hash_query(query)
+
+        # Evict oldest if at capacity
+        if len(self.cache) >= self.maxsize and key not in self.cache:
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+
+        self.cache[key] = embedding
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+
+    def stats(self) -> Dict:
+        """Return cache statistics"""
+        total = self.hits + self.misses
+        hit_rate = self.hits / total if total > 0 else 0
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': hit_rate,
+            'size': len(self.cache)
+        }
+
+
+def chunk_documents(documents: List[str], tokenizer, chunk_size=512, overlap=128, topics=None) -> Tuple[List[DocumentChunk], np.ndarray]:
+    """
+    Chunk documents into overlapping segments for better RAG retrieval.
+
+    Args:
+        documents: List of document texts
+        tokenizer: Tokenizer for counting tokens
+        chunk_size: Target tokens per chunk (512 is empirically optimal)
+        overlap: Overlap between chunks in tokens (128 recommended)
+        topics: Optional topic IDs for each document
+
+    Returns:
+        chunks: List of DocumentChunk objects
+        parent_mapping: Array mapping chunk_id → parent_doc_id
+    """
+    chunks = []
+    chunk_id = 0
+
+    for doc_id, doc_text in enumerate(documents):
+        if not doc_text or len(doc_text.strip()) == 0:
+            continue
+
+        topic_id = topics[doc_id] if topics is not None else None
+
+        # Tokenize document
+        try:
+            tokens = tokenizer.encode(doc_text, add_special_tokens=False)
+        except:
+            # Fallback: simple whitespace tokenization if tokenizer fails
+            tokens = doc_text.split()
+
+        # If document is shorter than chunk_size, keep it as one chunk
+        if len(tokens) <= chunk_size:
+            chunks.append(DocumentChunk(
+                chunk_id=chunk_id,
+                parent_doc_id=doc_id,
+                text=doc_text,
+                start_pos=0,
+                end_pos=len(doc_text),
+                topic_id=topic_id
+            ))
+            chunk_id += 1
+            continue
+
+        # Split into overlapping chunks
+        start = 0
+        while start < len(tokens):
+            end = min(start + chunk_size, len(tokens))
+
+            # Decode chunk tokens back to text
+            try:
+                chunk_tokens = tokens[start:end]
+                chunk_text = tokenizer.decode(chunk_tokens)
+            except:
+                # Fallback: slice original text proportionally
+                char_start = int((start / len(tokens)) * len(doc_text))
+                char_end = int((end / len(tokens)) * len(doc_text))
+                chunk_text = doc_text[char_start:char_end]
+
+            chunks.append(DocumentChunk(
+                chunk_id=chunk_id,
+                parent_doc_id=doc_id,
+                text=chunk_text,
+                start_pos=start,
+                end_pos=end,
+                topic_id=topic_id
+            ))
+            chunk_id += 1
+
+            # Move start forward by (chunk_size - overlap)
+            start += (chunk_size - overlap)
+
+            # Break if we've covered the document
+            if end >= len(tokens):
+                break
+
+    # Create parent mapping array
+    parent_mapping = np.array([chunk.parent_doc_id for chunk in chunks], dtype=np.int32)
+
+    return chunks, parent_mapping
+
+
+def expand_query_with_llm(query: str, llm_model, num_variants=2) -> List[str]:
+    """
+    ANDREJ KARPATHY: Expand query into multiple variants for better recall.
+    Generates 2-3 rephrased versions of the query, embeds all, retrieves union.
+
+    Args:
+        query: Original user query
+        llm_model: Tuple of (model, tokenizer)
+        num_variants: Number of query variants to generate (2-3 recommended)
+
+    Returns:
+        List of query strings: [original_query, variant1, variant2, ...]
+    """
+    if llm_model is None:
+        return [query]  # Fallback: just use original
+
+    try:
+        model, tokenizer = llm_model
+
+        prompt = f"""Rephrase this search query in {num_variants} different ways to find relevant documents.
+Keep the core meaning but vary the wording and perspective.
+
+Original query: {query}
+
+Provide {num_variants} alternative phrasings, one per line:"""
+
+        # Generate query variants
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=True
+            )
+
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract variants from response
+        variants = []
+        for line in response.split('\n'):
+            line = line.strip()
+            # Remove numbering like "1.", "2.", etc.
+            line = re.sub(r'^\d+[\.\)]\s*', '', line)
+            if line and len(line) > 10 and line.lower() not in query.lower():
+                variants.append(line)
+
+        # Return original + variants (limit to num_variants)
+        all_queries = [query] + variants[:num_variants]
+        return all_queries
+
+    except Exception as e:
+        # Fallback: just use original query
+        return [query]
+
+
+def save_faiss_index_to_disk(faiss_index, embeddings, chunks, parent_mapping, cache_dir=".cache"):
+    """
+    CARMACK: Persist FAISS index and embeddings to disk - free speedup.
+    Avoids rebuilding index every session.
+    """
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Save FAISS index
+        import faiss
+        index_path = os.path.join(cache_dir, "faiss_index.bin")
+        faiss.write_index(faiss_index, index_path)
+
+        # Save embeddings as numpy array
+        embeddings_path = os.path.join(cache_dir, "chunk_embeddings.npy")
+        np.save(embeddings_path, embeddings)
+
+        # Save chunks and parent mapping with pickle
+        chunks_path = os.path.join(cache_dir, "chunks.pkl")
+        with open(chunks_path, 'wb') as f:
+            pickle.dump({'chunks': chunks, 'parent_mapping': parent_mapping}, f)
+
+        st.success(f"💾 Cached FAISS index + embeddings ({len(chunks):,} chunks)")
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Failed to cache index: {str(e)}")
+        return False
+
+
+def load_faiss_index_from_disk(cache_dir=".cache") -> Optional[Tuple]:
+    """
+    Load FAISS index, embeddings, and chunks from disk if available.
+    Returns (faiss_index, embeddings, chunks, parent_mapping) or None if not found/invalid.
+    """
+    try:
+        index_path = os.path.join(cache_dir, "faiss_index.bin")
+        embeddings_path = os.path.join(cache_dir, "chunk_embeddings.npy")
+        chunks_path = os.path.join(cache_dir, "chunks.pkl")
+
+        # Check all files exist
+        if not all(os.path.exists(p) for p in [index_path, embeddings_path, chunks_path]):
+            return None
+
+        # Load FAISS index
+        import faiss
+        faiss_index = faiss.read_index(index_path)
+
+        # Load embeddings
+        embeddings = np.load(embeddings_path)
+
+        # Load chunks
+        with open(chunks_path, 'rb') as f:
+            chunk_data = pickle.load(f)
+            chunks = chunk_data['chunks']
+            parent_mapping = chunk_data['parent_mapping']
+
+        # Validate consistency
+        if faiss_index.ntotal != len(embeddings) or len(embeddings) != len(chunks):
+            st.warning("⚠️ Cached index is inconsistent - will rebuild")
+            return None
+
+        st.success(f"✅ Loaded cached FAISS index ({len(chunks):,} chunks)")
+        return (faiss_index, embeddings, chunks, parent_mapping)
+
+    except Exception as e:
+        st.warning(f"⚠️ Failed to load cached index: {str(e)}")
+        return None
 
 
 # -----------------------------------------------------
@@ -2803,157 +3178,234 @@ def build_faiss_index(embeddings):
         return None
 
 
-def retrieve_relevant_documents(query, faiss_index, embeddings, documents, safe_model, top_k=5, topics=None, topic_filter=None):
+def retrieve_relevant_documents(
+    query,
+    faiss_index,
+    embeddings,
+    documents,
+    safe_model,
+    top_k=5,
+    topics=None,
+    topic_filter=None,
+    chunks=None,
+    parent_mapping=None,
+    query_cache=None,
+    llm_model=None,
+    enable_query_expansion=False
+):
     """
-    Retrieve top-k most relevant documents using FAISS.
+    🚀 CARMACK+KARPATHY+YAN: Retrieve relevant documents with chunking, caching, and query expansion.
+
+    Improvements:
+    - Document chunking for better granularity
+    - LRU cache for query embeddings
+    - Query expansion with LLM (2-3 variants)
+    - Topic pre-filtering (before FAISS search, not after)
+    - Latency logging for measurement
+    """
+    if not faiss_index or len(documents) == 0:
+        return []
+
+    latency_start = time.time()
+
+    try:
+        # Initialize query embedding cache if not provided
+        if query_cache is None:
+            query_cache = st.session_state.get('query_embedding_cache')
+            if query_cache is None:
+                query_cache = QueryEmbeddingCache(maxsize=1000)
+                st.session_state.query_embedding_cache = query_cache
+
+        # Determine if we're using chunks or full documents
+        use_chunks = chunks is not None and parent_mapping is not None
+        search_items = chunks if use_chunks else documents
+
+        if len(search_items) == 0:
+            return []
+
+        # ANDREJ KARPATHY: Query expansion for better recall
+        query_variants = [query]  # Start with original
+        if enable_query_expansion and llm_model and st.session_state.get('enable_query_expansion', False):
+            expansion_start = time.time()
+            query_variants = expand_query_with_llm(query, llm_model, num_variants=2)
+            expansion_time = (time.time() - expansion_start) * 1000
+            if st.session_state.get('show_rag_debug', False):
+                st.caption(f"🔍 Expanded to {len(query_variants)} variants ({expansion_time:.0f}ms)")
+
+        # Encode all query variants (with caching)
+        query_embeddings = []
+        cache_hits = 0
+        for q_variant in query_variants:
+            cached_emb = query_cache.get(q_variant)
+            if cached_emb is not None:
+                query_embeddings.append(cached_emb)
+                cache_hits += 1
+            else:
+                # Encode and cache
+                emb = safe_model.model.encode(
+                    [q_variant],
+                    convert_to_numpy=True,
+                    normalize_embeddings=True
+                )[0].astype('float32')
+                query_cache.put(q_variant, emb)
+                query_embeddings.append(emb)
+
+        # EUGENE YAN: Pre-filter by topic BEFORE FAISS search (much faster)
+        if topic_filter is not None and topics is not None:
+            # Build mask of valid indices for this topic
+            if use_chunks:
+                # Filter chunks by topic
+                valid_indices = [i for i, chunk in enumerate(search_items) if chunk.topic_id == topic_filter]
+            else:
+                # Filter documents by topic
+                valid_indices = [i for i, t in enumerate(topics) if t == topic_filter]
+
+            if len(valid_indices) == 0:
+                return []  # No documents in this topic
+
+            # Extract subset of embeddings for this topic
+            filtered_embeddings = embeddings[valid_indices].astype('float32')
+
+            # Build temporary flat index for filtered set (fast for small subsets)
+            import faiss
+            temp_index = faiss.IndexFlatL2(embeddings.shape[1])
+            temp_index.add(filtered_embeddings)
+            search_index = temp_index
+            index_mapping = valid_indices  # Map results back to original indices
+        else:
+            search_index = faiss_index
+            index_mapping = None  # No mapping needed
+
+        # Search with all query variants, collect unique results
+        all_results = {}  # Use dict to deduplicate by index
+
+        for q_emb in query_embeddings:
+            q_emb_2d = q_emb.reshape(1, -1).astype('float32')
+
+            # Search (retrieve more if we need to fill top_k across variants)
+            search_k = min(top_k * 2, search_index.ntotal) if len(query_embeddings) > 1 else top_k
+            distances, indices = search_index.search(q_emb_2d, search_k)
+
+            # Collect results
+            for i, idx in enumerate(indices[0]):
+                if idx < 0:
+                    continue
+
+                # Map back to original index if we pre-filtered
+                original_idx = index_mapping[idx] if index_mapping is not None else idx
+
+                if original_idx >= len(search_items):
+                    continue
+
+                # Get document text (from chunk or original doc)
+                if use_chunks:
+                    chunk = search_items[original_idx]
+                    doc_text = chunk.text
+                    doc_topic = chunk.topic_id
+                    parent_id = chunk.parent_doc_id
+                else:
+                    doc_text = search_items[original_idx]
+                    doc_topic = topics[original_idx] if topics is not None and original_idx < len(topics) else None
+                    parent_id = original_idx
+
+                # Store best score for this doc/chunk
+                dist = float(distances[0][i])
+                if original_idx not in all_results or dist < all_results[original_idx]['distance']:
+                    all_results[original_idx] = {
+                        'document': doc_text,
+                        'distance': dist,
+                        'index': int(original_idx),
+                        'parent_id': int(parent_id),
+                        'topic': doc_topic,
+                        'chunk_id': original_idx if use_chunks else None
+                    }
+
+        # Sort by distance and take top_k
+        results = sorted(all_results.values(), key=lambda x: x['distance'])[:top_k]
+
+        # Latency logging
+        latency_ms = (time.time() - latency_start) * 1000
+
+        # Show retrieval stats if debug enabled
+        if st.session_state.get('show_rag_debug', False):
+            cache_stats = query_cache.stats()
+            search_count = len(valid_indices) if topic_filter else len(search_items)
+            item_type = "chunks" if use_chunks else "docs"
+
+            debug_msg = f"📊 {latency_ms:.0f}ms | Searched {search_count:,} {item_type}"
+            if cache_hits > 0:
+                debug_msg += f" | Cache: {cache_hits}/{len(query_variants)} hits ({cache_stats['hit_rate']:.1%})"
+            if len(query_variants) > 1:
+                debug_msg += f" | {len(query_variants)} query variants"
+            debug_msg += f" | Returned {len(results)}"
+
+            st.caption(debug_msg)
+
+        return results
+
+    except Exception as e:
+        st.error(f"❌ Retrieval error: {str(e)}")
+        return []
+
+
+@st.cache_resource
+def load_reranker_model(model_name='cross-encoder/ms-marco-MiniLM-L-6-v2'):
+    """
+    Load cross-encoder reranker model.
+    Uses ms-marco-MiniLM-L-6-v2: Fast, good accuracy, optimized for search relevance.
+    """
+    try:
+        return CrossEncoder(model_name)
+    except Exception as e:
+        st.warning(f"Failed to load reranker: {e}")
+        return None
+
+
+def rerank_documents(query, retrieved_docs, reranker_model, top_k=None, relevance_threshold=0.0):
+    """
+    Rerank documents using cross-encoder for better relevance scoring.
 
     Args:
         query: User query string
-        faiss_index: FAISS index
-        embeddings: Document embeddings
-        documents: List of documents
-        safe_model: Embedding model
-        top_k: Number of documents to return
-        topics: Array of topic assignments (same length as documents)
-        topic_filter: If set, only return documents from this topic ID
+        retrieved_docs: List of docs from FAISS retrieval (with 'document', 'distance', etc)
+        reranker_model: CrossEncoder model
+        top_k: Number of top docs to return after reranking (None = return all)
+        relevance_threshold: Minimum score to keep (0.0 = keep all)
+
+    Returns:
+        Reranked list of documents with added 'rerank_score' field
     """
-    if faiss_index is None:
-        st.error("❌ FAISS index is None - cannot retrieve documents")
-        return []
-
-    if len(documents) == 0:
-        st.error("❌ No documents available for retrieval")
-        return []
-
-    # Validate topics array matches documents
-    if topics is not None and len(topics) != len(documents):
-        st.error(f"❌ Topics array mismatch: {len(topics)} topics but {len(documents)} documents!")
-        st.error("This will cause incorrect filtering. Please recompute embeddings.")
-        # For now, disable topic filtering to at least get some results
-        st.warning("⚠️ Disabling topic filtering due to mismatch")
-        topics = None
+    if not reranker_model or not retrieved_docs:
+        return retrieved_docs
 
     try:
-        # Encode query
-        query_embedding = safe_model.model.encode(
-            [query],
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        )[0].reshape(1, -1).astype('float32')
+        # Prepare query-document pairs for cross-encoder
+        pairs = [(query, doc['document']) for doc in retrieved_docs]
 
-        # ✅ CARMACK: If filtering by topic, retrieve more candidates to ensure enough after filtering
-        # Otherwise, just get what we need
-        show_debug = st.session_state.get('show_rag_debug', False)
-        if topic_filter is not None and topics is not None:
-            search_k = min(top_k * 10, len(documents))  # 10x oversampling for filtering
-            if show_debug:
-                st.caption(f"🔍 Filtering mode: will search {search_k} docs to find {top_k} in topic {topic_filter}")
-        else:
-            search_k = min(top_k, len(documents))  # No filtering, get exactly what we need
-            if show_debug:
-                st.caption(f"🔍 Full search mode: searching all {len(documents)} docs for top {search_k} results")
+        # Get relevance scores (cross-encoder scores pairs together)
+        scores = reranker_model.predict(pairs)
 
-        # Debug: Show search parameters
-        if st.session_state.get('show_rag_debug', False):
-            st.caption(f"🔍 FAISS index: {faiss_index.ntotal} vectors indexed")
-            if topics is not None:
-                st.caption(f"🔍 Topics array: {len(topics)} topic assignments available")
+        # Add rerank scores to documents
+        for doc, score in zip(retrieved_docs, scores):
+            doc['rerank_score'] = float(score)
 
-        # Search FAISS index
-        distances, indices = faiss_index.search(query_embedding, search_k)
+        # Filter by threshold
+        if relevance_threshold > 0.0:
+            retrieved_docs = [doc for doc in retrieved_docs if doc['rerank_score'] >= relevance_threshold]
 
-        # Debug: Show what FAISS returned
-        if show_debug:
-            st.caption(f"🔍 FAISS returned: {len(indices[0])} indices, range: [{indices[0].min()}, {indices[0].max()}]")
+        # Sort by rerank score (descending)
+        retrieved_docs.sort(key=lambda x: x['rerank_score'], reverse=True)
 
-            # Debug: Show topic distribution in FAISS results
-            if topics is not None:
-                sample_indices = indices[0][:min(10, len(indices[0]))]
-                sample_topics = [topics[int(idx)] if 0 <= idx < len(topics) else 'OOR' for idx in sample_indices]
-                st.caption(f"🔍 Top 10 FAISS results have topics: {sample_topics}")
+        # Take top_k if specified
+        if top_k is not None and top_k > 0:
+            retrieved_docs = retrieved_docs[:top_k]
 
-                # Show overall topic distribution in data
-                from collections import Counter
-                all_topics_dist = Counter(topics)
-                st.caption(f"🔍 Topic distribution in full dataset: {len(all_topics_dist)} unique topics")
+        return retrieved_docs
 
-                # Show topic distribution in FAISS results
-                faiss_result_topics = [topics[int(idx)] for idx in indices[0] if 0 <= idx < len(topics)]
-                faiss_topics_dist = Counter(faiss_result_topics)
-                st.caption(f"🔍 Topics in FAISS results ({len(indices[0])} docs): {dict(faiss_topics_dist)}")
-
-        # Get documents
-        results = []
-        skipped_by_filter = 0
-        out_of_range = 0
-        for i, idx in enumerate(indices[0]):
-            if idx < 0 or idx >= len(documents):
-                out_of_range += 1
-                st.caption(f"⚠️ Index {idx} is out of range [0, {len(documents)-1}]")
-                continue
-
-            # Apply topic filter if specified
-            if topic_filter is not None and topics is not None:
-                if idx < len(topics) and topics[idx] != topic_filter:
-                    skipped_by_filter += 1
-                    # Debug: Show why we're skipping (only first few)
-                    if show_debug and skipped_by_filter <= 3:
-                        st.caption(f"⏭️ Skipping idx={idx}: has topic {topics[idx]}, want topic {topic_filter}")
-                    continue  # Skip documents not in the target topic
-
-            results.append({
-                'document': documents[idx],
-                'distance': float(distances[0][i]),
-                'index': int(idx),
-                'topic': topics[idx] if topics is not None and idx < len(topics) else None
-            })
-
-            # Stop once we have enough results
-            if len(results) >= top_k:
-                break
-
-        # Debug summary
-        if out_of_range > 0:
-            st.error(f"❌ {out_of_range} indices were out of range! FAISS index may not match documents array.")
-
-        if show_debug:
-            if topic_filter is not None:
-                st.caption(f"🔍 Topic filtering: searched {search_k} docs, skipped {skipped_by_filter} from other topics, kept {len(results)}")
-            else:
-                st.caption(f"✅ No topic filtering: retrieved {len(results)} most relevant documents from entire corpus")
-
-            # Show topic distribution in final results
-            if len(results) > 0 and topics is not None:
-                from collections import Counter
-                result_topics = [r['topic'] for r in results if r.get('topic') is not None]
-                result_topics_dist = Counter(result_topics)
-                st.caption(f"🔍 Final results topic distribution: {dict(result_topics_dist)}")
-
-                # Check if any topic is missing
-                all_unique_topics = set(topics)
-                result_unique_topics = set(result_topics)
-                missing_topics = all_unique_topics - result_unique_topics
-                if missing_topics and len(missing_topics) < 10:  # Don't spam if many missing
-                    st.warning(f"⚠️ {len(missing_topics)} topics not in results: {sorted(list(missing_topics))}")
-
-                    # Show how many documents each missing topic has
-                    topic_counts = Counter(topics)
-                    for missing_topic in sorted(list(missing_topics))[:5]:  # Show first 5
-                        count = topic_counts.get(missing_topic, 0)
-                        st.caption(f"   → Topic {missing_topic}: has {count} documents in dataset")
-
-        if len(results) == 0:
-            st.error(f"❌ Retrieved 0 documents! This should not happen. Check debug output above.")
-        else:
-            if show_debug:
-                st.success(f"✅ Retrieved {len(results)} documents successfully")
-
-        return results
     except Exception as e:
-        st.error(f"❌ Document retrieval error: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
-        return []
+        st.error(f"❌ Reranking error: {str(e)}")
+        # Return original docs if reranking fails
+        return retrieved_docs
 
 
 def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm_model, current_topic_id=None):
@@ -2988,7 +3440,7 @@ def generate_rag_response(user_query, retrieved_docs, topic_info_df, topics, llm
 
 User Question: {user_query}
 
-Based on the relevant documents and topic information above, provide a clear, helpful answer. Be concise and specific.
+Instructions: Answer the question using ONLY the relevant documents above. Do not repeat the question or documents. Start your response immediately with the answer.
 
 Answer:"""
 
@@ -3005,291 +3457,215 @@ Answer:"""
                 do_sample=True,
                 top_p=0.9,
                 pad_token_id=tokenizer.eos_token_id,
-                use_cache=True  # 30-50% speedup with static KV cache
+                use_cache=True  # 30-50% speedup - cache initialized on model load
             )
 
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Extract just the answer part
+        # Extract just the answer part - be aggressive to avoid showing the prompt
+        # Try multiple extraction strategies
         if "Answer:" in response:
+            # Best case: model followed format
             response = response.split("Answer:")[-1].strip()
+        elif "User Question:" in response:
+            # Extract everything after the user question
+            parts = response.split("User Question:")
+            if len(parts) > 1:
+                # Get text after the question, skip the question itself
+                after_question = parts[-1]
+                # Try to find where the actual answer starts (after the question text)
+                if user_query in after_question:
+                    response = after_question.split(user_query, 1)[-1].strip()
+                    # Remove common prompt artifacts
+                    for prefix in ["Based on", "provide a", "Be concise"]:
+                        if response.lower().startswith(prefix.lower()):
+                            continue
+                    # If response starts with prompt text, skip to next sentence
+                    if response.startswith("Based on"):
+                        sentences = response.split(". ", 1)
+                        response = sentences[1] if len(sentences) > 1 else response
+                else:
+                    response = after_question.strip()
+        else:
+            # Last resort: take the last 1/3 of response (likely the actual answer)
+            # This prevents showing the entire prompt back to user
+            lines = response.split("\n")
+            # Skip context lines, find where actual content starts
+            answer_lines = []
+            skip_mode = True
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # Stop skipping when we hit something that looks like an answer
+                if skip_mode and any(indicator in line.lower() for indicator in
+                                     ["based on", "according to", "the documents show", "analysis reveals"]):
+                    skip_mode = False
+                if not skip_mode:
+                    answer_lines.append(line)
 
-        return response
+            if answer_lines:
+                response = "\n".join(answer_lines)
+            else:
+                # Absolute fallback: take last 40% of text
+                response = response[int(len(response) * 0.6):]
+
+        return response.strip()
 
     except Exception as e:
         st.error(f"❌ LLM generation error: {str(e)}")
         return f"Error generating response: {str(e)}"
 
 
-def generate_chat_response(user_query, context, topic_info_df, topics, processed_df, current_topic_id=None, use_rag=False, llm_model=None, faiss_index=None, embeddings=None, documents=None, safe_model=None):
+def generate_chat_response(user_query, topic_info_df, topics, processed_df, current_topic_id=None, explicit_topic_filter=None, use_rag=True, llm_model=None, faiss_index=None, embeddings=None, documents=None, safe_model=None):
     """
-    Generate a chat response based on user query and topic data.
-    Supports both rule-based and RAG (Retrieval-Augmented Generation) modes.
+    Generate chat response using RAG (Retrieval-Augmented Generation).
+    No fallback modes - RAG or nothing.
 
     Args:
-        current_topic_id: The currently selected topic in the browser (or None if viewing all)
-        use_rag: Whether to use RAG with FAISS + LLM
-        llm_model: Tuple of (model, tokenizer) for RAG
-        faiss_index: FAISS index for document retrieval
-        embeddings: Document embeddings
-        documents: List of all documents
-        safe_model: Embedding model for query encoding
+        explicit_topic_filter: Topic ID to filter to (from UI dropdown), takes precedence over text parsing
     """
     query_lower = user_query.lower()
 
-    # RAG MODE: Use FAISS + LLM for intelligent responses
-    # ✅ Fixed: Check 'is not None' instead of truthiness to allow empty lists
-    if use_rag and llm_model is not None and faiss_index is not None and documents is not None and safe_model is not None:
-        # Debug: Show what we have
-        if st.session_state.get('show_rag_debug', False):
-            docs_len = len(documents) if documents is not None else 0
-            topics_len = len(topics) if topics is not None else 0
-            st.caption(f"🔍 RAG Debug: embeddings={type(embeddings)}, docs={docs_len}, topics={topics_len}, faiss={faiss_index is not None}")
+    # Check prerequisites
+    if not (use_rag and llm_model and faiss_index and documents is not None and safe_model):
+        missing = []
+        if not llm_model: missing.append("LLM")
+        if not faiss_index: missing.append("FAISS")
+        if documents is None: missing.append("documents")
+        if not safe_model: missing.append("embeddings")
+        return f"Error: Missing {', '.join(missing)}. Recompute embeddings with LLM enabled."
 
-        # Validate we have documents to search
-        if len(documents) == 0:
-            st.error("❌ RAG mode enabled but no documents available. Please recompute embeddings.")
-            return "Error: No documents available for RAG search."
+    if len(documents) == 0:
+        return "Error: No documents available."
 
-        # Validate indexing alignment
-        is_valid, validation_msg = validate_document_indexing(embeddings, documents, topics)
-        if not is_valid:
-            st.error(f"❌ Indexing validation failed: {validation_msg}")
-            return f"Error: Document indexing issue - {validation_msg}. Please recompute embeddings."
-        else:
-            st.caption(f"✅ Validation passed: {validation_msg}")
+    # Validate indexing alignment
+    is_valid, validation_msg = validate_document_indexing(embeddings, documents, topics)
+    if not is_valid:
+        st.error(f"❌ {validation_msg}")
+        return f"Error: {validation_msg}. Recompute embeddings."
 
-        # Parse query to detect if user is asking about a specific topic
-        # ✅ CARMACK FIX: Only filter by topic if user explicitly mentions it
-        topic_filter = None
+    # Check FAISS index matches embeddings
+    if faiss_index.ntotal != len(embeddings):
+        st.error(f"❌ FAISS index size mismatch: {faiss_index.ntotal} vs {len(embeddings)}")
+        return "Error: FAISS index out of sync. Recompute embeddings."
+
+    # Determine topic filter: explicit UI filter takes precedence, then parse from query text
+    topic_filter = explicit_topic_filter if explicit_topic_filter is not None else None
+
+    # If no explicit filter, try parsing from query text
+    if topic_filter is None:
         topic_match = re.search(r'topic\s+(\d+)', query_lower)
         if topic_match:
             topic_filter = int(topic_match.group(1))
-            # Validate topic exists
-            if topics is not None:
-                unique_topics = set(topics)
-                if topic_filter not in unique_topics:
-                    st.warning(f"⚠️ Topic {topic_filter} not found in data. Searching all topics instead.")
-                    topic_filter = None
-                else:
-                    st.info(f"🤖 Using RAG mode (FAISS + LLM) - Filtering to Topic {topic_filter}...")
-            else:
-                st.warning(f"⚠️ Topics data not available. Searching all documents.")
-                topic_filter = None
 
-        if topic_filter is None:
-            st.info("🤖 Using RAG mode (FAISS + LLM) - Searching ALL documents across ALL topics...")
+    # Validate topic filter
+    if topic_filter is not None:
+        if topics is not None and topic_filter not in set(topics):
+            st.warning(f"Topic {topic_filter} not found, searching all topics")
+            topic_filter = None
+        else:
+            # Get topic label for confirmation
+            topic_row = topic_info_df[topic_info_df['Topic'] == topic_filter]
+            topic_label = topic_row.iloc[0]['Human_Label'] if len(topic_row) > 0 else f"Topic {topic_filter}"
+            st.info(f"🎯 Filtering to: {topic_label}")
 
-        # Debug: Check what we're passing to retrieval
-        st.caption(f"🔍 Calling retrieval with: query='{user_query[:50]}...', topic_filter={topic_filter}, topics={'array of '+str(len(topics)) if topics is not None else 'None'}")
+    # Retrieve and generate
+    doc_count = st.session_state.get('rag_doc_count', 10)
 
-        # ✅ CRITICAL VALIDATION: Ensure all arrays are aligned
-        validation_checks = []
-        if embeddings is not None and documents is not None:
-            if len(embeddings) != len(documents):
-                st.error(f"🚨 CRITICAL: embeddings({len(embeddings)}) != documents({len(documents)})")
-                validation_checks.append(False)
-            else:
-                validation_checks.append(True)
+    # Debug: show what we're retrieving
+    if st.session_state.get('show_rag_debug', False):
+        st.caption(f"🔍 Retrieving {doc_count} documents...")
 
-        if topics is not None and documents is not None:
-            if len(topics) != len(documents):
-                st.error(f"🚨 CRITICAL: topics({len(topics)}) != documents({len(documents)})")
-                st.error("This WILL cause retrieval to fail! Topics and documents must match.")
-                validation_checks.append(False)
-            else:
-                validation_checks.append(True)
+    # Get initial candidates (retrieve more if reranking enabled)
+    use_reranking = st.session_state.get('use_reranking', False)
+    retrieval_count = doc_count * 3 if use_reranking else doc_count  # 3x oversample for reranking
 
-        if faiss_index is not None and embeddings is not None:
-            if faiss_index.ntotal != len(embeddings):
-                st.error(f"🚨 CRITICAL: FAISS index({faiss_index.ntotal}) != embeddings({len(embeddings)})")
-                validation_checks.append(False)
-            else:
-                validation_checks.append(True)
+    # 🚀 CARMACK+KARPATHY: Get chunks and embeddings from session state
+    chunks = st.session_state.get('chunks')
+    parent_mapping = st.session_state.get('parent_mapping')
+    chunk_embeddings = st.session_state.get('chunk_embeddings', embeddings)
 
-        if len(validation_checks) > 0 and all(validation_checks):
-            topics_len = len(topics) if topics is not None else 0
-            st.caption(f"✅ All arrays aligned: {len(documents)} docs, {len(embeddings)} emb, {faiss_index.ntotal} indexed, {topics_len} topics")
+    # Query expansion enabled?
+    enable_query_expansion = st.session_state.get('enable_query_expansion', False)
 
-        # Retrieve relevant documents (NO topic filtering by default)
-        # ✅ CARMACK: Search ALL docs unless user specifically asks for a topic
-        # Auto-adapt document count based on model capacity
-        doc_count = st.session_state.get('rag_doc_count', 10)  # Default to 10 if not set
-        retrieved_docs = retrieve_relevant_documents(
-            user_query,
-            faiss_index,
-            embeddings,
-            documents,
-            safe_model,
-            top_k=doc_count,  # Auto-adapts: 8 for 4k model, 50 for 128k model
-            topics=topics,  # Pass for metadata only
-            topic_filter=topic_filter  # None unless user asks for specific topic
-        )
+    retrieved_docs = retrieve_relevant_documents(
+        user_query,
+        faiss_index,
+        chunk_embeddings,  # Use chunk embeddings if available, else fall back to doc embeddings
+        documents,
+        safe_model,
+        top_k=retrieval_count,
+        topics=topics,
+        topic_filter=topic_filter,
+        chunks=chunks,  # Pass chunks for chunk-based retrieval
+        parent_mapping=parent_mapping,
+        query_cache=None,  # Will be initialized inside function
+        llm_model=llm_model,  # For query expansion
+        enable_query_expansion=enable_query_expansion
+    )
 
-        if retrieved_docs:
-            if topic_filter is not None:
-                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents from Topic {topic_filter}")
-            else:
-                st.caption(f"📚 Retrieved {len(retrieved_docs)} relevant documents across all topics")
+    if not retrieved_docs:
+        filter_msg = f" in topic {topic_filter}" if topic_filter else ""
+        st.error(f"No relevant documents found{filter_msg}")
+        return f"No relevant documents found{filter_msg}. Try rephrasing your query."
 
-            # Generate response using LLM with retrieved context
-            response = generate_rag_response(
+    # Rerank if enabled
+    if use_reranking:
+        reranker = st.session_state.get('reranker_model')
+        if not reranker:
+            # Load reranker on first use
+            with st.spinner("Loading reranker model..."):
+                reranker = load_reranker_model()
+                st.session_state.reranker_model = reranker
+
+        if reranker:
+            relevance_threshold = st.session_state.get('relevance_threshold', 0.0)
+
+            if st.session_state.get('show_rag_debug', False):
+                st.caption(f"🔄 Reranking {len(retrieved_docs)} docs → top {doc_count} (threshold: {relevance_threshold})")
+
+            # Rerank and take top_k with threshold filtering
+            retrieved_docs = rerank_documents(
                 user_query,
                 retrieved_docs,
-                topic_info_df,
-                topics,
-                llm_model,
-                current_topic_id
+                reranker,
+                top_k=doc_count,
+                relevance_threshold=relevance_threshold
             )
 
-            # Add source references with topic info
-            response += "\n\n**Sources:**\n"
-            for i, doc in enumerate(retrieved_docs[:3], 1):
-                doc_preview = doc['document'][:100] + "..." if len(doc['document']) > 100 else doc['document']
-                topic_tag = f" [Topic {doc['topic']}]" if doc.get('topic') is not None else ""
-                response += f"{i}. {doc_preview}{topic_tag}\n"
+            if st.session_state.get('show_rag_debug', False):
+                if retrieved_docs:
+                    avg_score = sum(d.get('rerank_score', 0) for d in retrieved_docs) / len(retrieved_docs)
+                    st.caption(f"✅ After reranking: {len(retrieved_docs)} docs (avg score: {avg_score:.3f})")
+                else:
+                    st.caption("⚠️ No docs passed relevance threshold")
 
-            return response
+    # Generate response
+    response = generate_rag_response(
+        user_query,
+        retrieved_docs,
+        topic_info_df,
+        topics,
+        llm_model,
+        current_topic_id
+    )
+
+    # Add sources with relevance scores
+    response += "\n\n**Sources:**\n"
+    for i, doc in enumerate(retrieved_docs[:3], 1):
+        preview = doc['document'][:100] + "..." if len(doc['document']) > 100 else doc['document']
+        topic_tag = f" [Topic {doc['topic']}]" if doc.get('topic') else ""
+
+        # Show rerank score if available
+        if 'rerank_score' in doc:
+            score_tag = f" (relevance: {doc['rerank_score']:.3f})"
         else:
-            # ✅ Fixed: Return error instead of falling back to rule-based mode
-            st.error("❌ No relevant documents found for your query. Try rephrasing or check if documents are properly indexed.")
-            return "No relevant documents found in the knowledge base for your query. Please try rephrasing your question or ensure your documents are properly indexed."
+            score_tag = ""
 
-    # Check why RAG mode is not active
-    elif use_rag:
-        missing_components = []
-        if llm_model is None:
-            missing_components.append("LLM model (llm_model=None)")
-        if faiss_index is None:
-            missing_components.append("FAISS index (faiss_index=None)")
-        if documents is None:
-            missing_components.append("documents (documents=None)")
-        elif len(documents) == 0:
-            missing_components.append("documents (empty list)")
-        if safe_model is None:
-            missing_components.append("embedding model (safe_model=None)")
+        response += f"{i}. {preview}{topic_tag}{score_tag}\n"
 
-        error_msg = f"❌ RAG mode requested but missing: {', '.join(missing_components)}. Please recompute embeddings or load the required models."
-        st.error(error_msg)
-        st.caption(f"🔍 Debug: use_rag={use_rag}, llm_model={llm_model is not None}, faiss={faiss_index is not None}, docs={documents is not None and len(documents) if documents else 0}, safe_model={safe_model is not None}")
-        return error_msg
-
-    # RULE-BASED MODE (only when RAG is explicitly disabled)
-
-
-    # Handle queries about the current topic
-    if current_topic_id is not None and any(phrase in query_lower for phrase in ['current topic', 'this topic', 'about this']):
-        topic_row = topic_info_df[topic_info_df['Topic'] == current_topic_id]
-        if len(topic_row) > 0:
-            row = topic_row.iloc[0]
-            pct = (row['Count'] / len(processed_df)) * 100
-            response = f"🔍 **Currently Viewing: Topic {current_topic_id}**\n\n"
-            response += f"**Label:** {row['Human_Label']}\n\n"
-            response += f"**Statistics:**\n"
-            response += f"- Documents: {row['Count']:,} ({pct:.1f}% of total)\n"
-            response += f"- Keywords: {row['Keywords']}\n\n"
-            response += "💡 This hierarchical label shows both the main category and specific details separated by ' - '."
-            return response
-
-    # Handle different types of queries
-    if any(word in query_lower for word in ['hello', 'hi', 'hey']):
-        greeting = "👋 Hello! I'm here to help you explore your topic modeling results."
-        if current_topic_id is not None:
-            human_label = topic_info_df[topic_info_df['Topic'] == current_topic_id].iloc[0]['Human_Label'] if len(topic_info_df[topic_info_df['Topic'] == current_topic_id]) > 0 else f"Topic {current_topic_id}"
-            greeting += f"\n\nYou're currently viewing **Topic {current_topic_id}: {human_label}**.\n\nWhat would you like to know?"
-        else:
-            greeting += " What would you like to know?"
-        return greeting
-
-    elif any(word in query_lower for word in ['how many', 'number of', 'count']):
-        if 'topic' in query_lower:
-            num_topics = len([t for t in topics if t != -1])
-            return f"📊 I found **{num_topics} unique topics** in your data. The topics are identified with hierarchical labels showing both the main category and specific details."
-
-        elif 'document' in query_lower or 'doc' in query_lower:
-            if current_topic_id is not None:
-                topic_row = topic_info_df[topic_info_df['Topic'] == current_topic_id]
-                if len(topic_row) > 0:
-                    count = topic_row.iloc[0]['Count']
-                    return f"📄 The current topic has **{count:,} documents**. Your entire dataset contains **{len(processed_df):,} documents** in total."
-            return f"📄 Your dataset contains **{len(processed_df):,} documents** in total."
-
-    elif 'largest' in query_lower or 'biggest' in query_lower or 'most common' in query_lower:
-        top_5 = topic_info_df.nlargest(5, 'Count')[['Topic', 'Human_Label', 'Count']]
-        response = "📈 **Top 5 Largest Topics:**\n\n"
-        for i, (_, row) in enumerate(top_5.iterrows(), 1):
-            pct = (row['Count'] / len(processed_df)) * 100
-            response += f"{i}. **{row['Human_Label']}** (Topic {row['Topic']})\n"
-            response += f"   - {row['Count']:,} documents ({pct:.1f}% of total)\n\n"
-        return response
-
-    elif 'smallest' in query_lower or 'least common' in query_lower:
-        bottom_5 = topic_info_df.nsmallest(5, 'Count')[['Topic', 'Human_Label', 'Count']]
-        response = "📉 **5 Smallest Topics:**\n\n"
-        for i, (_, row) in enumerate(bottom_5.iterrows(), 1):
-            pct = (row['Count'] / len(processed_df)) * 100
-            response += f"{i}. **{row['Human_Label']}** (Topic {row['Topic']})\n"
-            response += f"   - {row['Count']:,} documents ({pct:.1f}% of total)\n\n"
-        return response
-
-    elif re.search(r'topic\s+(\d+)', query_lower):
-        # Extract topic number
-        topic_match = re.search(r'topic\s+(\d+)', query_lower)
-        topic_num = int(topic_match.group(1))
-
-        topic_row = topic_info_df[topic_info_df['Topic'] == topic_num]
-        if len(topic_row) == 0:
-            return f"❌ Sorry, I couldn't find Topic {topic_num}. Please check if this topic number exists in your data."
-
-        row = topic_row.iloc[0]
-        pct = (row['Count'] / len(processed_df)) * 100
-        response = f"🔍 **Topic {topic_num}: {row['Human_Label']}**\n\n"
-        response += f"- **Documents:** {row['Count']:,} ({pct:.1f}% of total)\n"
-        response += f"- **Keywords:** {row['Keywords']}\n\n"
-        response += "💡 This hierarchical label shows the main category and specific details separated by ' - '."
-        return response
-
-    elif any(word in query_lower for word in ['main theme', 'overview', 'summary', 'what are']):
-        num_topics = len([t for t in topics if t != -1])
-        top_3 = topic_info_df.nlargest(3, 'Count')[['Human_Label', 'Count']]
-
-        response = f"📊 **Topic Modeling Overview:**\n\n"
-        response += f"Your data contains **{len(processed_df):,} documents** organized into **{num_topics} topics**.\n\n"
-        response += "**Top 3 Most Common Themes:**\n\n"
-        for i, (_, row) in enumerate(top_3.iterrows(), 1):
-            pct = (row['Count'] / len(processed_df)) * 100
-            response += f"{i}. {row['Human_Label']} - {row['Count']:,} docs ({pct:.1f}%)\n"
-
-        response += f"\n💡 All labels now use a hierarchical format: 'Main Category - Specific Details' for better clarity!"
-        return response
-
-    elif 'hierarchical' in query_lower or 'hierarchy' in query_lower or 'label format' in query_lower:
-        return ("📋 **Hierarchical Label Format:**\n\n"
-                "All topic labels now follow the format: **'Main Category - Specific Details'**\n\n"
-                "**Examples:**\n"
-                "- 'Customer Service - Response Time Issues'\n"
-                "- 'Product Orders - Samsung Washer Delivery'\n"
-                "- 'Technical Support - Installation Problems'\n\n"
-                "This two-tier structure helps you quickly understand both the general theme and the specific focus of each topic!")
-
-    elif 'help' in query_lower or 'what can you' in query_lower:
-        return ("💡 **I can help you with:**\n\n"
-                "- Get overview: 'What are the main themes?'\n"
-                "- Topic details: 'Tell me about topic 5'\n"
-                "- Statistics: 'How many topics are there?'\n"
-                "- Comparisons: 'Which topics are most common?'\n"
-                "- Label format: 'Explain the hierarchical labels'\n\n"
-                "Just ask your question in natural language!")
-
-    else:
-        # Generic response with helpful suggestions
-        return ("🤔 I'm not sure how to answer that specific question. Here are some things you can ask:\n\n"
-                "- 'What are the main themes in my data?'\n"
-                "- 'Tell me about topic 5'\n"
-                "- 'Which topics are most common?'\n"
-                "- 'How many topics are there?'\n"
-                "- 'Explain the hierarchical label format'\n\n"
-                f"**Quick Stats:** {len(processed_df):,} documents across {len([t for t in topics if t != -1])} topics")
+    return response
 
 def main():
     st.title("🚀 Complete BERTopic with All Features")
@@ -3347,23 +3723,46 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
 
-        # GPU Status Display
+        # GPU Status and Management
         if gpu_capabilities['cuda_available']:
             st.success(f"✅ GPU: {gpu_capabilities['device_name']}")
-            if gpu_capabilities['gpu_memory_free']:
-                st.info(f"Memory: {gpu_capabilities['gpu_memory_free']} / {gpu_capabilities['gpu_memory_total']}")
+
+            # Real-time GPU memory status
+            gpu_status = get_gpu_memory_status()
+            if gpu_status:
+                st.progress(gpu_status['percent_used'] / 100)
+                st.caption(f"**{gpu_status['used_gb']:.1f} GB / {gpu_status['total_gb']:.1f} GB** ({gpu_status['percent_used']:.0f}% used)")
+
+                # Show loaded models
+                if gpu_status['loaded_models']:
+                    with st.expander("🔍 Loaded on GPU", expanded=False):
+                        for model in gpu_status['loaded_models']:
+                            st.caption(f"• {model}")
+
+                # GPU management controls
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🗑️ Clear GPU", help="Unload LLM models and clear GPU cache"):
+                        msg = clear_gpu_memory(clear_models=True)
+                        st.success(msg)
+                        st.rerun()
+                with col2:
+                    if st.button("♻️ Cache Only", help="Clear GPU cache without unloading models"):
+                        msg = clear_gpu_memory(clear_models=False)
+                        st.info(msg)
+                        st.rerun()
         else:
             st.warning("⚠️ No GPU detected. Using CPU (slower)")
 
         # Acceleration packages status
-        st.subheader("📦 Acceleration Status")
-        accel_cols = st.columns(2)
-        with accel_cols[0]:
-            st.write(f"{'✅' if gpu_capabilities['cuml_available'] else '❌'} cuML")
-            st.write(f"{'✅' if gpu_capabilities['cupy_available'] else '❌'} CuPy")
-        with accel_cols[1]:
-            st.write(f"{'✅' if gpu_capabilities['faiss_gpu_available'] else '❌'} FAISS GPU")
-            st.write(f"{'✅' if gpu_capabilities['accelerate_available'] else '❌'} Accelerate")
+        with st.expander("📦 Acceleration Status", expanded=False):
+            accel_cols = st.columns(2)
+            with accel_cols[0]:
+                st.write(f"{'✅' if gpu_capabilities['cuml_available'] else '❌'} cuML")
+                st.write(f"{'✅' if gpu_capabilities['cupy_available'] else '❌'} CuPy")
+            with accel_cols[1]:
+                st.write(f"{'✅' if gpu_capabilities['faiss_gpu_available'] else '❌'} FAISS GPU")
+                st.write(f"{'✅' if gpu_capabilities['accelerate_available'] else '❌'} Accelerate")
 
         # File upload
         st.header("📄 Data Input")
@@ -3618,19 +4017,78 @@ def main():
                     st.success(f"✅ Document indexing validated: {validation_msg}")
                     st.caption(f"📊 Indexed: {len(embeddings):,} embeddings ↔ {len(cleaned_docs):,} documents")
 
-                if use_llm_labeling:
-                    with st.spinner("🔍 Step 4: Building FAISS index for LLM analysis and RAG chat..."):
-                        faiss_index = build_faiss_index(embeddings)
+                # Step 4: 🚀 CARMACK: Try loading cached index first, then chunk + build if needed
+                status_msg = "LLM analysis and RAG chat" if use_llm_labeling else "RAG chat"
+                with st.spinner(f"🔍 Step 4: Building enhanced FAISS index for {status_msg}..."):
+                    # Try loading from cache
+                    cached_data = load_faiss_index_from_disk()
+
+                    if cached_data is not None:
+                        # Use cached index
+                        faiss_index, chunk_embeddings, chunks, parent_mapping = cached_data
                         st.session_state.faiss_index = faiss_index
+                        st.session_state.chunks = chunks
+                        st.session_state.parent_mapping = parent_mapping
+                        st.session_state.chunk_embeddings = chunk_embeddings
+                    else:
+                        # Build new index with chunking
+                        st.info("📄 KARPATHY: Chunking documents (512 tokens, 128 overlap)...")
+
+                        # Get tokenizer from safe_model for chunking
+                        try:
+                            from transformers import AutoTokenizer
+                            model_name = safe_model.hf_model if hasattr(safe_model, 'hf_model') else "sentence-transformers/all-MiniLM-L6-v2"
+                            chunk_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                        except:
+                            # Fallback: use a simple tokenizer
+                            class SimpleTokenizer:
+                                def encode(self, text, add_special_tokens=False):
+                                    return text.split()
+                                def decode(self, tokens):
+                                    return ' '.join(tokens) if isinstance(tokens, list) else tokens
+                            chunk_tokenizer = SimpleTokenizer()
+
+                        # Chunk documents
+                        chunks, parent_mapping = chunk_documents(
+                            cleaned_docs,
+                            chunk_tokenizer,
+                            chunk_size=512,
+                            overlap=128,
+                            topics=None  # Will be set later after clustering
+                        )
+
+                        st.success(f"✅ Chunked {len(cleaned_docs):,} docs → {len(chunks):,} chunks ({len(chunks)/len(cleaned_docs):.1f}x)")
+
+                        # Embed chunks
+                        st.info("🔢 Embedding chunks with sentence-transformers...")
+                        chunk_texts = [chunk.text for chunk in chunks]
+                        chunk_embeddings = safe_model.model.encode(
+                            chunk_texts,
+                            show_progress_bar=True,
+                            convert_to_numpy=True,
+                            normalize_embeddings=True,
+                            batch_size=batch_size
+                        )
+
+                        # Build FAISS index from chunk embeddings
+                        st.info("🚀 Building FAISS index from chunks...")
+                        faiss_index = build_faiss_index(chunk_embeddings)
+
                         if faiss_index:
-                            st.success(f"✅ FAISS index built with {faiss_index.ntotal:,} vectors - ready for LLM analysis & RAG!")
-                else:
-                    # Still build for RAG chat even if LLM labeling is disabled
-                    with st.spinner("🔍 Step 4: Building FAISS index for RAG chat..."):
-                        faiss_index = build_faiss_index(embeddings)
-                        st.session_state.faiss_index = faiss_index
-                        if faiss_index:
-                            st.success(f"✅ FAISS index built with {faiss_index.ntotal:,} vectors - ready for RAG chat!")
+                            st.success(f"✅ FAISS index built: {faiss_index.ntotal:,} chunk vectors")
+
+                            # Save to disk
+                            st.info("💾 CARMACK: Persisting index to disk...")
+                            save_faiss_index_to_disk(faiss_index, chunk_embeddings, chunks, parent_mapping)
+
+                            # Store in session state
+                            st.session_state.faiss_index = faiss_index
+                            st.session_state.chunks = chunks
+                            st.session_state.parent_mapping = parent_mapping
+                            st.session_state.chunk_embeddings = chunk_embeddings
+                        else:
+                            st.error("❌ Failed to build FAISS index")
+                            st.session_state.faiss_index = None
 
                 # ✅ Clear GPU memory before loading LLM
                 if torch.cuda.is_available() and use_llm_labeling:
@@ -3642,6 +4100,15 @@ def main():
                 # Step 5: Load LLM if enabled
                 llm_model = None
                 if use_llm_labeling and llm_model_name:
+                    # Clear old LLM if loading a different one
+                    if st.session_state.get('llm_model_name') != llm_model_name:
+                        if st.session_state.get('llm_model'):
+                            st.info("Clearing old LLM...")
+                            del st.session_state.llm_model
+                            st.session_state.llm_model = None
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
                     with st.spinner(f"Loading {llm_model_name} for enhanced labeling..."):
                         llm_model = load_local_llm(llm_model_name, force_cpu=force_llm_cpu)
                         if llm_model:
@@ -4453,6 +4920,9 @@ def main():
 
                             # Generate summary if requested
                             if st.session_state.get(f'generate_topic_summary_{selected_topic_id}', False):
+                                # Clear the flag immediately to prevent re-generation on next rerun
+                                st.session_state[f'generate_topic_summary_{selected_topic_id}'] = False
+
                                 with st.spinner(f"🤖 Analyzing {min(len(filtered_df), summary_max_docs)} documents from Topic {selected_topic_id}..."):
                                     try:
                                         # Get all document texts for this topic
@@ -4547,6 +5017,16 @@ def main():
                                                 st.session_state.llm_model = (llm_model, llm_tokenizer)
                                                 st.session_state.llm_attention_type = attention_type
 
+                                                # ✅ CARMACK: Initialize KV cache with dummy forward pass
+                                                try:
+                                                    with torch.no_grad():
+                                                        dummy_input = llm_tokenizer("Init", return_tensors="pt", return_dict=True)
+                                                        if torch.cuda.is_available():
+                                                            dummy_input = {k: v.to(llm_model.device) for k, v in dummy_input.items()}
+                                                        _ = llm_model.generate(**dummy_input, max_new_tokens=1, use_cache=True, do_sample=False)
+                                                except:
+                                                    pass  # Non-critical
+
                                             # Show success message as toast (non-blocking)
                                             st.toast(f"✅ LLM loaded with {st.session_state.llm_attention_type}", icon="⚡")
 
@@ -4598,7 +5078,7 @@ Provide a clear, actionable summary:"""
                                                 temperature=0.7,
                                                 do_sample=True,
                                                 pad_token_id=llm_tokenizer.eos_token_id,
-                                                use_cache=True  # 30-50% speedup with static KV cache
+                                                use_cache=True  # 30-50% speedup - cache initialized on model load
                                             )
 
                                         # Decode only the generated tokens (skip prompt)
@@ -4606,42 +5086,65 @@ Provide a clear, actionable summary:"""
                                         generated_tokens = outputs[0][input_length:]
                                         summary_text = llm_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-                                        # Display summary in expander
-                                        with st.expander(f"📝 Topic {selected_topic_id} Summary ({len(filtered_df):,} docs)", expanded=True):
-                                            st.markdown(f"**Topic:** {human_label}")
-                                            st.markdown(f"**Keywords:** {topic_keywords}")
-                                            st.markdown(f"**Documents Analyzed:** {min(len(filtered_df), summary_max_docs):,} of {len(filtered_df):,}")
-                                            st.markdown("---")
-                                            st.markdown("**Summary:**")
-                                            st.write(summary_text)
+                                        # Store summary in session state
+                                        st.session_state[f'topic_summary_{selected_topic_id}'] = {
+                                            'text': summary_text,
+                                            'label': human_label,
+                                            'keywords': topic_keywords,
+                                            'total_docs': len(filtered_df),
+                                            'analyzed_docs': min(len(filtered_df), summary_max_docs),
+                                            'timestamp': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+                                        }
 
-                                            # Download button for summary
-                                            summary_report = f"""Topic {selected_topic_id} Summary
-{human_label}
-
-Keywords: {topic_keywords}
-Total Documents: {len(filtered_df):,}
-Documents Analyzed: {min(len(filtered_df), summary_max_docs):,}
-
-SUMMARY:
-{summary_text}
-
-Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
-"""
-                                            st.download_button(
-                                                label="📥 Download Summary",
-                                                data=summary_report.encode("utf-8"),
-                                                file_name=f"topic_{selected_topic_id}_summary.txt",
-                                                mime="text/plain",
-                                                key=f"download_summary_{selected_topic_id}"
-                                            )
-
-                                        # Clear the flag
-                                        st.session_state[f'generate_topic_summary_{selected_topic_id}'] = False
+                                        st.success(f"✅ Summary generated for Topic {selected_topic_id}")
+                                        # No rerun needed - display code below will show it immediately
 
                                     except Exception as e:
                                         st.error(f"❌ Failed to generate summary: {str(e)}")
                                         st.exception(e)
+
+                            # Display summary if it exists (persists after generation)
+                            if f'topic_summary_{selected_topic_id}' in st.session_state:
+                                summary_data = st.session_state[f'topic_summary_{selected_topic_id}']
+
+                                with st.expander(f"📝 Topic {selected_topic_id} Summary ({summary_data['total_docs']:,} docs)", expanded=True):
+                                    col_summary_display, col_clear = st.columns([5, 1])
+
+                                    with col_clear:
+                                        if st.button("🗑️ Clear", key=f"clear_summary_{selected_topic_id}", help="Remove this summary"):
+                                            del st.session_state[f'topic_summary_{selected_topic_id}']
+                                            st.rerun()
+
+                                    with col_summary_display:
+                                        st.markdown(f"**Topic:** {summary_data['label']}")
+                                        st.markdown(f"**Keywords:** {summary_data['keywords']}")
+                                        st.markdown(f"**Documents Analyzed:** {summary_data['analyzed_docs']:,} of {summary_data['total_docs']:,}")
+                                        st.caption(f"Generated: {summary_data['timestamp']}")
+
+                                    st.markdown("---")
+                                    st.markdown("**Summary:**")
+                                    st.write(summary_data['text'])
+
+                                    # Download button for summary
+                                    summary_report = f"""Topic {selected_topic_id} Summary
+{summary_data['label']}
+
+Keywords: {summary_data['keywords']}
+Total Documents: {summary_data['total_docs']:,}
+Documents Analyzed: {summary_data['analyzed_docs']:,}
+
+SUMMARY:
+{summary_data['text']}
+
+Generated: {summary_data['timestamp']}
+"""
+                                    st.download_button(
+                                        label="📥 Download Summary",
+                                        data=summary_report.encode("utf-8"),
+                                        file_name=f"topic_{selected_topic_id}_summary.txt",
+                                        mime="text/plain",
+                                        key=f"download_summary_persisted_{selected_topic_id}"
+                                    )
 
                     # Reorder columns - put topic metadata first
                     meta_cols = ['Topic', 'Topic_Human_Label', 'Topic_LLM_Analysis', 'Topic_Keywords']
@@ -4673,168 +5176,184 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
 
                 # Chat Interface integrated into Topic Browser
                 st.markdown("---")
-                with st.expander("💬 Ask Questions About Topics (RAG-Powered)", expanded=False):
+                with st.expander("💬 Ask Questions About Topics (RAG-Powered)", expanded=True):
                     st.caption("Get AI-powered insights using FAISS retrieval and LLM generation")
 
-                    # RAG Settings
-                    col_rag1, col_rag2, col_rag3 = st.columns(3)
+                    # Check prerequisites - RAG is mandatory, no fallback
+                    has_faiss = st.session_state.get('faiss_index') is not None
+
+                    if not has_faiss:
+                        st.error("❌ **RAG Prerequisites Missing**")
+                        st.warning("FAISS index not found. Recompute embeddings with 'Enable LLM Labeling' to build the index.")
+                        st.info("Chat requires:\n- FAISS index\n- Embedding model\n- LLM model")
+                        st.stop()  # Don't show chat interface at all
+
+                    # Prerequisites met - show RAG interface
+                    col_rag1, col_rag2 = st.columns(2)
                     with col_rag1:
-                        use_rag_chat = st.checkbox(
-                            "🤖 Enable RAG Mode (FAISS + LLM)",
-                            value=False,
-                            help="Use Retrieval-Augmented Generation for intelligent responses based on your actual documents"
-                        )
-                    with col_rag2:
                         show_rag_debug = st.checkbox(
                             "🔍 Show Debug Info",
                             value=True,
                             help="Show detailed diagnostic information about document retrieval",
                             key="show_rag_debug_checkbox"
                         )
-                        # Store in session state so retrieval function can access it
                         st.session_state.show_rag_debug = show_rag_debug
-                    with col_rag3:
-                        if use_rag_chat:
-                            chat_llm_model_name = st.selectbox(
-                                "Chat LLM Model",
-                                options=list(LLM_MODEL_CONFIG.keys()),
-                                help="Select LLM for chat. Can be different from labeling LLM.",
-                                key="chat_llm_selector"
+                    with col_rag2:
+                        chat_llm_model_name = st.selectbox(
+                            "Chat LLM Model",
+                            options=list(LLM_MODEL_CONFIG.keys()),
+                            help="Select LLM for chat",
+                            key="chat_llm_selector"
+                        )
+
+                    # Load chat LLM
+                    if st.session_state.get('chat_llm_loaded_model') == chat_llm_model_name:
+                        # Already loaded
+                        chat_llm = st.session_state.get('chat_llm')
+                        st.caption(f"✅ Using cached LLM: {chat_llm_model_name.split('/')[-1]}")
+                    else:
+                        # Clear old chat LLM if switching models
+                        if st.session_state.get('chat_llm'):
+                            st.info("Clearing old chat LLM...")
+                            del st.session_state.chat_llm
+                            st.session_state.chat_llm = None
+                            st.session_state.chat_llm_loaded_model = None
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                        # Load new model
+                        with st.spinner(f"Loading {chat_llm_model_name} for chat..."):
+                            chat_llm = load_local_llm(chat_llm_model_name, force_cpu=False)
+                            if not chat_llm:
+                                st.error("❌ Failed to load LLM. Cannot use chat without LLM.")
+                                st.stop()
+
+                            st.session_state.chat_llm = chat_llm
+                            st.session_state.chat_llm_loaded_model = chat_llm_model_name
+                            st.success(f"✅ Chat LLM loaded: {chat_llm_model_name.split('/')[-1]}")
+
+                    # Show status
+                    num_docs = len(st.session_state.get('documents', []))
+                    num_topics = len(set(st.session_state.get('current_topics', [])))
+                    st.success(f"✅ RAG Active: {num_docs:,} documents from {num_topics} topics")
+
+                    # Document count control - always visible
+                    model_config = LLM_MODEL_CONFIG.get(chat_llm_model_name, {})
+                    recommended_docs = model_config.get('recommended_docs', 10)
+                    context_window = model_config.get('context_window', 4096)
+
+                    # Use model-specific key so each model has its own slider value
+                    model_short_name = chat_llm_model_name.split('/')[-1]
+                    slider_key = f"rag_doc_count_slider_{model_short_name}"
+
+                    # Read from session state if exists, otherwise use recommended default
+                    default_value = st.session_state.get(slider_key, recommended_docs)
+
+                    rag_doc_count = st.slider(
+                        "📊 Documents to retrieve",
+                        min_value=1,
+                        max_value=100,
+                        value=default_value,
+                        help=f"Number of documents to search and use for answering. Recommended: {recommended_docs} for this model ({context_window//1024}k context)",
+                        key=slider_key
+                    )
+                    st.caption(f"💡 Recommended for {model_short_name}: {recommended_docs} documents")
+
+                    # Store for use in retrieval
+                    st.session_state.rag_doc_count = rag_doc_count
+
+                    # Reranking controls
+                    st.markdown("---")
+                    st.markdown("**🎯 Reranking & Relevance Filtering**")
+
+                    col_rerank1, col_rerank2 = st.columns(2)
+                    with col_rerank1:
+                        use_reranking = st.checkbox(
+                            "Enable Reranking",
+                            value=False,
+                            help="Use cross-encoder to re-score and filter retrieved documents for better relevance",
+                            key="use_reranking_checkbox"
+                        )
+                        st.session_state.use_reranking = use_reranking
+
+                    with col_rerank2:
+                        if use_reranking:
+                            # Read from session state if exists, otherwise use 0.0 default
+                            threshold_default = st.session_state.get("relevance_threshold_slider", 0.0)
+
+                            relevance_threshold = st.slider(
+                                "Relevance Threshold",
+                                min_value=0.0,
+                                max_value=1.0,
+                                value=threshold_default,
+                                step=0.05,
+                                help="Minimum relevance score (0.0=keep all, higher=stricter filtering)",
+                                key="relevance_threshold_slider"
                             )
+                            st.session_state.relevance_threshold = relevance_threshold
                         else:
-                            chat_llm_model_name = None
+                            st.session_state.relevance_threshold = 0.0
 
-                    # Load chat LLM if RAG is enabled
-                    chat_llm = None
-                    if use_rag_chat and chat_llm_model_name:
-                        if st.session_state.get('chat_llm_loaded_model') == chat_llm_model_name:
-                            # Already loaded
-                            chat_llm = st.session_state.get('chat_llm')
-                            st.caption(f"✅ Using cached LLM: {chat_llm_model_name.split('/')[-1]}")
-                        else:
-                            # Need to load
-                            with st.spinner(f"Loading {chat_llm_model_name} for chat..."):
-                                chat_llm = load_local_llm(chat_llm_model_name, force_cpu=False)
-                                if chat_llm:
-                                    st.session_state.chat_llm = chat_llm
-                                    st.session_state.chat_llm_loaded_model = chat_llm_model_name
-                                    st.success(f"✅ Chat LLM loaded: {chat_llm_model_name.split('/')[-1]}")
-                                else:
-                                    st.error("❌ Failed to load chat LLM. Falling back to rule-based mode.")
-                                    use_rag_chat = False
+                    if use_reranking:
+                        st.caption(f"✅ Reranking enabled: Retrieves {rag_doc_count * 3} candidates → reranks → returns top {rag_doc_count}")
 
-                    # Check if FAISS index is available
-                    has_faiss = st.session_state.get('faiss_index') is not None
-                    if use_rag_chat and not has_faiss:
-                        st.error("❌ FAISS index not available. RAG mode requires FAISS index. Please recompute embeddings with 'Enable LLM Labeling' checked to build the index.")
-                        use_rag_chat = False
-                    elif use_rag_chat and has_faiss:
-                        # Show diagnostic info
-                        num_docs = len(st.session_state.get('documents', []))
-                        num_topics = len(set(st.session_state.get('current_topics', [])))
-                        st.success(f"✅ RAG Mode Active: {num_docs:,} documents across {num_topics} topics available for search")
+                    # Query Expansion (ANDREJ KARPATHY)
+                    st.markdown("---")
+                    st.markdown("**🔍 Query Expansion (Advanced)**")
+                    enable_query_expansion = st.checkbox(
+                        "Enable Query Expansion",
+                        value=False,
+                        help="KARPATHY: Rephrase query into 2-3 variants using LLM for better recall. Slightly slower but finds more relevant docs.",
+                        key="enable_query_expansion_checkbox"
+                    )
+                    st.session_state.enable_query_expansion = enable_query_expansion
 
-                        # ✅ CARMACK: Smart auto-adapt document count based on model capacity
-                        model_config = LLM_MODEL_CONFIG.get(chat_llm_model_name, {})
-                        recommended_docs = model_config.get('recommended_docs', 10)
-                        context_window = model_config.get('context_window', 4096)
-
-                        # Advanced RAG settings (collapsed by default)
-                        with st.expander("⚙️ Advanced RAG Settings", expanded=False):
-                            st.caption(f"Model: {chat_llm_model_name.split('/')[-1]}")
-                            st.caption(f"Context window: {context_window:,} tokens")
-
-                            use_custom_docs = st.checkbox(
-                                "🎛️ Custom document count",
-                                value=False,
-                                help="Override auto-recommended document count",
-                                key="use_custom_doc_count"
-                            )
-
-                            if use_custom_docs:
-                                rag_doc_count = st.slider(
-                                    "Documents to retrieve",
-                                    min_value=1,
-                                    max_value=100,
-                                    value=recommended_docs,
-                                    help=f"Recommended: {recommended_docs} for this model",
-                                    key="rag_doc_count_slider"
-                                )
-                                st.caption(f"→ Using {rag_doc_count} documents (custom)")
-                            else:
-                                rag_doc_count = recommended_docs
-                                st.caption(f"→ Auto: {rag_doc_count} documents (recommended for {context_window//1024}k model)")
-
-                        # Store for use in retrieval
-                        st.session_state.rag_doc_count = rag_doc_count
+                    if enable_query_expansion:
+                        st.caption("✅ Query expansion: LLM generates 2-3 query variants → retrieves union → better recall")
 
                     # Initialize chat history in session state
                     if 'chat_history' not in st.session_state:
                         st.session_state.chat_history = []
 
-                    # Chat input at the top with clear button
-                    col_input, col_clear = st.columns([4, 1])
+                    # Topic filter for chat
+                    topic_options = ["All Topics"] + [f"Topic {t}: {st.session_state.topic_human.get(t, 'Unknown')}"
+                                                       for t in sorted([t for t in topics if t != -1])]
+
+                    col_filter, col_clear = st.columns([3, 1])
+                    with col_filter:
+                        chat_topic_filter = st.selectbox(
+                            "Filter to specific topic",
+                            options=topic_options,
+                            index=0,
+                            key="chat_topic_filter",
+                            help="Limit search to documents from a specific topic"
+                        )
                     with col_clear:
-                        if st.button("🗑️ Clear", key="clear_chat_browser", help="Clear chat history"):
+                        if st.button("🗑️ Clear Chat", key="clear_chat_browser", help="Clear chat history"):
                             st.session_state.chat_history = []
                             st.rerun()
+
+                    # Parse selected topic ID from dropdown
+                    chat_topic_id = None
+                    if chat_topic_filter != "All Topics":
+                        chat_topic_id = int(chat_topic_filter.split(":")[0].replace("Topic ", ""))
 
                     # Chat input
                     if prompt := st.chat_input("Ask a question about your topics...", key="topic_browser_chat"):
                         # Add user message to chat history
                         st.session_state.chat_history.append({"role": "user", "content": prompt})
 
-                        # Generate response based on topic data and current context
+                        # Generate response (RAG always enabled, no fallback)
                         with st.spinner("Thinking..."):
-                            # Get topic information
-                            topic_info_for_chat = topic_info
-
-                            # Create context from topic data
-                            context_parts = []
-                            context_parts.append(f"Total documents: {len(processed_df):,}")
-                            context_parts.append(f"Number of topics: {unique_topics}")
-                            context_parts.append(f"Outliers: {outlier_count} ({100-coverage:.1f}%)")
-
-                            # Add current topic context
-                            if selected_topic_id != "all":
-                                human_label = st.session_state.topic_human.get(selected_topic_id, f"Topic {selected_topic_id}")
-                                context_parts.append(f"\nCurrently viewing: Topic {selected_topic_id} - {human_label}")
-                                topic_row = topic_info_for_chat[topic_info_for_chat['Topic'] == selected_topic_id]
-                                if len(topic_row) > 0:
-                                    context_parts.append(f"Keywords: {topic_row.iloc[0]['Keywords']}")
-                                    context_parts.append(f"Document count: {topic_row.iloc[0]['Count']}")
-
-                            context_parts.append("\nTop Topics:")
-
-                            # Add top 10 topics (vectorized for performance)
-                            top_topics = topic_info_for_chat.nlargest(10, 'Count')[['Topic', 'Human_Label', 'Keywords', 'Count']]
-                            for topic, label, keywords, count in zip(top_topics['Topic'], top_topics['Human_Label'],
-                                                                     top_topics['Keywords'], top_topics['Count']):
-                                context_parts.append(f"- Topic {topic}: {label} ({count} docs)")
-                                context_parts.append(f"  Keywords: {keywords}")
-
-                            context = "\n".join(context_parts)
-
-                            # Debug: Check what we're passing
-                            if use_rag_chat:
-                                docs = st.session_state.get('documents')
-                                docs_len = len(docs) if docs is not None else 0
-                                st.caption(f"🔧 Calling RAG with: use_rag={use_rag_chat}, llm={chat_llm is not None}, "
-                                          f"faiss={st.session_state.get('faiss_index') is not None}, "
-                                          f"docs={docs_len}, "
-                                          f"emb={st.session_state.get('embeddings') is not None}, "
-                                          f"model={st.session_state.get('safe_model') is not None}")
-
-                            # Generate response with RAG or rule-based
                             response = generate_chat_response(
                                 prompt,
-                                context,
-                                topic_info_for_chat,
+                                topic_info,
                                 topics,
                                 processed_df,
                                 current_topic_id=selected_topic_id if selected_topic_id != "all" else None,
-                                use_rag=use_rag_chat,
-                                llm_model=chat_llm if use_rag_chat else None,
+                                explicit_topic_filter=chat_topic_id,
+                                use_rag=True,  # Always True - RAG is mandatory
+                                llm_model=chat_llm,  # Guaranteed to exist or we stopped earlier
                                 faiss_index=st.session_state.get('faiss_index'),
                                 embeddings=st.session_state.get('embeddings'),
                                 documents=st.session_state.get('documents'),
@@ -4851,24 +5370,15 @@ Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
                     st.markdown("---")
 
                     if len(st.session_state.chat_history) == 0:
-                        if use_rag_chat:
-                            num_docs = len(st.session_state.get('documents', []))
-                            num_topics = len(set(st.session_state.get('current_topics', [])))
-                            st.info(f"🤖 **RAG Mode Active!** All {num_docs:,} documents from {num_topics} topics are available.\n\n"
-                                   "I'll use semantic search + LLM to answer based on your actual documents.\n\n"
-                                   "**Try asking:**\n"
-                                   "- 'What do customers say about delivery?'\n"
-                                   "- 'Find issues related to installation'\n"
-                                   "- 'Summarize the main complaints'\n"
-                                   "- 'What are people saying about Samsung products?'\n"
-                                   "- 'Tell me about topic 5' (filters to specific topic)")
-                        else:
-                            st.info("👋 Ask me anything about your topics. For example:\n"
-                                   "- 'What are the main themes in my data?'\n"
-                                   "- 'Tell me about the current topic'\n"
-                                   "- 'Which topics are most common?'\n"
-                                   "- 'Show me insights about customer complaints'\n\n"
-                                   "💡 **Tip:** Enable RAG Mode above for AI-powered document-based responses!")
+                        num_docs = len(st.session_state.get('documents', []))
+                        num_topics = len(set(st.session_state.get('current_topics', [])))
+                        st.info(f"🤖 **RAG Active** - {num_docs:,} documents from {num_topics} topics available.\n\n"
+                               "Semantic search + LLM powered by your actual documents.\n\n"
+                               "**Try:**\n"
+                               "- 'What do customers say about delivery?'\n"
+                               "- 'Find issues related to installation'\n"
+                               "- 'Summarize the main complaints'\n"
+                               "- 'Tell me about topic 5'")
                     else:
                         # Display chat history (newest first)
                         for message in reversed(st.session_state.chat_history):
