@@ -74,7 +74,7 @@ LLM_MODEL_CONFIG = {
     "microsoft/Phi-3-mini-128k-instruct": {
         "context_window": 131072,  # 128k tokens
         "description": "3.8GB - Fast, massive context",
-        "recommended_docs": 50  # 128k tokens allows ~50+ docs with full context
+        "recommended_docs": 100  # 128k tokens can easily handle 100+ docs (only uses ~8k tokens)
     },
     "mistralai/Mistral-7B-Instruct-v0.2": {
         "context_window": 8192,  # 8k tokens
