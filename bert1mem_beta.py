@@ -2464,29 +2464,33 @@ class FastReclusterer:
                 doc_indices = topic_doc_indices.get(topic_id, [])
                 label = labels_dict.get(topic_id, f"Topic {topic_id}")
 
-                # Select representative documents using FAISS
+                # Select representative documents using FAISS (increased to 10 for better quality)
                 if faiss_index is not None and embeddings_for_analysis is not None and len(doc_indices) > 0:
                     try:
                         topic_embeddings = embeddings_for_analysis[doc_indices]
                         centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                        _, indices = faiss_index.search(centroid, min(5, len(doc_indices)))
+                        _, indices = faiss_index.search(centroid, min(10, len(doc_indices)))
 
                         idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
                         selected_docs = []
                         for idx in indices[0]:
                             if idx in idx_to_pos:
                                 selected_docs.append(docs[idx_to_pos[idx]])
-                                if len(selected_docs) >= 5:
+                                if len(selected_docs) >= 10:
                                     break
                     except Exception:
-                        selected_docs = docs[:5]
+                        selected_docs = docs[:10]
                 else:
-                    selected_docs = docs[:5]
+                    selected_docs = docs[:10]
+
+                # Get keywords for this topic to enable better fallback summaries
+                keywords = keywords_dict.get(topic_id, '')
 
                 all_topics_prepared.append({
                     'topic_id': topic_id,
                     'label': label,
-                    'docs': selected_docs
+                    'docs': selected_docs,
+                    'keywords': keywords
                 })
 
             # Process in batches (now parallelized internally via ThreadPoolExecutor)
@@ -2665,8 +2669,9 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
             topics_dict[topic].append(documents[idx])
             topic_doc_indices[topic].append(idx)
 
-    # Get labels from topic_info
+    # Get labels and keywords from topic_info
     labels_dict = dict(zip(topic_info['Topic'], topic_info['Human_Label']))
+    keywords_dict = dict(zip(topic_info['Topic'], topic_info.get('Keywords', [''] * len(topic_info))))
 
     # Run BATCHED LLM analysis for actual speedup
     llm_analysis_dict = {}
@@ -2694,30 +2699,32 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
 
         doc_indices = topic_doc_indices.get(topic_id, [])
         label = labels_dict.get(topic_id, f"Topic {topic_id}")
+        keywords = keywords_dict.get(topic_id, '')
 
-        # Select docs with FAISS
+        # Select docs with FAISS (increased to 10 for better quality)
         if faiss_index is not None and embeddings is not None and len(doc_indices) > 0:
             try:
                 topic_embeddings = embeddings[doc_indices]
                 centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                _, indices = faiss_index.search(centroid, min(5, len(doc_indices)))
+                _, indices = faiss_index.search(centroid, min(10, len(doc_indices)))
 
                 idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
                 selected_docs = []
                 for idx in indices[0]:
                     if idx in idx_to_pos:
                         selected_docs.append(docs[idx_to_pos[idx]])
-                        if len(selected_docs) >= 5:
+                        if len(selected_docs) >= 10:
                             break
             except Exception:
-                selected_docs = docs[:5]
+                selected_docs = docs[:10]
         else:
-            selected_docs = docs[:5]
+            selected_docs = docs[:10]
 
         all_topics_prepared.append({
             'topic_id': topic_id,
             'label': label,
-            'docs': selected_docs
+            'docs': selected_docs,
+            'keywords': keywords
         })
 
     # Process in batches (now parallelized internally via ThreadPoolExecutor)
