@@ -4097,9 +4097,6 @@ def main():
             key="global_llm_model"
         )
 
-        # Store in session state
-        st.session_state.global_llm_model = global_llm_model
-
         # Global optimization options
         col_llm1, col_llm2 = st.columns(2)
         with col_llm1:
@@ -4112,7 +4109,6 @@ def main():
                      (" [Disabled: " + str(bitsandbytes_error) + "]" if not can_use_4bit else ""),
                 key="global_use_4bit"
             )
-            st.session_state.global_use_4bit = global_use_4bit
             if not can_use_4bit:
                 if IS_WINDOWS:
                     st.caption("⚠️ Windows: Use FP16 instead")
@@ -4126,7 +4122,6 @@ def main():
                 help="Use system RAM instead of GPU (slower but reliable)",
                 key="global_force_cpu"
             )
-            st.session_state.global_force_cpu = global_force_cpu
 
         # Show model info
         model_config = LLM_MODEL_CONFIG[global_llm_model]
