@@ -2344,8 +2344,10 @@ def make_human_label(topic_docs, fallback_keywords, max_len=70):
 class FastReclusterer:
     """Fast reclustering using pre-computed embeddings"""
 
-    def __init__(self, documents, embeddings, umap_embeddings=None, llm_model_name=None):
-        self.documents = documents
+    def __init__(self, documents, embeddings, umap_embeddings=None, llm_model_name=None, raw_documents=None, valid_indices=None):
+        self.documents = documents  # Cleaned/preprocessed documents (for embeddings)
+        self.raw_documents = raw_documents  # Original untruncated documents (for LLM analysis)
+        self.valid_indices = valid_indices  # Mapping from cleaned docs to raw docs
         self.embeddings = embeddings
         self.umap_embeddings = umap_embeddings
         self.use_gpu = torch.cuda.is_available() and cuml_available
@@ -2474,13 +2476,23 @@ class FastReclusterer:
     def _extract_topic_keywords(self, topics, top_n_words=10):
         """⚡ OPTIMIZED: Extract keywords and generate human-readable labels with adaptive parallel batching"""
         # Group documents by topic (with document indices for FAISS)
-        topics_dict = {}
+        topics_dict = {}  # For cleaned docs (keyword extraction)
+        topics_dict_raw = {}  # For raw docs (LLM analysis)
         topic_doc_indices = {}  # Track which embedding indices belong to each topic
         for idx, topic in enumerate(topics):
             topics_dict.setdefault(topic, [])
+            topics_dict_raw.setdefault(topic, [])
             topic_doc_indices.setdefault(topic, [])
             if idx < len(self.documents):
+                # Use cleaned docs for keyword extraction (already truncated, clean)
                 topics_dict[topic].append(self.documents[idx])
+                # Use raw docs for LLM analysis (full context, untruncated)
+                if self.raw_documents is not None and self.valid_indices is not None:
+                    raw_idx = self.valid_indices[idx]
+                    topics_dict_raw[topic].append(self.raw_documents[raw_idx])
+                else:
+                    # Fallback: use cleaned docs if raw not available
+                    topics_dict_raw[topic].append(self.documents[idx])
                 topic_doc_indices[topic].append(idx)
         
         # Handle outliers
@@ -2582,7 +2594,8 @@ class FastReclusterer:
                 # Prepare all topics with FAISS-selected documents
                 all_topics_prepared = []
                 skipped_topics = []
-                for topic_id, docs in topics_dict.items():
+                # ✅ CARMACK FIX: Use raw documents for LLM analysis (full context, untruncated)
+                for topic_id, docs_raw in topics_dict_raw.items():
                     if topic_id == -1:
                         continue
 
@@ -2605,7 +2618,8 @@ class FastReclusterer:
                             matched_count = 0
                             for idx in indices[0]:
                                 if idx in idx_to_pos:
-                                    selected_docs.append(docs[idx_to_pos[idx]])
+                                    # Use raw documents for full context
+                                    selected_docs.append(docs_raw[idx_to_pos[idx]])
                                     matched_count += 1
                                     if len(selected_docs) >= max_docs:
                                         break
@@ -2613,21 +2627,21 @@ class FastReclusterer:
                             # ✅ FIX: If FAISS returned no valid docs for this topic, fall back to topic's own docs
                             if not selected_docs:
                                 logging.warning(f"Topic {topic_id}: FAISS selection returned 0 matching docs (matched {matched_count}/{len(indices[0])}), using fallback")
-                                selected_docs = docs[:max_docs]
+                                selected_docs = docs_raw[:max_docs]
                             else:
                                 logging.debug(f"Topic {topic_id}: FAISS selected {len(selected_docs)} docs")
                         except Exception as e:
                             import logging
                             logging.warning(f"Topic {topic_id}: FAISS selection failed ({str(e)[:100]}), using fallback")
-                            selected_docs = docs[:max_docs]
+                            selected_docs = docs_raw[:max_docs]
                     else:
-                        selected_docs = docs[:max_docs]
+                        selected_docs = docs_raw[:max_docs]
 
                     # ✅ FIXED: Minimal validation - only skip if literally no documents
                     # Let generate_simple_llm_analysis handle document validation (it has retry logic)
                     if not selected_docs or len(selected_docs) == 0:
                         import logging
-                        logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs)} original docs)")
+                        logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs_raw)} original docs)")
                         skipped_topics.append(topic_id)
                         llm_analysis_dict[topic_id] = ""
                         llm_fallback_count += 1
@@ -2843,7 +2857,7 @@ def normalize_topic_info(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------
 # STANDALONE LLM ANALYSIS FOR EXISTING TOPICS
 # -----------------------------------------------------
-def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_model, model_name=None):
+def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_model, model_name=None, raw_documents=None, valid_indices=None):
     """
     Run LLM analysis on already-clustered topics.
     This allows adding AI insights after clustering without reclustering.
@@ -2851,21 +2865,32 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
     Args:
         topics: Array of topic assignments
         topic_info: DataFrame with topic information
-        documents: List of document texts
+        documents: List of document texts (cleaned/preprocessed)
         embeddings: Document embeddings (for FAISS selection)
         llm_model: Loaded LLM model tuple (model, tokenizer)
+        raw_documents: Original untruncated documents (for LLM analysis)
+        valid_indices: Mapping from cleaned docs to raw docs
 
     Returns:
         Updated topic_info DataFrame with LLM_Analysis column
     """
     # Group documents by topic
-    topics_dict = {}
+    topics_dict = {}  # For cleaned docs (if needed)
+    topics_dict_raw = {}  # For raw docs (LLM analysis)
     topic_doc_indices = {}
     for idx, topic in enumerate(topics):
         topics_dict.setdefault(topic, [])
+        topics_dict_raw.setdefault(topic, [])
         topic_doc_indices.setdefault(topic, [])
         if idx < len(documents):
             topics_dict[topic].append(documents[idx])
+            # Use raw docs for LLM analysis if available
+            if raw_documents is not None and valid_indices is not None:
+                raw_idx = valid_indices[idx]
+                topics_dict_raw[topic].append(raw_documents[raw_idx])
+            else:
+                # Fallback: use cleaned docs
+                topics_dict_raw[topic].append(documents[idx])
             topic_doc_indices[topic].append(idx)
 
     # Get labels and keywords from topic_info
@@ -2902,7 +2927,8 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
         # Prepare all topics with FAISS-selected documents
         all_topics_prepared = []
         skipped_topics = []
-        for topic_id, docs in topics_dict.items():
+        # ✅ CARMACK FIX: Use raw documents for LLM analysis (full context, untruncated)
+        for topic_id, docs_raw in topics_dict_raw.items():
             if topic_id == -1:
                 continue
 
@@ -2926,7 +2952,8 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
                     matched_count = 0
                     for idx in indices[0]:
                         if idx in idx_to_pos:
-                            selected_docs.append(docs[idx_to_pos[idx]])
+                            # Use raw documents for full context
+                            selected_docs.append(docs_raw[idx_to_pos[idx]])
                             matched_count += 1
                             if len(selected_docs) >= max_docs:
                                 break
@@ -2934,21 +2961,21 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
                     # ✅ FIX: If FAISS returned no valid docs for this topic, fall back to topic's own docs
                     if not selected_docs:
                         logging.warning(f"Topic {topic_id}: FAISS selection returned 0 matching docs (matched {matched_count}/{len(indices[0])}), using fallback")
-                        selected_docs = docs[:max_docs]
+                        selected_docs = docs_raw[:max_docs]
                     else:
                         logging.debug(f"Topic {topic_id}: FAISS selected {len(selected_docs)} docs")
                 except Exception as e:
                     import logging
                     logging.warning(f"Topic {topic_id}: FAISS selection failed ({str(e)[:100]}), using fallback")
-                    selected_docs = docs[:max_docs]
+                    selected_docs = docs_raw[:max_docs]
             else:
-                selected_docs = docs[:max_docs]
+                selected_docs = docs_raw[:max_docs]
 
             # ✅ FIXED: Minimal validation - only skip if literally no documents
             # Let generate_simple_llm_analysis handle document validation (it has retry logic)
             if not selected_docs or len(selected_docs) == 0:
                 import logging
-                logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs)} original docs)")
+                logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs_raw)} original docs)")
                 skipped_topics.append(topic_id)
                 llm_analysis_dict[topic_id] = ""
                 llm_fallback_count += 1
@@ -4647,6 +4674,7 @@ def main():
                         st.stop()
 
                     st.session_state.documents = cleaned_docs
+                    st.session_state.raw_documents = raw_documents  # Store raw docs for LLM analysis
                     st.session_state.valid_indices = valid_indices
                     st.session_state.text_col = text_col
 
@@ -4827,7 +4855,9 @@ def main():
                 # Step 6: Create reclusterer
                 st.session_state.reclusterer = FastReclusterer(
                     cleaned_docs, embeddings, umap_embeddings,
-                    llm_model_name=llm_model_name if use_llm_labeling else None
+                    llm_model_name=llm_model_name if use_llm_labeling else None,
+                    raw_documents=raw_documents,  # Pass raw docs for LLM analysis
+                    valid_indices=valid_indices  # Pass mapping from cleaned to raw
                 )
 
                 # Set LLM model if loaded
@@ -5039,7 +5069,9 @@ def main():
                                 documents=st.session_state.documents,
                                 embeddings=st.session_state.embeddings,
                                 llm_model=post_llm,
-                                model_name=post_llm_model_name
+                                model_name=post_llm_model_name,
+                                raw_documents=st.session_state.get('raw_documents'),  # Pass raw docs for full context
+                                valid_indices=st.session_state.get('valid_indices')  # Pass index mapping
                             )
 
                             # Update session state with new topic_info
