@@ -11,6 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 # ✅ NEW IMPORTS FOR LLM OPTIMIZATION
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import time
 import psutil
 import os
@@ -193,6 +194,10 @@ if torch.cuda.is_available():
         torch.cuda.set_per_process_memory_fraction(0.8)
     except Exception as e:
         st.warning(f"CUDA initialization warning: {e}")
+
+# ✅ FIX: Global lock for thread-safe GPU/model access
+# Prevents concurrent CUDA operations that can cause silent failures or empty outputs
+_model_inference_lock = threading.Lock()
 
 # =====================================================
 # ⚡ OPTIMIZED LLM LABELING - AUTO-ADAPTIVE & PARALLEL
@@ -561,52 +566,120 @@ def generate_batch_llm_analysis(topic_batch, llm_model):
     Returns:
         Dict mapping topic_id to analysis string
     """
-    if not topic_batch or llm_model is None:
+    import logging
+
+    # ✅ FIX: Add detailed logging for empty batch scenarios
+    if not topic_batch:
+        logging.warning("generate_batch_llm_analysis called with empty topic_batch")
         return {}
+
+    if llm_model is None:
+        logging.warning("generate_batch_llm_analysis called with None llm_model")
+        return {}
+
+    # ✅ FIX: Ensure model is in eval mode for thread-safe inference
+    try:
+        model, tokenizer = llm_model
+        if hasattr(model, 'eval'):
+            model.eval()  # Ensure model is in evaluation mode
+            logging.debug("Model set to eval mode for batch processing")
+    except Exception as e:
+        logging.warning(f"Could not set model to eval mode: {str(e)}")
 
     results = {}
 
-    # Parallel execution - 4 workers for optimal GPU utilization
-    max_workers = min(4, len(topic_batch))
+    # ✅ FIX: Reduce parallelism to avoid GPU memory contention
+    # Using 4 workers can cause GPU OOM or lock contention, reducing to 2
+    max_workers = min(2, len(topic_batch))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all topics at once
-        future_to_topic = {
-            executor.submit(
-                generate_simple_llm_analysis,
-                item['topic_id'],
-                item['docs'][:20],  # ✅ CARMACK: Use up to 20 docs like interactive summary (was 8)
-                item['label'],
-                llm_model,
-                max_length=2000,  # ✅ Increased from 500 to allow longer, detailed analysis
-                keywords=item.get('keywords', '')  # ✅ CARMACK: Pass keywords for better context
-            ): item['topic_id']
-            for item in topic_batch
-        }
+    logging.info(f"Processing {len(topic_batch)} topics with {max_workers} workers")
 
-        # Collect results as they complete
-        for future in as_completed(future_to_topic):
-            topic_id = future_to_topic[future]
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all topics at once
+            future_to_topic = {
+                executor.submit(
+                    generate_simple_llm_analysis,
+                    item['topic_id'],
+                    item['docs'][:20],  # ✅ CARMACK: Use up to 20 docs like interactive summary (was 8)
+                    item['label'],
+                    llm_model,
+                    max_length=2000,  # ✅ Increased from 500 to allow longer, detailed analysis
+                    keywords=item.get('keywords', '')  # ✅ CARMACK: Pass keywords for better context
+                ): item['topic_id']
+                for item in topic_batch
+            }
+
+            # Collect results as they complete
+            # ✅ FIX: Add timeout to prevent infinite hangs
+            for future in as_completed(future_to_topic, timeout=300):  # 5 min timeout
+                topic_id = future_to_topic[future]
+                try:
+                    # ✅ FIX: Add timeout to result() call as well
+                    analysis = future.result(timeout=60)  # 1 min per topic
+                    # Validation: EXTREMELY lenient - accept very short analyses (5+ chars)
+                    # Most real LLM responses should easily pass this
+                    if analysis and len(analysis.strip()) >= 5:
+                        results[topic_id] = analysis
+                    else:
+                        # Log why validation failed for debugging
+                        if analysis:
+                            logging.warning(f"Topic {topic_id} analysis rejected (len={len(analysis.strip()) if analysis else 0}): '{analysis[:100] if analysis else 'None'}")
+                        else:
+                            logging.warning(f"Topic {topic_id} returned None from LLM generation")
+                    # Note: We don't add fallback here - let the caller handle missing results
+                except TimeoutError:
+                    logging.error(f"Topic {topic_id} analysis timed out after 60s")
+                except Exception as e:
+                    # Log error for debugging but don't crash
+                    logging.warning(f"Topic {topic_id} analysis failed: {str(e)}")
+                    pass
+    except TimeoutError:
+        logging.error(f"Batch processing timed out - only {len(results)}/{len(topic_batch)} topics completed")
+    except Exception as e:
+        logging.error(f"ThreadPoolExecutor failed: {str(e)}")
+        # If executor fails completely, return whatever results we got
+
+    # ✅ FIX: If parallel processing completely failed, try sequential processing as fallback
+    if not results and len(topic_batch) > 0:
+        logging.warning("Parallel processing returned empty results - attempting sequential fallback")
+        logging.warning("This may indicate GPU memory issues or threading problems with the model")
+
+        for item in topic_batch:
             try:
-                analysis = future.result()
-                # Validation: EXTREMELY lenient - accept very short analyses (5+ chars)
-                # Most real LLM responses should easily pass this
+                topic_id = item['topic_id']
+                logging.info(f"Sequential fallback: processing topic {topic_id}")
+
+                analysis = generate_simple_llm_analysis(
+                    topic_id,
+                    item['docs'][:20],
+                    item['label'],
+                    llm_model,
+                    max_length=2000,
+                    keywords=item.get('keywords', '')
+                )
+
                 if analysis and len(analysis.strip()) >= 5:
                     results[topic_id] = analysis
+                    logging.info(f"Sequential fallback: topic {topic_id} succeeded")
                 else:
-                    # Log why validation failed for debugging
-                    if analysis:
-                        import logging
-                        logging.warning(f"Topic {topic_id} analysis rejected (len={len(analysis.strip()) if analysis else 0}): '{analysis[:100] if analysis else 'None'}")
-                    else:
-                        import logging
-                        logging.warning(f"Topic {topic_id} returned None from LLM generation")
-                # Note: We don't add fallback here - let the caller handle missing results
+                    logging.warning(f"Sequential fallback: topic {topic_id} returned invalid analysis")
+
             except Exception as e:
-                # Log error for debugging but don't crash
-                import logging
-                logging.warning(f"Topic {topic_id} analysis failed: {str(e)}")
-                pass
+                logging.error(f"Sequential fallback: topic {topic_id} failed: {str(e)}")
+                continue
+
+        if results:
+            logging.info(f"Sequential fallback succeeded: {len(results)}/{len(topic_batch)} topics")
+        else:
+            logging.error(f"Sequential fallback also failed - model may be in bad state")
+
+    # Final logging
+    if not results:
+        logging.error(f"generate_batch_llm_analysis returning EMPTY results for {len(topic_batch)} topics!")
+        logging.error("Both parallel and sequential processing failed - check GPU memory, model state, or document content")
+    else:
+        logging.info(f"Successfully generated {len(results)}/{len(topic_batch)} analyses")
 
     return results
 
@@ -712,21 +785,23 @@ Write a complete summary explaining what these documents are about:"""
             # Adjust temperature based on retry count - higher temp for retries to get different output
             temperature = 0.7 + (retry_count * 0.15)  # 0.7, 0.85, 1.0 for retries 0,1,2
 
-            with torch.no_grad():
-                outputs = model.generate(
-                    **model_inputs,  # Unpacks input_ids and attention_mask
-                    max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
-                    temperature=min(temperature, 1.0),  # Cap at 1.0
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True  # ✅ Re-enabled: 30-50% speedup
-                )
+            # ✅ FIX: Use lock to prevent concurrent GPU access (fixes intermittent empty results)
+            with _model_inference_lock:
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **model_inputs,  # Unpacks input_ids and attention_mask
+                        max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
+                        temperature=min(temperature, 1.0),  # Cap at 1.0
+                        do_sample=True,
+                        top_p=0.9,
+                        pad_token_id=tokenizer.eos_token_id,
+                        use_cache=True  # ✅ Re-enabled: 30-50% speedup
+                    )
 
-            # Decode only the new tokens (exclude the prompt)
-            input_length = model_inputs['input_ids'].shape[1]
-            generated_ids = outputs[0][input_length:]
-            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                # Decode only the new tokens (exclude the prompt)
+                input_length = model_inputs['input_ids'].shape[1]
+                generated_ids = outputs[0][input_length:]
+                response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
             # Debug logging for raw response
             import logging
@@ -745,21 +820,23 @@ Write a complete summary explaining what these documents are about:"""
             # Adjust temperature for retries
             temperature = 0.5 + (retry_count * 0.15)  # 0.5, 0.65, 0.8 for retries 0,1,2
 
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
-                    temperature=min(temperature, 0.9),
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.eos_token_id,
-                    use_cache=True  # ✅ Re-enabled: 30-50% speedup
-                )
+            # ✅ FIX: Use lock to prevent concurrent GPU access (fixes intermittent empty results)
+            with _model_inference_lock:
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=800,  # ✅ Increased from 300 to allow detailed analysis without truncation
+                        temperature=min(temperature, 0.9),
+                        do_sample=True,
+                        top_p=0.9,
+                        pad_token_id=tokenizer.eos_token_id,
+                        use_cache=True  # ✅ Re-enabled: 30-50% speedup
+                    )
 
-            # Decode only the new tokens (exclude the prompt)
-            input_length = inputs['input_ids'].shape[1]
-            generated_ids = outputs[0][input_length:]
-            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                # Decode only the new tokens (exclude the prompt)
+                input_length = inputs['input_ids'].shape[1]
+                generated_ids = outputs[0][input_length:]
+                response = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
             # Debug logging for raw response
             import logging
@@ -2481,127 +2558,211 @@ class FastReclusterer:
         if self.llm_model is not None:
             num_topics = len(topics_dict) - (1 if -1 in topics_dict else 0)
 
-            # Batch size: process 5 topics at once (optimal for most LLMs)
-            batch_size = 5
-            st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
-
-            # Get FAISS index for document selection
-            faiss_index = st.session_state.get('faiss_index')
-            embeddings_for_analysis = self.embeddings if hasattr(self, 'embeddings') else None
-
-            # Create progress tracking
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
-
-            # Calculate optimal doc count based on model's context window
-            max_docs = get_max_docs_for_model(self.llm_model_name) if self.llm_model_name else 10
-            st.caption(f"📊 Using {max_docs} documents per topic (optimized for {self.llm_model_name.split('/')[-1] if self.llm_model_name else 'default'} context window)")
-
-            # Prepare all topics with FAISS-selected documents
-            all_topics_prepared = []
-            for topic_id, docs in topics_dict.items():
-                if topic_id == -1:
-                    continue
-
-                doc_indices = topic_doc_indices.get(topic_id, [])
-                label = labels_dict.get(topic_id, f"Topic {topic_id}")
-
-                # Select representative documents using FAISS (dynamically scaled by context window)
-                if faiss_index is not None and embeddings_for_analysis is not None and len(doc_indices) > 0:
-                    try:
-                        topic_embeddings = embeddings_for_analysis[doc_indices]
-                        centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                        _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
-
-                        idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
-                        selected_docs = []
-                        for idx in indices[0]:
-                            if idx in idx_to_pos:
-                                selected_docs.append(docs[idx_to_pos[idx]])
-                                if len(selected_docs) >= max_docs:
-                                    break
-                    except Exception:
-                        selected_docs = docs[:max_docs]
-                else:
-                    selected_docs = docs[:max_docs]
-
-                # Get keywords for this topic to enable better fallback summaries
-                keywords = keywords_dict.get(topic_id, '')
-
-                all_topics_prepared.append({
-                    'topic_id': topic_id,
-                    'label': label,
-                    'docs': selected_docs,
-                    'keywords': keywords
-                })
-
-            # Process in batches (now parallelized internally via ThreadPoolExecutor)
-            num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
-            processed_count = 0
-
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, len(all_topics_prepared))
-                batch = all_topics_prepared[start_idx:end_idx]
-
-                # Update progress
-                status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics in parallel)...")
-
-                # Carmack's simple parallel processing - no fallback needed!
-                batch_results = generate_batch_llm_analysis(batch, self.llm_model)
-
-                # Collect results and retry failed topics once
-                failed_topics = []
-                for topic_item in batch:
-                    topic_id = topic_item['topic_id']
-                    if topic_id in batch_results and batch_results[topic_id]:
-                        llm_analysis_dict[topic_id] = batch_results[topic_id]
-                        llm_success_count += 1
-                    else:
-                        # Queue for retry
-                        failed_topics.append(topic_item)
-
-                    processed_count += 1
-
-                # Retry failed topics once (reduces 2/80 failures to ~0/80)
-                if failed_topics:
-                    status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
-                    retry_results = generate_batch_llm_analysis(failed_topics, self.llm_model)
-
-                    for topic_item in failed_topics:
-                        topic_id = topic_item['topic_id']
-                        if topic_id in retry_results and retry_results[topic_id]:
-                            llm_analysis_dict[topic_id] = retry_results[topic_id]
-                            llm_success_count += 1
-                        else:
-                            # No redundant fallback - leave empty if LLM can't generate meaningful analysis
-                            # Users already see label and keywords in other columns
-                            llm_analysis_dict[topic_id] = ""
-                            llm_fallback_count += 1
-
-                # Update progress bar
-                progress = processed_count / num_topics
-                progress_bar.progress(progress)
-                status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
-
-            # Clear progress indicators
-            progress_bar.empty()
-            status_text.empty()
-
-            # Show LLM analysis statistics
-            if llm_success_count > 0:
-                success_pct = (llm_success_count / num_topics) * 100
-                st.success(
-                    f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
-                )
-                if llm_fallback_count > 0:
-                    # Find which topics have no analysis (empty string)
-                    failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items() if not analysis or analysis.strip() == ""]
-                    st.warning(f"⚠️ {llm_fallback_count} topics have no LLM analysis: {failed_topic_ids}")
-                    st.caption("💡 These topics had insufficient document content for LLM analysis. Label and keywords are still available.")
-                    st.caption("🔍 **Tip:** Enable 'Debug logging' above and check your terminal/console to see why specific topics failed.")
+            # ✅ FIX: Check if there are any valid topics to process
+            if num_topics == 0:
+                st.warning("⚠️ No valid topics to analyze (only outlier topics found)")
+                llm_analysis_dict = {}
             else:
-                st.warning("⚠️ LLM analysis failed for all topics")
+                # Batch size: process 5 topics at once (optimal for most LLMs)
+                batch_size = 5
+                st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
+
+                # Get FAISS index for document selection
+                faiss_index = st.session_state.get('faiss_index')
+                embeddings_for_analysis = self.embeddings if hasattr(self, 'embeddings') else None
+
+                # Create progress tracking
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
+
+                # Calculate optimal doc count based on model's context window
+                max_docs = get_max_docs_for_model(self.llm_model_name) if self.llm_model_name else 10
+                st.caption(f"📊 Using {max_docs} documents per topic (optimized for {self.llm_model_name.split('/')[-1] if self.llm_model_name else 'default'} context window)")
+
+                # Prepare all topics with FAISS-selected documents
+                all_topics_prepared = []
+                skipped_topics = []
+                for topic_id, docs in topics_dict.items():
+                    if topic_id == -1:
+                        continue
+
+                    doc_indices = topic_doc_indices.get(topic_id, [])
+                    label = labels_dict.get(topic_id, f"Topic {topic_id}")
+
+                    # Select representative documents using FAISS (dynamically scaled by context window)
+                    if faiss_index is not None and embeddings_for_analysis is not None and len(doc_indices) > 0:
+                        try:
+                            topic_embeddings = embeddings_for_analysis[doc_indices]
+                            centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
+                            _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
+
+                            # ✅ FIX: FAISS searches GLOBAL index, need to filter to topic's documents only
+                            idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
+                            selected_docs = []
+                            import logging
+                            logging.debug(f"Topic {topic_id}: FAISS returned {len(indices[0])} indices, topic has {len(doc_indices)} docs")
+
+                            matched_count = 0
+                            for idx in indices[0]:
+                                if idx in idx_to_pos:
+                                    selected_docs.append(docs[idx_to_pos[idx]])
+                                    matched_count += 1
+                                    if len(selected_docs) >= max_docs:
+                                        break
+
+                            # ✅ FIX: If FAISS returned no valid docs for this topic, fall back to topic's own docs
+                            if not selected_docs:
+                                logging.warning(f"Topic {topic_id}: FAISS selection returned 0 matching docs (matched {matched_count}/{len(indices[0])}), using fallback")
+                                selected_docs = docs[:max_docs]
+                            else:
+                                logging.debug(f"Topic {topic_id}: FAISS selected {len(selected_docs)} docs")
+                        except Exception as e:
+                            import logging
+                            logging.warning(f"Topic {topic_id}: FAISS selection failed ({str(e)[:100]}), using fallback")
+                            selected_docs = docs[:max_docs]
+                    else:
+                        selected_docs = docs[:max_docs]
+
+                    # ✅ FIXED: Minimal validation - only skip if literally no documents
+                    # Let generate_simple_llm_analysis handle document validation (it has retry logic)
+                    if not selected_docs or len(selected_docs) == 0:
+                        import logging
+                        logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs)} original docs)")
+                        skipped_topics.append(topic_id)
+                        llm_analysis_dict[topic_id] = ""
+                        llm_fallback_count += 1
+                        continue
+
+                    # Get keywords for this topic
+                    keywords = keywords_dict.get(topic_id, '')
+
+                    all_topics_prepared.append({
+                        'topic_id': topic_id,
+                        'label': label,
+                        'docs': selected_docs,  # Pass documents as-is, LLM function will validate
+                        'keywords': keywords
+                    })
+
+                # ✅ FIX: Show warning if topics were skipped due to empty documents
+                if skipped_topics:
+                    st.caption(f"⚠️ Skipped {len(skipped_topics)} topics with no valid documents: {skipped_topics[:10]}{'...' if len(skipped_topics) > 10 else ''}")
+
+                # ✅ FIX: Check if all topics were skipped (no valid documents)
+                if not all_topics_prepared:
+                    st.warning("⚠️ All topics have no valid documents for LLM analysis")
+                    st.caption("💡 Check that your documents contain meaningful text content")
+                else:
+                    # Process in batches (now parallelized internally via ThreadPoolExecutor)
+                    num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
+                    processed_count = 0
+
+                    for batch_idx in range(num_batches):
+                        start_idx = batch_idx * batch_size
+                        end_idx = min(start_idx + batch_size, len(all_topics_prepared))
+                        batch = all_topics_prepared[start_idx:end_idx]
+
+                        # Update progress
+                        status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics in parallel)...")
+
+                        # Carmack's simple parallel processing - no fallback needed!
+                        batch_results = generate_batch_llm_analysis(batch, self.llm_model)
+
+                        # Collect results and retry failed topics once
+                        failed_topics = []
+                        for topic_item in batch:
+                            topic_id = topic_item['topic_id']
+                            if topic_id in batch_results and batch_results[topic_id]:
+                                llm_analysis_dict[topic_id] = batch_results[topic_id]
+                                llm_success_count += 1
+                            else:
+                                # Queue for retry
+                                import logging
+                                logging.warning(f"Topic {topic_id} failed in initial batch - will retry")
+                                failed_topics.append(topic_item)
+
+                            processed_count += 1
+
+                        # Retry failed topics once (reduces 2/80 failures to ~0/80)
+                        if failed_topics:
+                            status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
+                            retry_results = generate_batch_llm_analysis(failed_topics, self.llm_model)
+
+                            still_failed = []
+                            for topic_item in failed_topics:
+                                topic_id = topic_item['topic_id']
+                                if topic_id in retry_results and retry_results[topic_id]:
+                                    llm_analysis_dict[topic_id] = retry_results[topic_id]
+                                    llm_success_count += 1
+                                else:
+                                    # Track topics that failed even after retry
+                                    still_failed.append(topic_item)
+
+                            # ✅ FIX: Generate keyword-based fallback for topics that completely failed
+                            if still_failed:
+                                import logging
+                                logging.error(f"{len(still_failed)} topics failed even after retry - generating keyword-based fallback")
+                                for topic_item in still_failed:
+                                    topic_id = topic_item['topic_id']
+                                    label = topic_item['label']
+                                    keywords = topic_item.get('keywords', '')
+                                    docs = topic_item.get('docs', [])
+
+                                    # Log details for debugging
+                                    logging.error(f"Topic {topic_id} completely failed LLM generation:")
+                                    logging.error(f"  Label: {label}")
+                                    logging.error(f"  Keywords: {keywords}")
+                                    logging.error(f"  Num docs: {len(docs)}")
+                                    if docs:
+                                        logging.error(f"  First doc preview: {str(docs[0])[:100]}")
+
+                                    # Generate simple keyword-based summary as last resort
+                                    if keywords:
+                                        fallback_analysis = f"Topic related to {keywords}. Contains {len(docs)} documents discussing {label.lower()}."
+                                        llm_analysis_dict[topic_id] = fallback_analysis
+                                        logging.info(f"Topic {topic_id} using keyword fallback: {fallback_analysis}")
+                                    else:
+                                        llm_analysis_dict[topic_id] = ""
+                                        logging.error(f"Topic {topic_id} has no keywords - setting empty")
+
+                                    llm_fallback_count += 1
+
+                        # Update progress bar
+                        progress = processed_count / num_topics
+                        progress_bar.progress(progress)
+                        status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
+
+                    # Clear progress indicators
+                    progress_bar.empty()
+                    status_text.empty()
+
+                    # Show LLM analysis statistics
+                    if llm_success_count > 0:
+                        success_pct = (llm_success_count / num_topics) * 100
+                        st.success(
+                            f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)"
+                        )
+                        if llm_fallback_count > 0:
+                            # Separate truly empty from keyword fallback
+                            empty_topic_ids = []
+                            fallback_topic_ids = []
+                            for tid, analysis in llm_analysis_dict.items():
+                                if not analysis or analysis.strip() == "":
+                                    empty_topic_ids.append(tid)
+                                elif "Topic related to" in analysis:
+                                    fallback_topic_ids.append(tid)
+
+                            if fallback_topic_ids:
+                                st.info(f"ℹ️ {len(fallback_topic_ids)} topics using keyword-based fallback: {fallback_topic_ids}")
+                                st.caption("💡 These topics had LLM generation issues - using keyword-based summaries instead.")
+
+                            if empty_topic_ids:
+                                st.warning(f"⚠️ {len(empty_topic_ids)} topics have no analysis: {empty_topic_ids}")
+                                st.caption("💡 These topics have no keywords or documents. Check your data.")
+
+                            st.caption("🔍 **Tip:** Check your terminal/console logs to see detailed failure reasons for each topic.")
+                    else:
+                        st.warning("⚠️ LLM analysis failed for all topics")
+                        st.caption("Check logs for detailed error messages")
 
         # PHASE 4: Build final topic info dataframe
         for topic_id in sorted(topics_dict.keys()):
@@ -2718,122 +2879,209 @@ def run_llm_analysis_on_topics(topics, topic_info, documents, embeddings, llm_mo
 
     num_topics = len(topics_dict) - (1 if -1 in topics_dict else 0)
 
-    # Batch size: process 5 topics at once
-    batch_size = 5
-    st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
-
-    # Get FAISS index
-    faiss_index = st.session_state.get('faiss_index')
-
-    # Progress tracking
-    progress_bar = st.progress(0.0)
-    status_text = st.empty()
-
-    # Calculate optimal doc count based on model's context window
-    max_docs = get_max_docs_for_model(model_name) if model_name else 10
-    st.caption(f"📊 Using {max_docs} documents per topic (optimized for {model_name.split('/')[-1] if model_name else 'default'} context window)")
-
-    # Prepare all topics with FAISS-selected documents
-    all_topics_prepared = []
-    for topic_id, docs in topics_dict.items():
-        if topic_id == -1:
-            continue
-
-        doc_indices = topic_doc_indices.get(topic_id, [])
-        label = labels_dict.get(topic_id, f"Topic {topic_id}")
-        keywords = keywords_dict.get(topic_id, '')
-
-        # Select docs with FAISS (dynamically scaled by context window)
-        if faiss_index is not None and embeddings is not None and len(doc_indices) > 0:
-            try:
-                topic_embeddings = embeddings[doc_indices]
-                centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
-                _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
-
-                idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
-                selected_docs = []
-                for idx in indices[0]:
-                    if idx in idx_to_pos:
-                        selected_docs.append(docs[idx_to_pos[idx]])
-                        if len(selected_docs) >= max_docs:
-                            break
-            except Exception:
-                selected_docs = docs[:max_docs]
-        else:
-            selected_docs = docs[:max_docs]
-
-        all_topics_prepared.append({
-            'topic_id': topic_id,
-            'label': label,
-            'docs': selected_docs,
-            'keywords': keywords
-        })
-
-    # Process in batches (now parallelized internally via ThreadPoolExecutor)
-    num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
-    processed_count = 0
-
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(all_topics_prepared))
-        batch = all_topics_prepared[start_idx:end_idx]
-
-        # Update progress
-        status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics in parallel)...")
-
-        # Carmack's simple parallel processing - no fallback needed!
-        batch_results = generate_batch_llm_analysis(batch, llm_model)
-
-        # Collect results and retry failed topics once
-        failed_topics = []
-        for topic_item in batch:
-            topic_id = topic_item['topic_id']
-            if topic_id in batch_results and batch_results[topic_id]:
-                llm_analysis_dict[topic_id] = batch_results[topic_id]
-                llm_success_count += 1
-            else:
-                # Queue for retry
-                failed_topics.append(topic_item)
-
-            processed_count += 1
-
-        # Retry failed topics once (reduces 2/80 failures to ~0/80)
-        if failed_topics:
-            status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
-            retry_results = generate_batch_llm_analysis(failed_topics, llm_model)
-
-            for topic_item in failed_topics:
-                topic_id = topic_item['topic_id']
-                if topic_id in retry_results and retry_results[topic_id]:
-                    llm_analysis_dict[topic_id] = retry_results[topic_id]
-                    llm_success_count += 1
-                else:
-                    # No redundant fallback - leave empty if LLM can't generate meaningful analysis
-                    # Users already see label and keywords in other columns
-                    llm_analysis_dict[topic_id] = ""
-                    llm_fallback_count += 1
-
-        # Update progress bar
-        progress = processed_count / num_topics
-        progress_bar.progress(progress)
-        status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
-
-    # Clear progress
-    progress_bar.empty()
-    status_text.empty()
-
-    # Show stats
-    if llm_success_count > 0:
-        success_pct = (llm_success_count / num_topics) * 100
-        st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
-        if llm_fallback_count > 0:
-            # Find which topics have no analysis (empty string)
-            failed_topic_ids = [tid for tid, analysis in llm_analysis_dict.items() if not analysis or analysis.strip() == ""]
-            st.warning(f"⚠️ {llm_fallback_count} topics have no LLM analysis: {failed_topic_ids}")
-            st.caption("💡 These topics had insufficient document content for LLM analysis. Label and keywords are still available.")
-            st.caption("🔍 **Tip:** Enable 'Debug logging' checkbox and check your terminal/console to see why specific topics failed.")
+    # ✅ FIX: Check if there are any valid topics to process
+    if num_topics == 0:
+        st.warning("⚠️ No valid topics to analyze (only outlier topics found)")
+        llm_analysis_dict = {}
     else:
-        st.warning("⚠️ LLM analysis failed for all topics")
+        # Batch size: process 5 topics at once
+        batch_size = 5
+        st.info(f"🤖 Generating LLM analysis for {num_topics} topics using batch processing (5 topics/batch)...")
+
+        # Get FAISS index
+        faiss_index = st.session_state.get('faiss_index')
+
+        # Progress tracking
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+
+        # Calculate optimal doc count based on model's context window
+        max_docs = get_max_docs_for_model(model_name) if model_name else 10
+        st.caption(f"📊 Using {max_docs} documents per topic (optimized for {model_name.split('/')[-1] if model_name else 'default'} context window)")
+
+        # Prepare all topics with FAISS-selected documents
+        all_topics_prepared = []
+        skipped_topics = []
+        for topic_id, docs in topics_dict.items():
+            if topic_id == -1:
+                continue
+
+            doc_indices = topic_doc_indices.get(topic_id, [])
+            label = labels_dict.get(topic_id, f"Topic {topic_id}")
+            keywords = keywords_dict.get(topic_id, '')
+
+            # Select docs with FAISS (dynamically scaled by context window)
+            if faiss_index is not None and embeddings is not None and len(doc_indices) > 0:
+                try:
+                    topic_embeddings = embeddings[doc_indices]
+                    centroid = np.mean(topic_embeddings, axis=0).reshape(1, -1).astype('float32')
+                    _, indices = faiss_index.search(centroid, min(max_docs, len(doc_indices)))
+
+                    # ✅ FIX: FAISS searches GLOBAL index, need to filter to topic's documents only
+                    idx_to_pos = {embedding_idx: pos for pos, embedding_idx in enumerate(doc_indices)}
+                    selected_docs = []
+                    import logging
+                    logging.debug(f"Topic {topic_id}: FAISS returned {len(indices[0])} indices, topic has {len(doc_indices)} docs")
+
+                    matched_count = 0
+                    for idx in indices[0]:
+                        if idx in idx_to_pos:
+                            selected_docs.append(docs[idx_to_pos[idx]])
+                            matched_count += 1
+                            if len(selected_docs) >= max_docs:
+                                break
+
+                    # ✅ FIX: If FAISS returned no valid docs for this topic, fall back to topic's own docs
+                    if not selected_docs:
+                        logging.warning(f"Topic {topic_id}: FAISS selection returned 0 matching docs (matched {matched_count}/{len(indices[0])}), using fallback")
+                        selected_docs = docs[:max_docs]
+                    else:
+                        logging.debug(f"Topic {topic_id}: FAISS selected {len(selected_docs)} docs")
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Topic {topic_id}: FAISS selection failed ({str(e)[:100]}), using fallback")
+                    selected_docs = docs[:max_docs]
+            else:
+                selected_docs = docs[:max_docs]
+
+            # ✅ FIXED: Minimal validation - only skip if literally no documents
+            # Let generate_simple_llm_analysis handle document validation (it has retry logic)
+            if not selected_docs or len(selected_docs) == 0:
+                import logging
+                logging.warning(f"Topic {topic_id} skipped - no documents selected (had {len(docs)} original docs)")
+                skipped_topics.append(topic_id)
+                llm_analysis_dict[topic_id] = ""
+                llm_fallback_count += 1
+                continue
+
+            # Get keywords for this topic
+            keywords = keywords_dict.get(topic_id, '')
+
+            all_topics_prepared.append({
+                'topic_id': topic_id,
+                'label': label,
+                'docs': selected_docs,  # Pass documents as-is, LLM function will validate
+                'keywords': keywords
+            })
+
+        # ✅ FIX: Show warning if topics were skipped due to empty documents
+        if skipped_topics:
+            st.caption(f"⚠️ Skipped {len(skipped_topics)} topics with no valid documents: {skipped_topics[:10]}{'...' if len(skipped_topics) > 10 else ''}")
+
+        # ✅ FIX: Check if all topics were skipped (no valid documents)
+        if not all_topics_prepared:
+            st.warning("⚠️ All topics have no valid documents for LLM analysis")
+            st.caption("💡 Check that your documents contain meaningful text content")
+        else:
+            # Process in batches (now parallelized internally via ThreadPoolExecutor)
+            num_batches = (len(all_topics_prepared) + batch_size - 1) // batch_size
+            processed_count = 0
+
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(all_topics_prepared))
+                batch = all_topics_prepared[start_idx:end_idx]
+
+                # Update progress
+                status_text.info(f"🔄 Analyzing batch {batch_idx+1}/{num_batches} ({len(batch)} topics in parallel)...")
+
+                # Carmack's simple parallel processing - no fallback needed!
+                batch_results = generate_batch_llm_analysis(batch, llm_model)
+
+                # Collect results and retry failed topics once
+                failed_topics = []
+                for topic_item in batch:
+                    topic_id = topic_item['topic_id']
+                    if topic_id in batch_results and batch_results[topic_id]:
+                        llm_analysis_dict[topic_id] = batch_results[topic_id]
+                        llm_success_count += 1
+                    else:
+                        # Queue for retry
+                        import logging
+                        logging.warning(f"Topic {topic_id} failed in initial batch - will retry")
+                        failed_topics.append(topic_item)
+
+                    processed_count += 1
+
+                # Retry failed topics once (reduces 2/80 failures to ~0/80)
+                if failed_topics:
+                    status_text.info(f"🔄 Retrying {len(failed_topics)} failed topics...")
+                    retry_results = generate_batch_llm_analysis(failed_topics, llm_model)
+
+                    still_failed = []
+                    for topic_item in failed_topics:
+                        topic_id = topic_item['topic_id']
+                        if topic_id in retry_results and retry_results[topic_id]:
+                            llm_analysis_dict[topic_id] = retry_results[topic_id]
+                            llm_success_count += 1
+                        else:
+                            # Track topics that failed even after retry
+                            still_failed.append(topic_item)
+
+                    # ✅ FIX: Generate keyword-based fallback for topics that completely failed
+                    if still_failed:
+                        import logging
+                        logging.error(f"{len(still_failed)} topics failed even after retry - generating keyword-based fallback")
+                        for topic_item in still_failed:
+                            topic_id = topic_item['topic_id']
+                            label = topic_item['label']
+                            keywords = topic_item.get('keywords', '')
+                            docs = topic_item.get('docs', [])
+
+                            # Log details for debugging
+                            logging.error(f"Topic {topic_id} completely failed LLM generation:")
+                            logging.error(f"  Label: {label}")
+                            logging.error(f"  Keywords: {keywords}")
+                            logging.error(f"  Num docs: {len(docs)}")
+                            if docs:
+                                logging.error(f"  First doc preview: {str(docs[0])[:100]}")
+
+                            # Generate simple keyword-based summary as last resort
+                            if keywords:
+                                fallback_analysis = f"Topic related to {keywords}. Contains {len(docs)} documents discussing {label.lower()}."
+                                llm_analysis_dict[topic_id] = fallback_analysis
+                                logging.info(f"Topic {topic_id} using keyword fallback: {fallback_analysis}")
+                            else:
+                                llm_analysis_dict[topic_id] = ""
+                                logging.error(f"Topic {topic_id} has no keywords - setting empty")
+
+                            llm_fallback_count += 1
+
+                # Update progress bar
+                progress = processed_count / num_topics
+                progress_bar.progress(progress)
+                status_text.info(f"🔄 Analyzed {processed_count}/{num_topics} topics")
+
+            # Clear progress
+            progress_bar.empty()
+            status_text.empty()
+
+            # Show stats
+            if llm_success_count > 0:
+                success_pct = (llm_success_count / num_topics) * 100
+                st.success(f"✅ **LLM Analysis Complete:** {llm_success_count}/{num_topics} topics ({success_pct:.1f}% success)")
+                if llm_fallback_count > 0:
+                    # Separate truly empty from keyword fallback
+                    empty_topic_ids = []
+                    fallback_topic_ids = []
+                    for tid, analysis in llm_analysis_dict.items():
+                        if not analysis or analysis.strip() == "":
+                            empty_topic_ids.append(tid)
+                        elif "Topic related to" in analysis:
+                            fallback_topic_ids.append(tid)
+
+                    if fallback_topic_ids:
+                        st.info(f"ℹ️ {len(fallback_topic_ids)} topics using keyword-based fallback: {fallback_topic_ids}")
+                        st.caption("💡 These topics had LLM generation issues - using keyword-based summaries instead.")
+
+                    if empty_topic_ids:
+                        st.warning(f"⚠️ {len(empty_topic_ids)} topics have no analysis: {empty_topic_ids}")
+                        st.caption("💡 These topics have no keywords or documents. Check your data.")
+
+                    st.caption("🔍 **Tip:** Check your terminal/console logs to see detailed failure reasons for each topic.")
+            else:
+                st.warning("⚠️ LLM analysis failed for all topics")
+                st.caption("Check logs for detailed error messages")
 
     # Update topic_info with LLM_Analysis
     topic_info = topic_info.copy()
